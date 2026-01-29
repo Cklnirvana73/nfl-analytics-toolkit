@@ -47,3 +47,37 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Data files
+
+data/cache/*
+
+*.csv
+
+*.rds
+
+*.parquet
+
+# R files
+
+.Rhistory
+
+.RData
+
+.Rproj.user
+
+# Output
+
+output/*.html
+
+output/*.png
+
+output/*.jpg
+
+!output/.gitkeep
+
+# System files
+
+.DS_Store
+
+Thumbs.db
