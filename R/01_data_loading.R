@@ -183,8 +183,9 @@ validate_pbp_quality <- function(pbp) {
     results$invalid_dates <- FALSE
   }
   
-  # Check 5: Duplicate plays
+  # Check 5: Duplicate plays (fixed NA handling)
   duplicate_plays <- pbp %>%
+    filter(!is.na(game_id) & !is.na(play_id)) %>%  # ADDED: explicit NA exclusion
     group_by(game_id, play_id) %>%
     filter(n() > 1) %>%
     nrow()
@@ -195,6 +196,21 @@ validate_pbp_quality <- function(pbp) {
     warning(glue("Found {duplicate_plays} duplicate plays (same game_id + play_id)"))
   } else {
     results$duplicate_plays <- 0
+  }
+  # Check 6: Season completeness
+  current_year <- as.numeric(format(Sys.Date(), "%Y"))
+  current_season_data <- pbp %>% filter(season == current_year)
+  
+  if (nrow(current_season_data) > 0) {
+    current_week <- max(current_season_data$week, na.rm = TRUE)
+    
+    if (current_week < 18) {
+      results$incomplete_seasons <- data.frame(
+        season = current_year, 
+        weeks_available = current_week
+      )
+      message(glue("ℹ️  Note: {current_year} season is incomplete (data through week {current_week} of 18)"))
+    }
   }
   
   # Summary statistics
@@ -248,13 +264,28 @@ get_roster_data <- function(seasons) {
     stop(glue("Failed to download roster data: {e$message}"))
   })
   
-  # Select key columns and clean
+  # Select key columns and clean (improved robustness)
+  expected_cols <- c("season", "team", "gsis_id", "full_name", "position", 
+                     "depth_chart_position", "status")
+  missing_cols <- setdiff(expected_cols, names(rosters))
+  
+  if (length(missing_cols) > 0) {
+    warning(glue("Roster data missing columns: {paste(missing_cols, collapse=', ')}. These will be omitted."))
+  }
+  
+  rows_before <- nrow(rosters)
+  
   rosters_clean <- rosters %>%
-    select(season, team, gsis_id, full_name, position, 
-           depth_chart_position, status) %>%
+    select(any_of(expected_cols)) %>%  # CHANGED: use any_of() instead of select()
     filter(!is.na(gsis_id))  # Remove rows without player ID
   
+  rows_removed <- rows_before - nrow(rosters_clean)
+  
   message(glue("Loaded {nrow(rosters_clean)} player records"))
+  
+  if (rows_removed > 0) {
+    message(glue("ℹ️  Removed {rows_removed} roster records without player IDs"))
+  }
   
   return(rosters_clean)
 }
