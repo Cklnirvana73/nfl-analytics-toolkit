@@ -100,13 +100,16 @@ get_team_offense_stats <- function(pbp_data,
       # Situational metrics - third down
       third_down_attempts = sum(down == 3, na.rm = TRUE),
       third_down_conversions = sum(third_down_converted == 1, na.rm = TRUE),
-      third_down_conversion_rate = third_down_conversions / third_down_attempts,
+      third_down_conversion_rate = ifelse(third_down_attempts > 0, 
+                                          third_down_conversions / third_down_attempts, 
+                                          NA_real_),
       
       # Situational metrics - fourth down
       fourth_down_attempts = sum(down == 4, na.rm = TRUE),
       fourth_down_conversions = sum(fourth_down_converted == 1, na.rm = TRUE),
-      fourth_down_conversion_rate = fourth_down_conversions / fourth_down_attempts,
-      
+      fourth_down_conversion_rate = ifelse(fourth_down_attempts > 0,
+                                           fourth_down_conversions / fourth_down_attempts,
+                                           NA_real_),      
       # Context metrics
       explosive_play_rate = mean(yards_gained >= 20, na.rm = TRUE),
       
@@ -224,21 +227,28 @@ get_team_defense_stats <- function(pbp_data,
       # Situational metrics - third down stops
       third_down_attempts_against = sum(down == 3, na.rm = TRUE),
       third_down_stops = sum(down == 3 & third_down_converted == 0, na.rm = TRUE),
-      third_down_stop_rate = third_down_stops / third_down_attempts_against,
+      third_down_stop_rate = ifelse(third_down_attempts_against > 0,
+                                    third_down_stops / third_down_attempts_against,
+                                    NA_real_),
       
       # Situational metrics - fourth down stops
       fourth_down_attempts_against = sum(down == 4, na.rm = TRUE),
       fourth_down_stops = sum(down == 4 & fourth_down_converted == 0, na.rm = TRUE),
-      fourth_down_stop_rate = fourth_down_stops / fourth_down_attempts_against,
+      fourth_down_stop_rate = ifelse(fourth_down_attempts_against > 0,
+                                     fourth_down_stops / fourth_down_attempts_against,
+                                     NA_real_),
       
       # Playmaking metrics
       sacks = sum(sack == 1, na.rm = TRUE),
-      sack_rate = sacks / pass_attempts_against,
+      sack_rate = ifelse(pass_attempts_against > 0,
+                         sacks / pass_attempts_against,
+                         NA_real_),
       interceptions = sum(interception == 1, na.rm = TRUE),
       fumbles_recovered = sum(fumble_lost == 1, na.rm = TRUE),
       turnovers_generated = interceptions + fumbles_recovered,
-      turnover_rate = turnovers_generated / plays_against,
-      
+      turnover_rate = ifelse(plays_against > 0,
+                             turnovers_generated / plays_against,
+                             NA_real_),      
       # Context metrics
       explosive_plays_allowed = sum(yards_gained >= 20, na.rm = TRUE),
       explosive_play_rate_allowed = explosive_plays_allowed / plays_against,
