@@ -234,13 +234,17 @@ get_player_passing_stats <- function(pbp_data,
     ) %>%
     # Calculate passer rating (simplified NFL formula)
     mutate(
-      passer_rating = pmin(
-        pmax((completion_pct - 0.3) * 5, 0) * 100 +
-        pmax((yards_per_attempt - 3) * 0.25, 0) * 100 +
-        pmax(pass_tds / attempts * 20, 0) * 100 +
-        pmax(2.375 - (interceptions / attempts * 25), 0) * 100,
-        158.3
-      ) / 6
+      passer_rating = ifelse(
+        attempts > 0,
+        pmin(
+          pmax((completion_pct - 0.3) * 5, 0) * 100 +
+            pmax((yards_per_attempt - 3) * 0.25, 0) * 100 +
+            pmax(pass_tds / attempts * 20, 0) * 100 +
+            pmax(2.375 - (interceptions / attempts * 25), 0) * 100,
+          158.3
+        ) / 6,
+        NA_real_
+      )
     ) %>%
     # Rename for clarity
     rename(
@@ -360,9 +364,8 @@ get_player_receiving_stats <- function(pbp_data,
       
       # Efficiency metrics
       catch_rate = receptions / targets,
-      yards_per_reception = rec_yards / receptions,
-      yards_per_target = rec_yards / targets,
-      
+      yards_per_reception = ifelse(receptions > 0, rec_yards / receptions, NA_real_),
+      yards_per_target = ifelse(targets > 0, rec_yards / targets, NA_real_),
       # Advanced metrics
       rec_epa = sum(epa, na.rm = TRUE),
       rec_epa_per_target = mean(epa, na.rm = TRUE),
