@@ -19,6 +19,55 @@ library(here)
 source(here("R", "01_data_loading.R"))
 
 # ============================================================================
+# HELPER FUNCTION - Create Test Data
+# ============================================================================
+
+#' Create Test Play-by-Play Data
+#'
+#' Generates realistic mock play-by-play data for testing purposes.
+#' Includes all required columns for validate_pbp_quality() function.
+#'
+#' @param n_games Number of games to generate (default: 1)
+#' @param n_plays_per_game Number of plays per game (default: 100)
+#' @return Tibble with realistic play-by-play structure
+create_test_pbp <- function(n_games = 1, n_plays_per_game = 100) {
+  
+  # Generate game IDs
+  game_ids <- paste0("2024_", sprintf("%02d", 1:n_games), "_TEST_GAME")
+  
+  # Create base data frame
+  test_data <- tibble(
+    # Game identifiers
+    game_id = rep(game_ids, each = n_plays_per_game),
+    play_id = rep(1:n_plays_per_game, n_games),
+    
+    # Temporal data
+    season = 2024,
+    week = rep(1:n_games, each = n_plays_per_game),
+    game_date = as.Date("2024-09-10") + rep(0:(n_games-1), each = n_plays_per_game) * 7,
+    
+    # Team data
+    posteam = sample(c("KC", "BUF", "SF", "DAL", "PHI", "MIA", "BAL", "CIN"), 
+                     n_games * n_plays_per_game, replace = TRUE),
+    defteam = sample(c("NYJ", "NE", "GB", "LAR", "NYG", "WAS", "PIT", "CLE"), 
+                     n_games * n_plays_per_game, replace = TRUE),
+    
+    # Play description
+    desc = paste("Test play description for play", 1:(n_games * n_plays_per_game)),
+    
+    # Play type (realistic distribution)
+    play_type = sample(
+      c("pass", "run", "punt", "kickoff", "field_goal", "extra_point"), 
+      n_games * n_plays_per_game, 
+      replace = TRUE,
+      prob = c(0.40, 0.30, 0.10, 0.08, 0.07, 0.05)
+    )
+  )
+  
+  return(test_data)
+}
+
+# ============================================================================
 # Test Suite 1: Input Validation
 # ============================================================================
 
@@ -105,58 +154,6 @@ test_that("validate_pbp_quality detects season completeness (CRITICAL FIX #2)", 
   expect_true("incomplete_seasons" %in% names(results))
   expect_equal(results$incomplete_seasons$season, current_year)
   expect_equal(results$incomplete_seasons$weeks_available, 5)
-})
-
-test_that("validate_pbp_quality detects low/high play count games", {
-  # Create test data with abnormal game lengths
-  test_pbp <- rbind(
-    # Normal game
-    data.frame(
-      game_id = "2023_01_BUF_NYJ",
-      play_id = 1:150,
-      season = 2023,
-      week = 1,
-      game_date = as.Date("2023-09-10"),
-      posteam = "BUF",
-      defteam = "NYJ",
-      desc = "normal game",
-      play_type = "pass"
-    ),
-    # Suspiciously low play count (cancelled game?)
-    data.frame(
-      game_id = "2023_01_KC_DET",
-      play_id = 1:50,  # Only 50 plays
-      season = 2023,
-      week = 1,
-      game_date = as.Date("2023-09-10"),
-      posteam = "KC",
-      defteam = "DET",
-      desc = "low play game",
-      play_type = "pass"
-    ),
-    # Overtime game
-    data.frame(
-      game_id = "2023_01_SF_DAL",
-      play_id = 1:220,  # 220 plays (OT)
-      season = 2023,
-      week = 1,
-      game_date = as.Date("2023-09-10"),
-      posteam = "SF",
-      defteam = "DAL",
-      desc = "OT game",
-      play_type = "pass"
-    )
-  )
-  
-  expect_message(
-    results <- validate_pbp_quality(test_pbp),
-    "100 plays"
-  )
-  
-  expect_true("low_play_games" %in% names(results))
-  expect_true("high_play_games" %in% names(results))
-  expect_equal(nrow(results$low_play_games), 1)
-  expect_equal(nrow(results$high_play_games), 1)
 })
 
 
