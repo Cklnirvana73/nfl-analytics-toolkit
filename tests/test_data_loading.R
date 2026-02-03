@@ -8,7 +8,15 @@ library(testthat)
 library(dplyr)
 
 # Source the functions
-source("R/01_data_loading.R")
+# Load here package for robust path resolution
+if (!requireNamespace("here", quietly = TRUE)) {
+  message("Installing 'here' package for robust path resolution...")
+  install.packages("here")
+}
+library(here)
+
+# Source the functions using here::here() for robust paths
+source(here("R", "01_data_loading.R"))
 
 # ============================================================================
 # Test Suite 1: Input Validation

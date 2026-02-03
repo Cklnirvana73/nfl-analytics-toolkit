@@ -6,7 +6,15 @@ library(nflfastR)
 library(tidyverse)
 
 # Source our functions
-source("R/01_data_loading.R")
+# Load here package for robust path resolution
+if (!requireNamespace("here", quietly = TRUE)) {
+  message("Installing 'here' package for robust path resolution...")
+  install.packages("here")
+}
+library(here)
+
+# Source our functions using here::here() for robust paths
+source(here("R", "01_data_loading.R"))
 
 # Test 1: Load single season (most recent)
 cat("\n=== Test 1: Load 2025 season ===\n")
