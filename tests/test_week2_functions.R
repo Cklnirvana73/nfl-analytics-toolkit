@@ -6,11 +6,22 @@
 library(testthat)
 library(dplyr)
 
-# Source the functions
-source("R/01_data_loading.R")
-source("R/02_player_stats.R")
-source("R/03_team_stats.R")
-source("R/04_game_analysis.R")
+# Defensive path resolution - handles running from different directories
+if (file.exists("R/01_data_loading.R")) {
+  # Running from project root
+  source("R/01_data_loading.R")
+  source("R/02_player_stats.R")
+  source("R/03_team_stats.R")
+  source("R/04_game_analysis.R")
+} else if (file.exists("../R/01_data_loading.R")) {
+  # Running from tests/ directory
+  source("../R/01_data_loading.R")
+  source("../R/02_player_stats.R")
+  source("../R/03_team_stats.R")
+  source("../R/04_game_analysis.R")
+} else {
+  stop("Cannot find R source files. Please run tests from project root or tests/ directory.")
+}
 
 # ============================================================================
 # Helper: Create test data
