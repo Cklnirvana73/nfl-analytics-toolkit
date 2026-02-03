@@ -30,9 +30,9 @@ load_and_validate_pbp <- function(seasons,
                                   validate = TRUE) {
   
   # Load required packages
-  require(nflfastR)
-  require(dplyr)
-  require(glue)
+  library(nflfastR)
+  library(dplyr)
+  library(glue)
   
   # Input validation
   if (!is.numeric(seasons)) {
@@ -118,12 +118,31 @@ load_and_validate_pbp <- function(seasons,
 #' @export
 validate_pbp_quality <- function(pbp) {
   
-  require(dplyr)
-  require(glue)
+  library(dplyr)
+  library(glue)
   
   # Initialize results list
   results <- list()
   results$has_critical_issues <- FALSE
+  
+  # Check 0: Empty data (PRIORITY 3 FIX)
+  if (nrow(pbp) == 0) {
+    results$has_critical_issues <- TRUE
+    results$empty_data <- TRUE
+    warning("Data is empty (0 rows)")
+    
+    # Return minimal summary
+    results$summary <- list(
+      total_plays = 0,
+      seasons = numeric(0),
+      weeks = c(NA, NA),
+      date_range = c(NA, NA),
+      teams = 0,
+      games = 0
+    )
+    
+    return(results)
+  }
   
   # Check 1: Required columns exist
   required_cols <- c("game_id", "play_id", "posteam", "week", "season", 
@@ -157,18 +176,26 @@ validate_pbp_quality <- function(pbp) {
     results$low_play_count <- NULL
   }
   
-  # Check 3: NA patterns in key columns
+  # Check 3: NA patterns in key columns (PRIORITY 2 FIX)
   key_cols <- c("posteam", "game_id", "play_id", "season", "week")
-  na_counts <- sapply(pbp[key_cols], function(x) sum(is.na(x)))
+  existing_key_cols <- intersect(key_cols, names(pbp))  # Only use existing columns
   
-  high_na_cols <- names(na_counts[na_counts > nrow(pbp) * 0.5])  # More than 50% NA
-  
-  if (length(high_na_cols) > 0) {
-    results$has_critical_issues <- TRUE
-    results$high_na_columns <- high_na_cols
-    warning(glue("Key columns with >50% missing data: {paste(high_na_cols, collapse=', ')}"))
+  if (length(existing_key_cols) > 0) {
+    na_counts <- sapply(pbp[existing_key_cols], function(x) sum(is.na(x)))
+    
+    high_na_cols <- names(na_counts[na_counts > nrow(pbp) * 0.5])  # More than 50% NA
+    
+    if (length(high_na_cols) > 0) {
+      results$has_critical_issues <- TRUE
+      results$high_na_columns <- high_na_cols
+      warning(glue("Key columns with >50% missing data: {paste(high_na_cols, collapse=', ')}"))
+    } else {
+      results$high_na_columns <- NULL
+    }
   } else {
-    results$high_na_columns <- NULL
+    results$has_critical_issues <- TRUE
+    results$high_na_columns <- key_cols  # All key columns missing
+    warning("All key columns are missing from data")
   }
   
   # Check 4: Date range is valid
@@ -183,19 +210,30 @@ validate_pbp_quality <- function(pbp) {
     results$invalid_dates <- FALSE
   }
   
-  # Check 5: Duplicate plays (fixed NA handling)
-  duplicate_plays <- pbp %>%
-    filter(!is.na(game_id) & !is.na(play_id)) %>%  # ADDED: explicit NA exclusion
-    group_by(game_id, play_id) %>%
-    filter(n() > 1) %>%
-    nrow()
-  
-  if (duplicate_plays > 0) {
-    results$has_critical_issues <- TRUE
-    results$duplicate_plays <- duplicate_plays
-    warning(glue("Found {duplicate_plays} duplicate plays (same game_id + play_id)"))
+  # Check 5: Duplicate plays (PRIORITY 1 FIX: Count pairs not rows)
+  # Only check duplicates if both game_id and play_id columns exist
+  if ("game_id" %in% names(pbp) && "play_id" %in% names(pbp)) {
+    duplicate_pairs <- pbp %>%
+      filter(!is.na(game_id) & !is.na(play_id)) %>%  # Explicit NA exclusion
+      group_by(game_id, play_id) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      filter(n > 1)  # Find duplicate pairs
+    
+    duplicate_plays <- nrow(duplicate_pairs)  # Count PAIRS not individual rows
+    
+    if (duplicate_plays > 0) {
+      results$has_critical_issues <- TRUE
+      results$duplicate_plays <- duplicate_plays
+      warning(glue("Found {duplicate_plays} duplicate plays (same game_id + play_id)"))
+    } else {
+      results$duplicate_plays <- 0
+    }
   } else {
-    results$duplicate_plays <- 0
+    # Can't check duplicates without required columns
+    results$duplicate_plays <- NA
+    if (!"game_id" %in% names(pbp) || !"play_id" %in% names(pbp)) {
+      message("Skipping duplicate check: game_id or play_id column missing")
+    }
   }
   # Check 6: Season completeness
   current_year <- as.numeric(format(Sys.Date(), "%Y"))
@@ -246,22 +284,43 @@ validate_pbp_quality <- function(pbp) {
 #' @export
 get_roster_data <- function(seasons) {
   
-  require(nflfastR)
-  require(dplyr)
-  require(glue)
+  library(dplyr)
+  library(glue)
+  
+  # Check nflreadr package availability
+  if (!requireNamespace("nflreadr", quietly = TRUE)) {
+    stop(
+      "nflreadr package required but not installed.\n",
+      "Fix: install.packages('nflreadr')\n",
+      "Note: nflfastR moved roster functions to nflreadr package."
+    )
+  }
   
   # Input validation
   if (!is.numeric(seasons)) {
     stop("seasons must be numeric (e.g., 2023 or 2018:2023)")
   }
   
+  current_year <- as.numeric(format(Sys.Date(), "%Y"))
+  if (any(seasons < 1999 | seasons > current_year)) {
+    stop(glue("Invalid seasons: {paste(seasons, collapse=', ')}. Must be between 1999 and {current_year}."))
+  }
+  
   message(glue("Loading roster data for seasons: {paste(seasons, collapse=', ')}"))
   
-  # Load rosters
+  # Load rosters with enhanced error handling
   rosters <- tryCatch({
-    nflfastR::load_rosters(seasons)
+    nflreadr::load_rosters(seasons)
   }, error = function(e) {
-    stop(glue("Failed to download roster data: {e$message}"))
+    stop(
+      "Failed to download roster data.\n",
+      "Error: ", e$message, "\n",
+      "Troubleshooting:\n",
+      "  1. Check internet connection\n",
+      "  2. Verify seasons are valid: ", paste(seasons, collapse=", "), "\n",
+      "  3. Try updating nflreadr: install.packages('nflreadr')\n",
+      "  4. Check https://github.com/nflverse/nflreadr for known issues"
+    )
   })
   
   # Select key columns and clean (improved robustness)
