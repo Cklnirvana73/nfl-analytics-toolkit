@@ -2,24 +2,44 @@
 #'
 #' @description
 #' Summarizes a single game's key statistics including score, volume, efficiency,
-#' and key events for both teams.
+#' and key events for both teams. Now includes win probability context.
 #'
 #' @param pbp_data Play-by-play data from load_and_validate_pbp()
 #' @param game_id Single game ID (e.g., "2024_01_KC_BAL")
 #'
 #' @return Single-row tibble with comprehensive game statistics, or NULL if game not found
 #'
+#' @details
+#' **NFL Context:**
+#' - EPA (Expected Points Added): Positive = offense gained expected points
+#' - Success rate: Proportion of plays with positive EPA
+#' - Turnovers include interceptions and fumbles lost
+#' - Sacks counted from defensive perspective (allowed by offense)
+#'
+#' **Win Probability Context:**
+#' - If available, includes biggest win probability swing in game
+#' - Large swings typically occur on: turnovers, 4th down conversions, long TDs
+#' - Leverage situations = close games where WP can swing dramatically
+#'
 #' @examples
 #' \dontrun{
 #' pbp <- load_and_validate_pbp(2024)
 #' game_summary <- get_game_summary(pbp, "2024_01_KC_BAL")
+#' 
+#' # View key stats
+#' game_summary %>%
+#'   select(home_team, away_team, winner, home_epa, away_epa)
 #' }
+#'
+#' @seealso
+#' \code{\link{get_scoring_plays}} for play-by-play scoring timeline
+#' \code{\link{get_drive_summary}} for drive-level efficiency
 #'
 #' @export
 get_game_summary <- function(pbp_data, game_id) {
   
-  require(dplyr)
-  require(glue)
+  library(dplyr)
+  library(glue)
   
   # Input validation
   if (!is.data.frame(pbp_data)) {
@@ -66,9 +86,9 @@ get_game_summary <- function(pbp_data, game_id) {
       home_plays = n(),
       home_epa = sum(epa, na.rm = TRUE),
       home_success_rate = mean(success, na.rm = TRUE),
-      home_sacks = sum(defteam == away_team & sack == 1, na.rm = TRUE),
+      home_sacks_allowed = sum(sack == 1, na.rm = TRUE),
       home_turnovers = sum(
-        (interception == 1 | fumble_lost == 1) & posteam == home_team,
+        (interception == 1 | fumble_lost == 1),
         na.rm = TRUE
       )
     )
@@ -80,16 +100,12 @@ get_game_summary <- function(pbp_data, game_id) {
       away_plays = n(),
       away_epa = sum(epa, na.rm = TRUE),
       away_success_rate = mean(success, na.rm = TRUE),
-      away_sacks = sum(defteam == home_team & sack == 1, na.rm = TRUE),
+      away_sacks_allowed = sum(sack == 1, na.rm = TRUE),
       away_turnovers = sum(
-        (interception == 1 | fumble_lost == 1) & posteam == away_team,
+        (interception == 1 | fumble_lost == 1),
         na.rm = TRUE
       )
     )
-  
-  # Extract home and away team names for safer referencing
-  home_team <- game_info$home_team
-  away_team <- game_info$away_team
   
   # Combine all stats
   game_summary <- game_info %>%
@@ -103,6 +119,15 @@ get_game_summary <- function(pbp_data, game_id) {
         TRUE ~ "TIE"
       )
     )
+  
+  # NFL ENHANCEMENT: Add win probability swing if available
+  if ("wpa" %in% names(game_plays)) {
+    biggest_swing <- max(abs(game_plays$wpa), na.rm = TRUE)
+    if (is.finite(biggest_swing)) {
+      game_summary <- game_summary %>%
+        mutate(biggest_wp_swing = biggest_swing)
+    }
+  }
   
   return(game_summary)
 }
@@ -119,17 +144,33 @@ get_game_summary <- function(pbp_data, game_id) {
 #'
 #' @return Tibble with one row per scoring play, or NULL if game not found
 #'
+#' @details
+#' **NFL Context:**
+#' - Touchdown = 6 points (extra point/2-pt conversion tracked separately)
+#' - Field Goal = 3 points
+#' - Safety = 2 points (defensive score)
+#' - Score differential shows game flow and momentum shifts
+#' - Time remaining crucial for understanding comeback attempts
+#'
 #' @examples
 #' \dontrun{
 #' pbp <- load_and_validate_pbp(2024)
 #' scoring <- get_scoring_plays(pbp, "2024_01_KC_BAL")
+#' 
+#' # View scoring timeline
+#' scoring %>%
+#'   select(qtr, time_remaining, scoring_team, score_type, points)
 #' }
+#'
+#' @seealso
+#' \code{\link{get_game_summary}} for overall game statistics
+#' \code{\link{get_drive_summary}} for drive-level analysis
 #'
 #' @export
 get_scoring_plays <- function(pbp_data, game_id) {
   
-  require(dplyr)
-  require(glue)
+  library(dplyr)
+  library(glue)
   
   # Input validation
   if (!is.data.frame(pbp_data)) {
@@ -227,17 +268,39 @@ get_scoring_plays <- function(pbp_data, game_id) {
 #'
 #' @return Tibble with one row per drive, or NULL if game not found
 #'
+#' @details
+#' **NFL Context:**
+#' - Drive = series of plays from one team's possession until change
+#' - Ended with score = TD or FG (successful drive)
+#' - Drive EPA = total expected points added across all plays in drive
+#' - Positive drive EPA = offense moved into better scoring position
+#' - Time of possession affects game strategy (clock management)
+#'
+#' **Typical Drive Statistics:**
+#' - Average plays per drive: 5-6
+#' - Average yards per drive: 25-35
+#' - Drive success rate: 30-40% (end in score)
+#'
 #' @examples
 #' \dontrun{
 #' pbp <- load_and_validate_pbp(2024)
 #' drives <- get_drive_summary(pbp, "2024_01_KC_BAL")
+#' 
+#' # View scoring drives
+#' drives %>%
+#'   filter(ended_with_score == 1) %>%
+#'   select(drive, posteam, plays, yards_gained, drive_epa)
 #' }
+#'
+#' @seealso
+#' \code{\link{get_game_summary}} for overall game statistics
+#' \code{\link{get_scoring_plays}} for scoring timeline
 #'
 #' @export
 get_drive_summary <- function(pbp_data, game_id) {
   
-  require(dplyr)
-  require(glue)
+  library(dplyr)
+  library(glue)
   
   # Input validation
   if (!is.data.frame(pbp_data)) {

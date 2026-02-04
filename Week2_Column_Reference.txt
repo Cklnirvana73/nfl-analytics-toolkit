@@ -1,0 +1,763 @@
+================================================================================
+WEEK 2 COLUMN REFERENCE - OUTPUT DOCUMENTATION
+================================================================================
+Purpose: Documents exact output columns from all Week 2 functions
+Created: February 4, 2026
+Version: Post-fixes (includes all corrections)
+
+CRITICAL: Always verify column names before using in downstream analysis!
+Use names(result) after calling any function to see actual columns.
+
+================================================================================
+FUNCTION: get_player_rushing_stats()
+================================================================================
+
+**File:** 02_player_stats.R
+**Returns:** Tibble with one row per player
+
+**OUTPUT COLUMNS:**
+
+player_id (chr)
+  - Player GSIS ID (unique identifier)
+  - Use for joins with roster data
+  - Example: "00-0034857"
+
+player_name (chr)
+  - Full player name
+  - Example: "D.Henry"
+  - Note: May have inconsistent formatting (use player_id for joins)
+
+recent_team (chr)
+  - Most recent team abbreviation (3 letters)
+  - From last(posteam) in data
+  - Example: "TEN"
+  - Note: Player may have played for multiple teams in season
+
+rushes (int)
+  - Number of rushing attempts
+  - Count of play_type == "run" plays
+  - IMPORTANT: Named 'rushes', NOT 'carries'!
+  - NFL Context: Minimum 20 rushes recommended for meaningful YPC
+
+games_played (int)
+  - Number of distinct games with rushing attempts
+  - Count of unique game_id values
+  - Useful for per-game averages
+
+rush_yards (int)
+  - Total rushing yards
+  - Sum of rushing_yards column
+  - Can be negative (losses)
+
+rush_tds (int)
+  - Rushing touchdowns
+  - Count of rush_touchdown == 1
+  - NFL Context: League average ~0.05 TDs per rush
+
+rush_first_downs (int)
+  - First downs gained on rushing plays
+  - Count of first_down_rush == 1
+
+yards_per_carry (dbl)
+  - Rushing yards per attempt
+  - Formula: rush_yards / rushes
+  - NFL Context: League average ~4.4 YPC, elite >5.0
+
+rush_epa (dbl)
+  - Total Expected Points Added on rushes
+  - Sum of epa on rushing plays
+  - NFL Context: League average ~0.0 per rush, elite >+0.05
+
+rush_epa_per_play (dbl)
+  - Average EPA per rushing attempt
+  - Mean EPA on rushing plays
+  - NFL Context: Same as rush_epa context (per-play metric)
+
+rush_success_rate (dbl)
+  - Proportion of rushes with positive EPA
+  - Proportion of success == 1
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~45%, elite >50%
+
+explosive_rush_rate (dbl)
+  - Proportion of rushes gaining 15+ yards
+  - NFL standard: 15+ yards = explosive
+  - Range: 0.0 to 1.0
+  - NFL Context: Elite RBs ~10-15% explosive rate
+
+**COLUMNS NOT RETURNED (Common Mistakes):**
+❌ 'carries' - Use 'rushes'
+❌ 'posteam' - Renamed to 'recent_team'
+❌ 'team' - Use 'recent_team'
+❌ 'ypc' - Use 'yards_per_carry'
+❌ 'position' - Not returned (filtered internally)
+
+**SORTING:**
+Default sort: desc(rush_yards)
+
+**NFL BENCHMARKS:**
+- Elite YPC: >5.0
+- Good YPC: 4.5-5.0
+- Average YPC: 4.0-4.5
+- Poor YPC: <4.0
+- Minimum attempts for analysis: 20+ rushes
+
+================================================================================
+FUNCTION: get_player_passing_stats()
+================================================================================
+
+**File:** 02_player_stats.R
+**Returns:** Tibble with one row per QB
+
+**OUTPUT COLUMNS:**
+
+player_id (chr)
+  - Player GSIS ID
+  - Example: "00-0036389" (Patrick Mahomes)
+
+player_name (chr)
+  - Full player name
+  - Example: "P.Mahomes"
+
+recent_team (chr)
+  - Most recent team abbreviation
+  - Example: "KC"
+
+attempts (int)
+  - Total pass attempts (includes completions, incompletions, sacks)
+  - Includes qb_spike and qb_kneel per NFL official stats
+  - NFL Context: Minimum 100 attempts for meaningful stats
+
+completions (int)
+  - Number of completed passes
+  - Count of complete_pass == 1
+
+games_played (int)
+  - Number of distinct games with pass attempts
+
+pass_yards (int)
+  - Total passing yards
+  - Sum of passing_yards
+  - Includes yards lost on sacks
+
+pass_tds (int)
+  - Passing touchdowns
+  - Count of pass_touchdown == 1
+  - NFL Context: League average ~4-5% TD rate
+
+interceptions (int)
+  - Interceptions thrown
+  - Count of interception == 1
+  - NFL Context: League average ~2-3% INT rate
+
+completion_pct (dbl)
+  - Completion percentage
+  - Formula: completions / attempts
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~64%, elite >68%
+
+yards_per_attempt (dbl)
+  - Passing yards per attempt
+  - Formula: pass_yards / attempts
+  - NFL Context: League average ~7.0, elite >8.0
+
+pass_epa (dbl)
+  - Total Expected Points Added on passes
+  - Sum of epa on passing plays
+  - NFL Context: League average slightly positive
+
+pass_epa_per_play (dbl)
+  - Average EPA per pass attempt
+  - Mean EPA on passing plays
+  - NFL Context: League average ~+0.08, elite >+0.15
+
+cpoe (dbl)
+  - Completion Percentage Over Expected
+  - Mean cpoe from nflfastR
+  - Range: Typically -10% to +10%
+  - NFL Context: Measures QB accuracy independent of receivers
+  - Positive = more accurate than expected
+
+air_yards_per_attempt (dbl)
+  - Average air yards per attempt
+  - Mean air_yards on passes
+  - NFL Context: Measures depth of target
+  - Typical range: 6-10 yards
+
+sack_rate (dbl)
+  - Proportion of dropbacks ending in sack
+  - Formula: sacks / attempts
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~6-7%, good <5%
+
+passer_rating (dbl)
+  - NFL passer rating (CORRECTED FORMULA)
+  - Range: 0.0 to 158.3 (theoretical max)
+  - NFL Context:
+    - 0-39.9: Very poor
+    - 40-69.9: Poor
+    - 70-84.9: Below average
+    - 85-94.9: Average
+    - 95-104.9: Above average
+    - 105-119.9: Very good
+    - 120+: Elite
+    - 158.3: Perfect rating
+  - Formula: ((A+B+C+D)/6)*100 where each component capped at 2.375
+
+**COLUMNS NOT RETURNED (Common Mistakes):**
+❌ 'pass_epa_per_dropback' - Use 'pass_epa_per_play'
+❌ 'comp_pct' - Use 'completion_pct'
+❌ 'td_pct' - Not returned (calculate: pass_tds / attempts)
+❌ 'int_pct' - Not returned (calculate: interceptions / attempts)
+❌ 'rating' - Use 'passer_rating'
+
+**SORTING:**
+Default sort: desc(pass_yards)
+
+**NFL BENCHMARKS:**
+- Elite passer rating: >105
+- Good passer rating: 95-105
+- Average passer rating: 85-95
+- Minimum attempts for analysis: 100+ attempts
+
+================================================================================
+FUNCTION: get_player_receiving_stats()
+================================================================================
+
+**File:** 02_player_stats.R
+**Returns:** Tibble with one row per receiver
+
+**OUTPUT COLUMNS:**
+
+player_id (chr)
+  - Player GSIS ID
+  - Example: "00-0033077" (Tyreek Hill)
+
+player_name (chr)
+  - Full player name
+  - Example: "T.Hill"
+
+recent_team (chr)
+  - Most recent team abbreviation
+  - Example: "MIA"
+
+targets (int)
+  - Number of pass attempts thrown to player
+  - Count of plays where receiver_player_id matches
+  - NFL Context: WR1 typically 120-160 targets/season
+
+receptions (int)
+  - Number of completed passes caught
+  - Count of complete_pass == 1
+  - Also called "catches"
+
+games_played (int)
+  - Number of distinct games with targets
+
+rec_yards (int)
+  - Total receiving yards
+  - Sum of receiving_yards
+  - NFL Context: WR1 typically 1,000+ yards
+
+rec_tds (int)
+  - Receiving touchdowns
+  - Count of pass_touchdown == 1 when targeted
+
+rec_first_downs (int)
+  - First downs gained on receptions
+  - Count of first_down_pass == 1
+
+catch_rate (dbl)
+  - Proportion of targets caught
+  - Formula: receptions / targets
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~65%, elite >75%
+
+yards_per_reception (dbl)
+  - Yards gained per reception
+  - Formula: rec_yards / receptions (if receptions > 0, else NA)
+  - NFL Context: 
+    - WR (outside): 12-15 yards
+    - WR (slot): 9-12 yards
+    - TE: 10-13 yards
+    - RB: 7-10 yards
+
+yards_per_target (dbl)
+  - Yards gained per target (includes incompletions)
+  - Formula: rec_yards / targets (if targets > 0, else NA)
+  - NFL Context: More stable than yards_per_reception
+  - Elite receivers: >10 yards per target
+
+rec_epa (dbl)
+  - Total Expected Points Added on targets
+  - Sum of epa on plays where targeted
+
+rec_epa_per_target (dbl)
+  - Average EPA per target
+  - Mean EPA on plays where targeted
+  - NFL Context: More predictive than yards
+
+avg_yac (dbl)
+  - Average yards after catch per reception
+  - Mean yards_after_catch
+  - NFL Context:
+    - YAC receivers: >6 yards (screens, short routes)
+    - Deep threats: <4 yards (air yards primary)
+
+avg_air_yards (dbl)
+  - Average depth of target
+  - Mean air_yards (distance ball travels in air)
+  - NFL Context:
+    - Deep threats: >12 air yards
+    - Intermediate: 7-12 air yards
+    - Short/screens: <7 air yards
+
+target_share (dbl)
+  - Proportion of team's targets to this player (CORRECTED FORMULA)
+  - Formula: player targets / team season total targets
+  - Range: 0.0 to 1.0 (typically 0.05 to 0.30)
+  - NFL Context:
+    - WR1: 0.20-0.28 (20-28%)
+    - WR2: 0.12-0.18 (12-18%)
+    - WR3: 0.08-0.12 (8-12%)
+    - TE1: 0.15-0.22 (15-22%)
+    - RB: 0.08-0.15 (8-15%)
+  - CRITICAL: Now correctly calculated at season level (not game level)
+
+**COLUMNS NOT RETURNED (Common Mistakes):**
+❌ 'catches' - Use 'receptions'
+❌ 'receiving_tds' - Use 'rec_tds'
+❌ 'ypr' - Use 'yards_per_reception'
+❌ 'yac' - Use 'avg_yac'
+❌ 'adot' - Use 'avg_air_yards'
+
+**SORTING:**
+Default sort: desc(rec_yards)
+
+**NFL BENCHMARKS:**
+- Elite WR: 1,300+ yards, 25%+ target share
+- Good WR: 1,000-1,300 yards, 18-25% target share
+- Minimum targets for analysis: 30+ targets
+
+================================================================================
+FUNCTION: get_team_offense_stats()
+================================================================================
+
+**File:** 03_team_stats.R
+**Returns:** Tibble with one row per team
+
+**OUTPUT COLUMNS:**
+
+team (chr)
+  - Team abbreviation (3 letters)
+  - Example: "KC"
+  - IMPORTANT: Renamed from 'posteam' in final output!
+
+season (chr)
+  - Season(s) included in data
+  - Format: "2024" or "2023, 2024" for multiple
+  - Note: Character type (uses paste/collapse)
+
+games_played (int)
+  - Number of distinct games played
+  - Typical: 17 (regular season) or 18 (with playoffs)
+
+total_plays (int)
+  - Total offensive plays run
+  - Includes pass + run (excludes QB kneels/spikes)
+  - Excludes garbage time if parameter set
+  - NFL Context: Average ~1,000 plays per season
+
+pass_attempts (int)
+  - Number of pass attempts
+  - Count of play_type == "pass"
+
+rush_attempts (int)
+  - Number of rush attempts
+  - Count of play_type == "run"
+  - Excludes QB kneels
+
+pass_play_pct (dbl)
+  - Proportion of plays that are passes
+  - Formula: pass_attempts / total_plays
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~60% pass, 40% run
+
+total_yards (int)
+  - Total offensive yards
+  - Sum of yards_gained on all plays
+
+yards_per_play (dbl)
+  - Average yards per play
+  - Mean yards_gained
+  - NFL Context: League average ~5.5, elite >6.0
+
+offensive_epa (dbl)
+  - Total Expected Points Added
+  - Sum of epa on all plays
+  - NFL Context: Positive = above average offense
+
+offensive_epa_per_play (dbl)
+  - Average EPA per play
+  - Mean epa
+  - NFL Context:
+    - Elite: >+0.10
+    - Good: +0.05 to +0.10
+    - Average: -0.05 to +0.05
+    - Poor: <-0.05
+
+success_rate (dbl)
+  - Proportion of plays with positive EPA
+  - Proportion of success == 1
+  - Range: 0.0 to 1.0
+  - NFL Context: League average ~45%, elite >50%
+
+third_down_attempts (int)
+  - Number of third down plays
+  - Count of down == 3
+
+third_down_conversions (int)
+  - Number of third down conversions
+  - Count of third_down_converted == 1
+
+third_down_conversion_rate (dbl)
+  - Third down conversion percentage
+  - Formula: conversions / attempts (if attempts > 0, else NA)
+  - Range: 0.0 to 1.0
+  - NFL Context:
+    - Elite: >45%
+    - Good: 40-45%
+    - Average: 37-40%
+    - Poor: <37%
+
+fourth_down_attempts (int)
+  - Number of fourth down plays
+  - Count of down == 4
+
+fourth_down_conversions (int)
+  - Number of fourth down conversions
+  - Count of fourth_down_converted == 1
+
+fourth_down_conversion_rate (dbl)
+  - Fourth down conversion percentage
+  - Formula: conversions / attempts (if attempts > 0, else NA)
+  - NFL Context: Highly situational, varies by distance
+
+explosive_play_rate (dbl)
+  - Proportion of plays gaining 20+ yards
+  - NFL standard: 20+ yards = explosive
+  - Range: 0.0 to 1.0
+  - NFL Context: Elite offenses ~10-12% explosive rate
+
+**COLUMNS NOT RETURNED (Common Mistakes):**
+❌ 'posteam' - Renamed to 'team' in final output!
+❌ 'off_epa' - Use 'offensive_epa_per_play'
+❌ 'epa_per_play' - Use 'offensive_epa_per_play' (offensive prefix)
+❌ 'rush_epa_per_play' - Not returned (only combined offensive_epa_per_play)
+❌ 'pass_epa_per_play' - Not returned (only combined offensive_epa_per_play)
+
+**SORTING:**
+Default sort: desc(offensive_epa_per_play)
+
+**NEW PARAMETER:**
+exclude_garbage_time (default: TRUE) - Filters out Q4 plays with WP <10% or >90%
+
+**NFL BENCHMARKS:**
+- Elite offensive EPA/play: >+0.10
+- Good yards per play: >6.0
+- Elite 3rd down conversion: >45%
+
+================================================================================
+FUNCTION: get_team_defense_stats()
+================================================================================
+
+**File:** 03_team_stats.R
+**Returns:** Tibble with one row per team
+
+**OUTPUT COLUMNS:**
+
+team (chr)
+  - Team abbreviation
+  - IMPORTANT: Renamed from 'defteam' in final output!
+
+season (chr)
+  - Season(s) included
+
+games_played (int)
+  - Number of distinct games played
+
+plays_against (int)
+  - Total plays faced on defense
+  - Opposite of total_plays for offense
+
+pass_attempts_against (int)
+  - Pass attempts faced
+
+rush_attempts_against (int)
+  - Rush attempts faced
+
+yards_allowed (int)
+  - Total yards allowed
+  - Sum of yards_gained by opponents
+
+yards_per_play_allowed (dbl)
+  - Average yards allowed per play
+  - Mean yards_gained by opponents
+  - NFL Context: Elite defense <5.0
+
+defensive_epa (dbl)
+  - Total EPA allowed
+  - Sum of epa (from opponent's perspective)
+  - NFL Context: NEGATIVE is GOOD for defense
+
+defensive_epa_per_play (dbl)
+  - Average EPA allowed per play
+  - Mean epa
+  - NFL Context:
+    - Elite: <-0.10 (significantly negative)
+    - Good: -0.05 to -0.10
+    - Average: -0.05 to +0.05
+    - Poor: >+0.05
+  - IMPORTANT: Lower (more negative) is better!
+
+success_rate_allowed (dbl)
+  - Proportion of opponent plays with positive EPA
+  - Proportion of opponent success == 1
+  - NFL Context:
+    - Elite: <40%
+    - Good: 40-43%
+    - Average: 43-47%
+    - Poor: >47%
+  - IMPORTANT: Lower is better!
+
+third_down_attempts_against (int)
+  - Third downs faced
+
+third_down_stops (int)
+  - Third downs where conversion prevented
+
+third_down_stop_rate (dbl)
+  - Proportion of third downs stopped
+  - NFL Context: Elite >60% stop rate
+
+fourth_down_attempts_against (int)
+  - Fourth downs faced
+
+fourth_down_stops (int)
+  - Fourth downs where conversion prevented
+
+fourth_down_stop_rate (dbl)
+  - Proportion of fourth downs stopped
+
+sacks (int)
+  - Total sacks generated
+  - Count of sack == 1
+  - NFL Context: Elite defense 40+ sacks/season
+
+sack_rate (dbl)
+  - Sacks per pass attempt against
+  - Formula: sacks / pass_attempts_against
+  - NFL Context: Elite >8%, average ~6-7%
+
+interceptions (int)
+  - Interceptions generated
+  - Count of interception == 1
+
+fumbles_recovered (int)
+  - Fumbles recovered
+  - Count of fumble_lost == 1
+
+turnovers_generated (int)
+  - Total turnovers forced
+  - Sum of interceptions + fumbles_recovered
+  - NFL Context: Elite defense 25+ turnovers/season
+
+turnover_rate (dbl)
+  - Turnovers per play
+  - Formula: turnovers / plays_against
+  - NFL Context: Elite >2%, average ~1.5%
+
+explosive_plays_allowed (int)
+  - Count of plays allowing 20+ yards
+
+explosive_play_rate_allowed (dbl)
+  - Proportion of plays allowing 20+ yards
+  - NFL Context: Elite defense <6%
+
+**COLUMNS NOT RETURNED (Common Mistakes):**
+❌ 'defteam' - Renamed to 'team' in final output!
+❌ 'def_epa' - Use 'defensive_epa_per_play'
+❌ 'epa_allowed' - Use 'defensive_epa_per_play'
+
+**SORTING:**
+Default sort: defensive_epa_per_play (ascending - most negative first)
+
+**NEW PARAMETER:**
+exclude_garbage_time (default: TRUE) - Filters out Q4 plays with WP <10% or >90%
+
+**NFL BENCHMARKS:**
+- Elite defensive EPA/play: <-0.10 (negative!)
+- Elite sack rate: >8%
+- Elite turnover rate: >2%
+
+================================================================================
+FUNCTION: get_game_summary()
+================================================================================
+
+**File:** 04_game_analysis.R
+**Returns:** Single-row tibble (or NULL if game not found)
+
+**OUTPUT COLUMNS:**
+
+game_id (chr)
+  - Unique game identifier
+  - Example: "2024_01_KC_BAL"
+
+home_team (chr)
+  - Home team abbreviation
+
+away_team (chr)
+  - Away team abbreviation
+
+game_date (Date)
+  - Date of game
+  - Format: YYYY-MM-DD
+
+week (int)
+  - Week number (1-18 regular season, 19-22 playoffs)
+
+total_home_score (int)
+  - Final score for home team
+
+total_away_score (int)
+  - Final score for away team
+
+home_plays (int)
+  - Total offensive plays by home team
+
+away_plays (int)
+  - Total offensive plays by away team
+
+home_epa (dbl)
+  - Total EPA for home team offense
+
+away_epa (dbl)
+  - Total EPA for away team offense
+
+home_success_rate (dbl)
+  - Success rate for home team
+
+away_success_rate (dbl)
+  - Success rate for away team
+
+home_sacks_allowed (int)
+  - Sacks allowed by home team
+
+away_sacks_allowed (int)
+  - Sacks allowed by away team
+
+home_turnovers (int)
+  - Turnovers committed by home team
+
+away_turnovers (int)
+  - Turnovers committed by away team
+
+total_plays (int)
+  - Combined plays from both teams
+
+score_margin (int)
+  - Point differential (home - away)
+
+winner (chr)
+  - Winning team abbreviation (or "TIE")
+
+biggest_wp_swing (dbl) [OPTIONAL]
+  - Largest win probability swing in game
+  - Only included if 'wpa' column exists in data
+  - Range: 0.0 to 1.0 (typically 0.1 to 0.5)
+
+**SORTING:** Not applicable (single row)
+
+================================================================================
+FUNCTION: get_scoring_plays()
+================================================================================
+
+**File:** 04_game_analysis.R
+**Returns:** Tibble with one row per scoring play
+
+**OUTPUT COLUMNS:**
+
+game_id (chr)
+play_id (int)
+qtr (int) - Quarter (1-4 regular, 5 = OT)
+time_remaining (chr) - Format: "MM:SS"
+down (int) - Down when score occurred
+ydstogo (int) - Yards to go when score occurred
+scoring_team (chr) - Team that scored
+score_type (chr) - "Touchdown", "Field Goal", or "Safety"
+points (int) - Points scored (6 for TD, 3 for FG, 2 for Safety)
+posteam (chr) - Possessing team
+defteam (chr) - Defensive team
+score_differential_before (int) - Score margin before this play
+desc (chr) - Play description
+
+**SORTING:** By play_id (chronological order)
+
+================================================================================
+FUNCTION: get_drive_summary()
+================================================================================
+
+**File:** 04_game_analysis.R
+**Returns:** Tibble with one row per drive
+
+**OUTPUT COLUMNS:**
+
+game_id (chr)
+drive (int) - Drive number (sequential)
+posteam (chr) - Possessing team
+defteam (chr) - Defensive team
+plays (int) - Number of plays in drive
+yards_gained (int) - Net yards gained on drive
+yards_penalized (int) - Penalty yards on drive
+start_yard_line (int) - Starting field position
+end_yard_line (int) - Ending field position
+time_of_possession (chr) - Drive duration (MM:SS format)
+ended_with_score (int) - 1 if drive ended in score, 0 otherwise
+drive_epa (dbl) - Total EPA for drive
+
+**SORTING:** By drive number (chronological order)
+
+================================================================================
+USAGE EXAMPLES
+================================================================================
+
+# CORRECT - Column names verified first:
+rush_stats <- get_player_rushing_stats(pbp, 2024)
+names(rush_stats)  # Check actual columns
+top_rushers <- rush_stats %>%
+  select(player_name, rushes, rush_yards) %>%  # Using verified columns
+  arrange(desc(rush_yards))
+
+# WRONG - Assumed column names:
+rush_stats <- get_player_rushing_stats(pbp, 2024)
+top_rushers <- rush_stats %>%
+  select(player_name, carries, rush_yards)  # ERROR: 'carries' doesn't exist!
+
+================================================================================
+KEY REMINDERS
+================================================================================
+
+1. ALWAYS run names(result) after calling a function
+2. Use 'rushes' NOT 'carries'
+3. Use 'recent_team' NOT 'posteam' or 'team' (in player functions)
+4. Use 'team' NOT 'posteam' or 'defteam' (in team functions - renamed!)
+5. Passer rating ranges 0.0-158.3 (now corrected)
+6. Target share is proportion (0.0-1.0), not percentage
+7. Defensive EPA: NEGATIVE is GOOD
+8. Success rate: proportion (0.0-1.0), not percentage
+9. New parameter: exclude_garbage_time in team functions
+10. New parameter: include_qbs in rushing function
+
+================================================================================
+END OF COLUMN REFERENCE
+================================================================================
