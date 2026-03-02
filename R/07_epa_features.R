@@ -237,7 +237,9 @@ calculate_epa_trends <- function(pbp_data,
   # Filter to games where player had meaningful involvement
   weekly_epa <- weekly_epa %>%
     filter(plays >= min_plays_per_game) %>%
-    arrange(player_id, season, week)
+    # TEAM GROUPING: sort by player + season + team + week so rolling windows
+    # reset correctly when a player changes teams mid-season.
+    arrange(player_id, season, posteam, week)
 
   message(glue("Aggregated {nrow(weekly_epa)} player-weeks ({n_distinct(weekly_epa$player_id)} players)"))
 
@@ -263,7 +265,9 @@ calculate_epa_trends <- function(pbp_data,
     level_col <- glue("epa_level_{w}")
 
     weekly_epa <- weekly_epa %>%
-      group_by(player_id) %>%
+      # Group by player + season + team: rolling window resets on team change.
+      # A player traded mid-season has two independent trend windows.
+      group_by(player_id, season, posteam) %>%
       mutate(
         .row_num = row_number(),
 

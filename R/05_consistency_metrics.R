@@ -660,15 +660,33 @@ calculate_rolling_stats <- function(player_stats,
   # ============================================================================
   # PREPARE DATA
   # ============================================================================
-  
-  # Ensure data is sorted by player and week
-  player_stats <- player_stats %>%
-    arrange(player_id, season, week)
-  
+
+  # NOTE: success_rate uses nflfastR 'success' column (EPA > 0 = 1, EPA <= 0 = 0).
+  # EPA == 0 plays count as non-successes. This is NFL-standard behavior.
+  # Plays with EPA == 0 are NOT rare -- they cluster in goal-line and specific
+  # short-yardage situations. They are included in the denominator and treated
+  # as failures throughout this function.
+
+  # TEAM GROUPING: Rolling windows are partitioned by player_id + season + team
+  # (when a 'team' column is present). A player traded mid-season has two
+  # independent rolling windows. Rolling context from team A does NOT carry
+  # over into team B's window. This prevents cross-team contamination of
+  # rolling features.
+  has_team_col <- "team" %in% names(player_stats)
+
+  # Ensure data is sorted by player, season, team (if present), and week
+  if (has_team_col) {
+    player_stats <- player_stats %>%
+      arrange(player_id, season, team, week)
+  } else {
+    player_stats <- player_stats %>%
+      arrange(player_id, season, week)
+  }
+
   # ============================================================================
   # CALCULATE ROLLING AVERAGES
   # ============================================================================
-  
+
   # For each window size, calculate rolling averages
   for (window in windows) {
     
@@ -678,12 +696,10 @@ calculate_rolling_stats <- function(player_stats,
       roll_col_name <- glue("{stat}_roll{window}")
       
       # Calculate rolling average for each player
+      # Group by team if available to reset window on team change
       player_stats <- player_stats %>%
-        group_by(player_id) %>%
+        { if (has_team_col) group_by(., player_id, season, team) else group_by(., player_id, season) } %>%
         mutate(
-          # Add row number to check if we have enough prior games
-          .row_num = row_number(),
-          
           # CRITICAL: Use lag() to exclude current game (prevent feature leakage)
           # rollapply calculates mean of previous 'window' games
           !!roll_col_name := {
@@ -692,15 +708,18 @@ calculate_rolling_stats <- function(player_stats,
             
             # Calculate rolling mean with alignment='right' (looks backward)
             # fill=NA ensures we get NA when insufficient data
-            result <- zoo::rollapply(
+            zoo::rollapply(
               lagged_vals,
               width = window,
               FUN = function(x) {
-                # Count non-NA values (actual games with data)
+                # Count non-NA values (actual games with data, excluding the
+                # leading NA introduced by lag() on row 1 of each group)
                 non_na_count <- sum(!is.na(x))
-                
-                # Require enough non-NA values to meet min_games
-                # This allows some NAs in the window (missing data)
+
+                # min_games is the only gate. partial = TRUE means rollapply
+                # passes whatever values exist (up to window size), so this
+                # check handles both the early-season case (not enough real
+                # games yet) and the mid-window NA case (bye weeks, injuries).
                 if (non_na_count >= min_games) {
                   mean(x, na.rm = TRUE)
                 } else {
@@ -709,15 +728,10 @@ calculate_rolling_stats <- function(player_stats,
               },
               align = "right",
               fill = NA,
-              partial = FALSE  # Don't calculate with partial windows
+              partial = TRUE  # Pass partial windows; min_games check is the gate
             )
-            
-            # But override to NA if we don't have enough PRIOR GAMES yet
-            # Row N needs at least window prior games (row must be > window)
-            ifelse(.row_num <= window, NA_real_, result)
           }
         ) %>%
-        select(-.row_num) %>%
         ungroup()
     }
   }
