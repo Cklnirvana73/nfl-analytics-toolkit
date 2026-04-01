@@ -1,0 +1,863 @@
+
+> cat("NFL Analytics Toolkit -- Week 11 Assumption Validation\n")
+NFL Analytics Toolkit -- Week 11 Assumption Validation
+
+> cat("Run date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+Run date: 2026-03-17 16:02:53 
+
+> cat("Output:  ", output_path, "\n\n")
+Output:   C:/Users/cklni/Documents/nfl-analytics-toolkit/output/assumption_tests/assumptions_week11.txt 
+
+
+> # ==============================================================================
+> # STEP 1: SOURCE ALL PRODUCTION SCRIPTS
+> # ===================== .... [TRUNCATED] 
+Sourcing production scripts...
+
+> source(here::here("R", "01_data_loading.R"))
+
+> source(here::here("R", "02_player_stats.R"))
+
+> source(here::here("R", "03_team_stats.R"))
+
+> source(here::here("R", "04_game_analysis.R"))
+
+> source(here::here("R", "05_consistency_metrics.R"))
+
+> source(here::here("R", "06_predictive_validation.R"))
+
+> source(here::here("R", "07_epa_features.R"))
+
+> source(here::here("R", "08_usage_features.R"))
+
+> source(here::here("R", "09_gamescript_features.R"))
+
+> source(here::here("R", "10_opponent_features.R"))
+
+> source(here::here("R", "11_xgboost_fantasy.R"))
+
+> source(here::here("R", "13_ensemble_pipeline.R"))
+
+> cat("All scripts sourced.\n\n")
+All scripts sourced.
+
+
+> # ==============================================================================
+> # STEP 2: LOAD ARTIFACTS
+> # Load saved artifacts directly -- do  .... [TRUNCATED] 
+
+> results_path <- here::here("output", glue("week11_full_results_{SEASON}.rds"))
+
+> for (p in c(ml_path, results_path)) {
++   if (!file.exists(p)) {
++     sink()
++     stop("Required artifact missing: ", p,
++          "\nRun run_ful ..." ... [TRUNCATED] 
+
+> ml_data <- readRDS(ml_path)
+
+> results  <- readRDS(results_path)
+
+> cat("ml_data:", nrow(ml_data), "rows |", ncol(ml_data), "cols\n")
+ml_data: 5656 rows | 31 cols
+
+> cat("results slots:", paste(names(results), collapse = ", "), "\n\n")
+results slots: suites, comparisons, ensembles, features, summary 
+
+
+> model_rows <- ml_data %>% filter(has_target == TRUE, !is_absence_week)
+
+> train_rows <- model_rows %>% filter(week %in% TRAIN_WEEKS)
+
+> test_rows  <- model_rows %>% filter(week %in% TEST_WEEKS)
+
+> cat("Train rows:", nrow(train_rows), "| Test rows:", nrow(test_rows), "\n\n")
+Train rows: 2142 | Test rows: 520 
+
+
+> # ==============================================================================
+> # SECTION 1: REQUIRED FILES AND COLUMN PRESENCE
+> # ============= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 1: REQUIRED FILES AND COLUMN PRESENCE
+======================================================================== 
+
+> required_cols <- c(
++   "season", "week", "player_id", "player_name", "position_group", "team",
++   "opponent", "ppr_points_this_week", "ppr_points_ ..." ... [TRUNCATED] 
+
+> missing_cols <- setdiff(required_cols, names(ml_data))
+
+> if (length(missing_cols) == 0) {
++   log_result(paste0("All ", length(required_cols), " required columns present"), "PASS")
++   record("S1", "requir ..." ... [TRUNCATED] 
+  [PASS]  All 29 required columns present 
+
+> required_slots <- c("comparisons", "ensembles", "features", "summary")
+
+> missing_slots  <- setdiff(required_slots, names(results))
+
+> if (length(missing_slots) == 0) {
++   log_result("results artifact has all required slots", "PASS")
++   record("S1", "results_slots", "PASS")
++ } el .... [TRUNCATED] 
+  [PASS]  results artifact has all required slots 
+
+> record("S1", "data_loaded", "PASS",
++        paste0("train=", nrow(train_rows), " test=", nrow(test_rows)))
+
+> # ==============================================================================
+> # SECTION 2: TEMPORAL FOLD ORDERING
+> # ========================= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 2: TEMPORAL FOLD ORDERING
+======================================================================== 
+
+> if (max(train_rows$week) < min(test_rows$week)) {
++   log_result("Train/test week boundary clean", "PASS",
++              paste0("Train max = week " .... [TRUNCATED] 
+  [PASS]  Train/test week boundary clean
+         Train max = week 14 | Test min = week 15 
+
+> train_wk_range <- range(train_rows$week)
+
+> if (train_wk_range[1] == min(TRAIN_WEEKS) && train_wk_range[2] == max(TRAIN_WEEKS)) {
++   log_result("Train week range correct", "PASS",
++           .... [TRUNCATED] 
+  [PASS]  Train week range correct
+         Weeks 1 through 14 
+
+> test_wk_range <- range(test_rows$week)
+
+> if (test_wk_range[1] >= min(TEST_WEEKS) && test_wk_range[2] <= max(TEST_WEEKS)) {
++   log_result("Test week range correct", "PASS",
++              p .... [TRUNCATED] 
+  [PASS]  Test week range correct
+         Weeks 15 through 18 
+
+> # ==============================================================================
+> # SECTION 3: FEATURE LEAKAGE VERIFICATION
+> # =================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 3: FEATURE LEAKAGE (LAG VERIFICATION)
+======================================================================== 
+
+> # L1: epa_roll3 must be structurally NA at week 1
+> roll3_w1_na <- ml_data %>%
++   filter(week == 1, !is_absence_week) %>%
++   summarise(pct = round .... [TRUNCATED] 
+
+> if (roll3_w1_na >= 95) {
++   log_result("epa_roll3 structurally NA at week 1", "PASS",
++              paste0(roll3_w1_na, "% NA -- lag(rollapply())  ..." ... [TRUNCATED] 
+  [PASS]  epa_roll3 structurally NA at week 1
+         100% NA -- lag(rollapply()) logic intact 
+
+> # L2: epa_season_to_date must be structurally NA at week 1
+> std_w1_na <- ml_data %>%
++   filter(week == 1, !is_absence_week) %>%
++   summarise(pct  .... [TRUNCATED] 
+
+> if (std_w1_na >= 95) {
++   log_result("epa_season_to_date structurally NA at week 1", "PASS",
++              paste0(std_w1_na, "% NA -- lag(cummean( ..." ... [TRUNCATED] 
+  [PASS]  epa_season_to_date structurally NA at week 1
+         100% NA -- lag(cummean()) logic intact 
+
+> # L3: opp_adjusted_epa_prior must be NA at week 1
+> opp_w1_na <- ml_data %>%
++   filter(week == 1, !is_absence_week) %>%
++   summarise(pct = round(1 .... [TRUNCATED] 
+
+> if (opp_w1_na >= 95) {
++   log_result("opp_adjusted_epa_prior NA at week 1", "PASS",
++              paste0(opp_w1_na, "% NA -- expanding window thro ..." ... [TRUNCATED] 
+  [PASS]  opp_adjusted_epa_prior NA at week 1
+         100% NA -- expanding window through_week=0 correct 
+
+> # L4: target absent from feature set
+> non_feature_cols <- c(
++   "player_id", "player_name", "position_group", "season", "week",
++   "ppr_points_ne ..." ... [TRUNCATED] 
+
+> feature_cols_check <- setdiff(names(train_rows), non_feature_cols)
+
+> if (!"ppr_points_next_week" %in% feature_cols_check) {
++   log_result("Target (ppr_points_next_week) absent from feature set", "PASS")
++   record("S ..." ... [TRUNCATED] 
+  [PASS]  Target (ppr_points_next_week) absent from feature set 
+
+> # L5: leaky features confirmed excluded
+> leakage_excluded <- c("opponent_style", "opponent_tier")
+
+> found_in_feats   <- intersect(leakage_excluded, feature_cols_check)
+
+> if (length(found_in_feats) == 0) {
++   log_result("Leaky features excluded (opponent_style, opponent_tier)", "PASS",
++              "Full-season cla ..." ... [TRUNCATED] 
+  [PASS]  Leaky features excluded (opponent_style, opponent_tier)
+         Full-season classifications excluded per Week 11 leakage audit 
+
+> # ==============================================================================
+> # SECTION 4: FEATURE NA PROFILE
+> # ============================= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 4: FEATURE NA PROFILE
+======================================================================== 
+
+> feature_cols <- setdiff(
++   names(model_rows),
++   c("player_id", "player_name", "season", "week", "team", "opponent",
++     "position_group", "is_ ..." ... [TRUNCATED] 
+
+> na_profile <- model_rows %>%
++   select(all_of(intersect(feature_cols, names(model_rows)))) %>%
++   summarise(across(everything(), ~ round(100 * mea .... [TRUNCATED] 
+
+> cat("\nTop 20 features by % missing (model-eligible rows):\n")
+
+Top 20 features by % missing (model-eligible rows):
+
+> print(head(na_profile, 20))
+# A tibble: 18 × 2
+   feature                  pct_na
+   <chr>                     <dbl>
+ 1 neutral_epa_season         70.4
+ 2 epa_roll3                  30.9
+ 3 plays_roll3                30.9
+ 4 weeks_since_last_played    11.7
+ 5 epa_season_to_date         11.7
+ 6 leading_share_season       11.7
+ 7 trailing_share_season      11.7
+ 8 opp_adjusted_epa_prior      8.5
+ 9 schedule_difficulty_rank    8.5
+10 opp_adj_games_prior         1.9
+11 missed_weeks_this_season    0  
+12 availability_rate           0  
+13 plays_this_week             0  
+14 epa_this_week               0  
+15 success_rate_this_week      0  
+16 weeks_played                0  
+17 weeks_since_role_change     0  
+18 role_stability_flag         0  
+
+> structural_na_features <- c("epa_roll3", "plays_roll3", "epa_season_to_date",
++                              "opp_adjusted_epa_prior", "schedule_dif ..." ... [TRUNCATED] 
+
+> high_na <- na_profile %>%
++   filter(pct_na > 80, !feature %in% structural_na_features)
+
+> if (nrow(high_na) == 0) {
++   log_result("No non-structural features with >80% NA", "PASS")
++   record("S4", "high_na_features", "PASS")
++ } else {
+ .... [TRUNCATED] 
+  [PASS]  No non-structural features with >80% NA 
+
+> log_result("Structural NAs passed through to XGBoost (no imputation)", "INFO",
++            paste0(paste(structural_na_features, collapse = ", ")))
+  [INFO]  Structural NAs passed through to XGBoost (no imputation)
+         epa_roll3, plays_roll3, epa_season_to_date, opp_adjusted_epa_prior, schedule_difficulty_rank, neutral_epa_season, leading_share_season, trailing_share_season, weeks_since_last_played 
+
+> record("S4", "structural_nas", "INFO",
++        paste0(paste(structural_na_features, collapse = ", ")))
+
+> # ==============================================================================
+> # SECTION 5: FEATURE CORRELATION
+> # ============================ .... [TRUNCATED] 
+
+========================================================================
+  SECTION 5: FEATURE CORRELATION (SHAP INTERPRETATION RISK)
+======================================================================== 
+
+> numeric_feats <- train_rows %>%
++   select(all_of(intersect(feature_cols, names(train_rows)))) %>%
++   select(where(is.numeric))
+
+> cor_mat <- cor(numeric_feats, use = "pairwise.complete.obs")
+
+> cor_idx <- which(abs(cor_mat) > 0.70 & upper.tri(cor_mat), arr.ind = TRUE)
+
+> if (nrow(cor_idx) == 0) {
++   log_result("No highly correlated feature pairs (|r| > 0.70)", "PASS")
++   record("S5", "feature_correlation", "PASS")
+ .... [TRUNCATED] 
+
+Highly correlated pairs (|r| > 0.70):
+# A tibble: 9 × 3
+  feature_a                feature_b              correlation
+  <chr>                    <chr>                        <dbl>
+1 missed_weeks_this_season availability_rate           -0.939
+2 opp_adj_games_prior      weeks_played                 0.926
+3 epa_season_to_date       opp_adjusted_epa_prior       0.901
+4 plays_this_week          plays_roll3                  0.862
+5 epa_roll3                epa_season_to_date           0.837
+6 weeks_since_role_change  role_stability_flag          0.807
+7 leading_share_season     trailing_share_season       -0.797
+8 epa_roll3                opp_adjusted_epa_prior       0.787
+9 epa_this_week            success_rate_this_week       0.727
+  [WARN]  Correlated feature pairs: 9
+         SHAP values for these pairs must be interpreted as a group 
+  [PASS]  No extreme correlations (|r| > 0.95) 
+
+> # ==============================================================================
+> # SECTION 6: FOLD VIABILITY
+> # ================================= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 6: FOLD VIABILITY (SAMPLE SIZE PER WEEK)
+======================================================================== 
+
+> fold_sizes <- train_rows %>%
++   group_by(position_group, week) %>%
++   summarise(n_players = n(), .groups = "drop")
+
+> fold_summary <- fold_sizes %>%
++   group_by(position_group) %>%
++   summarise(
++     min_players    = min(n_players),
++     median_players = round(m .... [TRUNCATED] 
+
+> cat("\nPlayers per position per week (training rows):\n")
+
+Players per position per week (training rows):
+
+> print(fold_summary)
+# A tibble: 3 × 4
+  position_group min_players median_players weeks_below_10
+  <fct>                <int>          <dbl>          <int>
+1 passer                  21             28              0
+2 rusher                  34             45              0
+3 receiver                58             81              0
+
+> for (i in seq_len(nrow(fold_summary))) {
++   pos    <- fold_summary$position_group[i]
++   min_n  <- fold_summary$min_players[i]
++   low_wk <- fold_s .... [TRUNCATED] 
+  [PASS]  Fold size: passer
+         Min 21 players/week 
+  [PASS]  Fold size: rusher
+         Min 34 players/week 
+  [PASS]  Fold size: receiver
+         Min 58 players/week 
+
+> # ==============================================================================
+> # SECTION 7: TARGET VARIABLE DISTRIBUTION
+> # =================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 7: TARGET VARIABLE DISTRIBUTION BY POSITION
+======================================================================== 
+
+> ppr_dist <- train_rows %>%
++   group_by(position_group) %>%
++   summarise(
++     n        = n(),
++     mean_ppr = round(mean(ppr_points_next_week, n .... [TRUNCATED] 
+
+> cat("\nTarget (ppr_points_next_week) distribution by position:\n")
+
+Target (ppr_points_next_week) distribution by position:
+
+> print(ppr_dist)
+# A tibble: 3 × 7
+  position_group     n mean_ppr sd_ppr   p25   p50   p75
+  <fct>          <int>    <dbl>  <dbl> <dbl> <dbl> <dbl>
+1 passer           384    13.7    6.99  8.84 13.1   18.4
+2 rusher           630     8.04   6.66  2.9   6.05  11.7
+3 receiver        1128    11.6    7.33  6.1   9.9   15.6
+
+> for (i in seq_len(nrow(ppr_dist))) {
++   pos <- ppr_dist$position_group[i]
++   sd  <- ppr_dist$sd_ppr[i]
++   log_result(paste0("Target SD: ", pos),  .... [TRUNCATED] 
+  [INFO]  Target SD: passer
+         SD = 6.99 PPR pts -- RMSE ceiling (naive predict-mean = this SD) 
+  [INFO]  Target SD: rusher
+         SD = 6.66 PPR pts -- RMSE ceiling (naive predict-mean = this SD) 
+  [INFO]  Target SD: receiver
+         SD = 7.33 PPR pts -- RMSE ceiling (naive predict-mean = this SD) 
+
+> neg_target <- sum(train_rows$ppr_points_next_week < 0, na.rm = TRUE)
+
+> if (neg_target == 0) {
++   log_result("No negative target values", "PASS")
++   record("S7", "negative_target", "PASS")
++ } else {
++   log_result("Ne ..." ... [TRUNCATED] 
+  [WARN]  Negative target values present
+         6 rows with ppr_points_next_week < 0 
+
+> # ==============================================================================
+> # SECTION 8: SEASON BOUNDARY
+> # ================================ .... [TRUNCATED] 
+
+========================================================================
+  SECTION 8: SEASON BOUNDARY (TARGET NA AT LAST PLAYER-SEASON WEEK)
+======================================================================== 
+
+> # The correct check: the last week each player-season-team group appears must
+> # have NA target (no next week to predict). Checking week == 18 is w .... [TRUNCATED] 
+
+> # Also show the max week in the data for context
+> max_week_data <- max(ml_data$week, na.rm = TRUE)
+
+> cat(glue("  Max week in ml_data: {max_week_data}
++ "))
+Max week in ml_data: 21
+> cat(glue("  Rows with NA target at last player-season week: {last_week_target_na}%
++ "))
+Rows with NA target at last player-season week: 100%
+> if (last_week_target_na >= 95) {
++   log_result("ppr_points_next_week NA at last player-season week", "PASS",
++              paste0(last_week_target .... [TRUNCATED] 
+  [PASS]  ppr_points_next_week NA at last player-season week
+         100% NA -- season boundary intact (postseason rows have valid targets) 
+
+> cat("\n\n", strrep("-", 72), "\n")
+
+
+ ------------------------------------------------------------------------ 
+
+> cat("Pre-training checks complete. Loading model results...\n")
+Pre-training checks complete. Loading model results...
+
+> cat(strrep("-", 72), "\n\n")
+------------------------------------------------------------------------ 
+
+
+> # ==============================================================================
+> # STEP 3: ASSEMBLE METRICS
+> # ================================== .... [TRUNCATED] 
+
+> positions   <- unique(summary_tbl$position)
+
+> baselines   <- c("season_avg_baseline", "persistence_baseline")
+
+> models      <- c("xgboost", "random_forest", "elastic_net", "ensemble")
+
+> get_rmse <- function(pos, mdl) {
++   summary_tbl %>%
++     filter(position == pos, model == mdl) %>%
++     pull(rmse) %>%
++     { if (length(.) == 0 .... [TRUNCATED] 
+
+> cat("\nFull results summary:\n")
+
+Full results summary:
+
+> print(summary_tbl %>% arrange(position, rmse))
+# A tibble: 18 × 6
+   position model                 rmse   mae     rsq n_test
+   <chr>    <chr>                <dbl> <dbl>   <dbl>  <int>
+ 1 passer   random_forest         7.02  5.88  0.179     109
+ 2 passer   elastic_net           7.13  5.95  0.168     109
+ 3 passer   ensemble              7.14  5.98  0.160     109
+ 4 passer   xgboost               7.38  6.07  0.116     109
+ 5 passer   season_avg_baseline   7.60  6.34 NA         109
+ 6 passer   persistence_baseline  9.73  7.76  0.0748    109
+ 7 receiver ensemble              6.35  5.06  0.160     417
+ 8 receiver elastic_net           6.37  5.11  0.157     417
+ 9 receiver xgboost               6.38  5.17  0.167     417
+10 receiver random_forest         6.42  5.22  0.149     417
+11 receiver season_avg_baseline   6.93  5.67 NA         417
+12 receiver persistence_baseline  9.58  7.50  0.0816    417
+13 rusher   elastic_net           6.24  4.74  0.0718    211
+14 rusher   ensemble              6.36  4.78  0.0327    211
+15 rusher   season_avg_baseline   6.46  4.87 NA         211
+16 rusher   random_forest         6.49  5.00  0.0322    211
+17 rusher   xgboost               6.63  5.13  0.0320    211
+18 rusher   persistence_baseline  8.40  6.14  0.0511    211
+
+> cat("\n")
+
+
+> # ==============================================================================
+> # SECTION 9: BASELINE COMPARISON
+> # ============================ .... [TRUNCATED] 
+
+========================================================================
+  SECTION 9: BASELINE COMPARISON
+======================================================================== 
+
+> cat("All ML models must beat the season_avg_baseline RMSE.\n\n")
+All ML models must beat the season_avg_baseline RMSE.
+
+
+> for (pos in positions) {
++   baseline_rmse <- get_rmse(pos, "season_avg_baseline")
++   if (is.na(baseline_rmse)) {
++     log_result(paste0("Baseline ..." ... [TRUNCATED] 
+  passer -- Season avg baseline RMSE: 7.597
+  [PASS]  Beats baseline: passer | xgboost
+         RMSE 7.38 vs baseline 7.597 (delta -0.216) 
+  [PASS]  Beats baseline: passer | random_forest
+         RMSE 7.02 vs baseline 7.597 (delta -0.577) 
+  [PASS]  Beats baseline: passer | elastic_net
+         RMSE 7.131 vs baseline 7.597 (delta -0.466) 
+  [PASS]  Beats baseline: passer | ensemble
+         RMSE 7.142 vs baseline 7.597 (delta -0.455) 
+  receiver -- Season avg baseline RMSE: 6.931
+  [PASS]  Beats baseline: receiver | xgboost
+         RMSE 6.375 vs baseline 6.931 (delta -0.556) 
+  [PASS]  Beats baseline: receiver | random_forest
+         RMSE 6.417 vs baseline 6.931 (delta -0.514) 
+  [PASS]  Beats baseline: receiver | elastic_net
+         RMSE 6.372 vs baseline 6.931 (delta -0.559) 
+  [PASS]  Beats baseline: receiver | ensemble
+         RMSE 6.346 vs baseline 6.931 (delta -0.585) 
+  rusher -- Season avg baseline RMSE: 6.460
+  [FAIL]  Does NOT beat baseline: rusher | xgboost
+         RMSE 6.633 >= baseline 6.46 (delta +0.173) 
+  [FAIL]  Does NOT beat baseline: rusher | random_forest
+         RMSE 6.49 >= baseline 6.46 (delta +0.03) 
+  [PASS]  Beats baseline: rusher | elastic_net
+         RMSE 6.241 vs baseline 6.46 (delta -0.219) 
+  [PASS]  Beats baseline: rusher | ensemble
+         RMSE 6.363 vs baseline 6.46 (delta -0.098) 
+
+> # ==============================================================================
+> # SECTION 10: OVERFITTING GAP
+> # =============================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 10: OVERFITTING GAP (RMSE VS TARGET SD; R-SQUARED UPPER BOUND)
+======================================================================== 
+
+> cat("Test RMSE > target SD means model is worse than predicting the mean.\n")
+Test RMSE > target SD means model is worse than predicting the mean.
+
+> cat("R-squared > 0.95 on real-world NFL data strongly suggests leakage.\n\n")
+R-squared > 0.95 on real-world NFL data strongly suggests leakage.
+
+
+> for (pos in positions) {
++   target_sd <- ppr_dist %>%
++     filter(position_group == pos) %>%
++     pull(sd_ppr)
++   if (length(target_sd) == 0) ne .... [TRUNCATED] 
+  [WARN]  RMSE > target SD: passer | xgboost
+         RMSE 7.38 > SD 6.99 (ratio 1.056) 
+  [WARN]  RMSE > target SD: passer | random_forest
+         RMSE 7.02 > SD 6.99 (ratio 1.004) 
+  [WARN]  RMSE > target SD: passer | elastic_net
+         RMSE 7.131 > SD 6.99 (ratio 1.02) 
+  [WARN]  RMSE > target SD: passer | ensemble
+         RMSE 7.142 > SD 6.99 (ratio 1.022) 
+  [WARN]  RMSE > target SD: passer | season_avg_baseline
+         RMSE 7.597 > SD 6.99 (ratio 1.087) 
+  [PASS]  R-squared upper bound: passer
+         Max Rsq = 0.179 (< 0.95) 
+  [PASS]  RMSE within SD ceiling: receiver | xgboost
+         RMSE 6.375 / SD 7.33 = 0.87 
+  [PASS]  RMSE within SD ceiling: receiver | random_forest
+         RMSE 6.417 / SD 7.33 = 0.875 
+  [PASS]  RMSE within SD ceiling: receiver | elastic_net
+         RMSE 6.372 / SD 7.33 = 0.869 
+  [PASS]  RMSE within SD ceiling: receiver | ensemble
+         RMSE 6.346 / SD 7.33 = 0.866 
+  [PASS]  RMSE within SD ceiling: receiver | season_avg_baseline
+         RMSE 6.931 / SD 7.33 = 0.946 
+  [PASS]  R-squared upper bound: receiver
+         Max Rsq = 0.167 (< 0.95) 
+  [PASS]  RMSE within SD ceiling: rusher | xgboost
+         RMSE 6.633 / SD 6.66 = 0.996 
+  [PASS]  RMSE within SD ceiling: rusher | random_forest
+         RMSE 6.49 / SD 6.66 = 0.975 
+  [PASS]  RMSE within SD ceiling: rusher | elastic_net
+         RMSE 6.241 / SD 6.66 = 0.937 
+  [PASS]  RMSE within SD ceiling: rusher | ensemble
+         RMSE 6.363 / SD 6.66 = 0.955 
+  [PASS]  RMSE within SD ceiling: rusher | season_avg_baseline
+         RMSE 6.46 / SD 6.66 = 0.97 
+  [PASS]  R-squared upper bound: rusher
+         Max Rsq = 0.072 (< 0.95) 
+
+> # ==============================================================================
+> # SECTION 11: ENSEMBLE GAIN
+> # ================================= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 11: ENSEMBLE GAIN OVER BEST INDIVIDUAL MODEL
+======================================================================== 
+
+> cat("Stacking typically improves 0-5% over best single model.\n\n")
+Stacking typically improves 0-5% over best single model.
+
+
+> for (pos in positions) {
++   ens_rmse  <- get_rmse(pos, "ensemble")
++   ind_rmses <- sapply(c("xgboost", "random_forest", "elastic_net"),
++          .... [TRUNCATED] 
+  passer: Ensemble 7.142 | Best individual (random_forest) 7.020 | Gain -1.74%
+  [WARN]  Ensemble trails best individual: passer
+         Ensemble RMSE 7.142 > best individual 7.02 (1.74% worse) -- stacking adds noise for this position 
+  receiver: Ensemble 6.346 | Best individual (elastic_net) 6.372 | Gain 0.40%
+  [PASS]  Ensemble gain: receiver
+         Beats best individual by 0.4% 
+  rusher: Ensemble 6.363 | Best individual (elastic_net) 6.241 | Gain -1.94%
+  [WARN]  Ensemble trails best individual: rusher
+         Ensemble RMSE 6.363 > best individual 6.241 (1.94% worse) -- stacking adds noise for this position 
+
+> # ==============================================================================
+> # SECTION 12: PREDICTION CORRELATION
+> # ======================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 12: PREDICTION CORRELATION (ENSEMBLE DIVERSIFICATION)
+======================================================================== 
+
+> cat("r > 0.9 between models: ensemble adds marginal value -- documented, not blocking.\n\n")
+r > 0.9 between models: ensemble adds marginal value -- documented, not blocking.
+
+
+> for (pos in positions) {
++   comp <- results$comparisons[[pos]]
++ 
++   if (is.null(comp) || is.null(comp$test_predictions)) {
++     log_result(paste .... [TRUNCATED] 
+  [INFO]  Prediction correlation: passer
+         test_predictions not available 
+  [INFO]  Prediction correlation: receiver
+         test_predictions not available 
+  [INFO]  Prediction correlation: rusher
+         test_predictions not available 
+
+> # ==============================================================================
+> # SECTION 13: FEATURE IMPORTANCE STABILITY
+> # ================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 13: FEATURE IMPORTANCE STABILITY
+======================================================================== 
+
+> cat("Consensus features = top 20 in >= 2 of 3 models.\n")
+Consensus features = top 20 in >= 2 of 3 models.
+
+> cat("These are the most robust signals across model types.\n\n")
+These are the most robust signals across model types.
+
+
+> for (pos in positions) {
++   feat_res <- results$features[[pos]]
++ 
++   if (is.null(feat_res) || is.null(feat_res$importance_table)) {
++     log_res .... [TRUNCATED] 
+  passer: 21 features | 20 consensus (top 20 in >= 2 models)
+  Top consensus features:
+    1. leading_share_season                0.808
+    2. trailing_share_season               0.738
+    3. epa_this_week                       0.712
+    4. epa_season_to_date                  0.654
+    5. opp_adjusted_epa_prior              0.616
+  [PASS]  Feature consensus: passer
+         20 consensus features 
+  receiver: 21 features | 21 consensus (top 20 in >= 2 models)
+  Top consensus features:
+    1. plays_this_week                     0.755
+    2. availability_rate                   0.721
+    3. ppr_points_this_week                0.651
+    4. plays_roll3                         0.603
+    5. epa_season_to_date                  0.514
+  [PASS]  Feature consensus: receiver
+         21 consensus features 
+  rusher: 21 features | 20 consensus (top 20 in >= 2 models)
+  Top consensus features:
+    1. plays_this_week                     0.833
+    2. ppr_points_this_week                0.665
+    3. epa_roll3                           0.557
+    4. team                                0.500
+    6. leading_share_season                0.466
+  [PASS]  Feature consensus: rusher
+         20 consensus features 
+
+> # ==============================================================================
+> # SECTION 14: OBSERVATION INDEPENDENCE
+> # ====================== .... [TRUNCATED] 
+
+========================================================================
+  SECTION 14: OBSERVATION INDEPENDENCE (DOCUMENTED LIMITATION)
+======================================================================== 
+
+> cat("XGBoost does not assume independent observations.\n")
+XGBoost does not assume independent observations.
+
+> cat("RMSE treats each player-week as independent -- same player in multiple\n")
+RMSE treats each player-week as independent -- same player in multiple
+
+> cat("test weeks means RMSE CIs are anti-conservative.\n")
+test weeks means RMSE CIs are anti-conservative.
+
+> cat("Report point estimates only, no confidence intervals on RMSE.\n\n")
+Report point estimates only, no confidence intervals on RMSE.
+
+
+> player_reps <- test_rows %>%
++   count(player_id, position_group) %>%
++   group_by(position_group) %>%
++   summarise(
++     median_weeks = round(med .... [TRUNCATED] 
+
+> cat("Player appearances in test set (weeks 15-18):\n")
+Player appearances in test set (weeks 15-18):
+
+> print(player_reps)
+# A tibble: 3 × 3
+  position_group median_weeks max_weeks
+  <fct>                 <dbl>     <int>
+1 passer                    3         4
+2 rusher                    3         4
+3 receiver                  2         7
+
+> log_result("Observation independence: repeated player-weeks", "INFO",
++            "RMSE CIs anti-conservative -- report point estimates only")
+  [INFO]  Observation independence: repeated player-weeks
+         RMSE CIs anti-conservative -- report point estimates only 
+
+> record("S14", "obs_independence", "INFO",
++        "repeated player-weeks -- RMSE CIs anti-conservative by design")
+
+> # ==============================================================================
+> # SECTION 15: OPPONENT FEATURE COVERAGE (NEW WEEK 11)
+> # ======= .... [TRUNCATED] 
+
+========================================================================
+  SECTION 15: OPPONENT FEATURE COVERAGE (WEEK 11 FIX VERIFICATION)
+======================================================================== 
+
+> cat("Week 11 fix: opp_adjusted_epa_prior, schedule_difficulty_rank, and\n")
+Week 11 fix: opp_adjusted_epa_prior, schedule_difficulty_rank, and
+
+> cat("opp_adj_games_prior now populated via calculate_opponent_adjustments().\n")
+opp_adj_games_prior now populated via calculate_opponent_adjustments().
+
+> cat("Previously all three were 100% NA in every model run.\n")
+Previously all three were 100% NA in every model run.
+
+> cat("FAIL here means the fix did not take -- check run_full_pipeline().\n\n")
+FAIL here means the fix did not take -- check run_full_pipeline().
+
+
+> opp_features <- c("opp_adjusted_epa_prior", "schedule_difficulty_rank",
++                    "opp_adj_games_prior")
+
+> for (feat in opp_features) {
++   if (!feat %in% names(model_rows)) {
++     log_result(paste0("Column absent: ", feat), "FAIL")
++     record("S15", p .... [TRUNCATED] 
+  opp_adjusted_epa_prior             : 2.0% NA on post-week-1 rows
+  [PASS]  Opponent coverage: opp_adjusted_epa_prior
+         2% NA on post-week-1 rows -- fix confirmed active 
+  schedule_difficulty_rank           : 2.0% NA on post-week-1 rows
+  [PASS]  Opponent coverage: schedule_difficulty_rank
+         2% NA on post-week-1 rows -- fix confirmed active 
+  opp_adj_games_prior                : 2.0% NA on post-week-1 rows
+  [PASS]  Opponent coverage: opp_adj_games_prior
+         2% NA on post-week-1 rows -- fix confirmed active 
+
+> # Coverage by position
+> opp_by_pos <- model_rows %>%
++   filter(week > 1) %>%
++   group_by(position_group) %>%
++   summarise(
++     pct_na_opp = ro .... [TRUNCATED] 
+
+> cat("\nopp_adjusted_epa_prior coverage by position (weeks > 1):\n")
+
+opp_adjusted_epa_prior coverage by position (weeks > 1):
+
+> print(opp_by_pos)
+# A tibble: 3 × 3
+  position_group pct_na_opp     n
+  <fct>               <dbl> <int>
+1 passer                3.9   459
+2 rusher                1.8   763
+3 receiver              1.5  1322
+
+> # ==============================================================================
+> # FINAL SUMMARY
+> # ============================================= .... [TRUNCATED] 
+
+========================================================================
+  ASSUMPTION VALIDATION SUMMARY
+======================================================================== 
+
+> summary_results <- bind_rows(lapply(results_log, as.data.frame)) %>%
++   as_tibble()
+
+> status_counts <- summary_results %>%
++   group_by(status) %>%
++   summarise(n = n(), .groups = "drop") %>%
++   arrange(match(status, c("FAIL", "WARN ..." ... [TRUNCATED] 
+
+> cat("\nResult counts:\n")
+
+Result counts:
+
+> print(status_counts)
+# A tibble: 4 × 2
+  status     n
+  <chr>  <int>
+1 FAIL       2
+2 WARN       9
+3 PASS      47
+4 INFO       8
+
+> fails <- summary_results %>% filter(status == "FAIL")
+
+> if (nrow(fails) > 0) {
++   cat("\nFAILURES -- resolve before trusting model output:\n")
++   for (i in seq_len(nrow(fails))) {
++     cat(sprintf("  [ ..." ... [TRUNCATED] 
+
+FAILURES -- resolve before trusting model output:
+  [FAIL]  SS9  | vs_baseline_rusher_xgboost
+          delta=+0.173
+  [FAIL]  SS9  | vs_baseline_rusher_random_forest
+          delta=+0.03
+
+> warns <- summary_results %>% filter(status == "WARN")
+
+> if (nrow(warns) > 0) {
++   cat("\nWARNINGS -- review before Week 11 code review:\n")
++   for (i in seq_len(nrow(warns))) {
++     cat(sprintf("  [WAR ..." ... [TRUNCATED] 
+
+WARNINGS -- review before Week 11 code review:
+  [WARN]  SS5  | feature_correlation
+          9 pairs above 0.70
+  [WARN]  SS7  | negative_target
+          6 rows
+  [WARN]  SS10 | rmse_vs_sd_passer_xgboost
+          ratio=1.056
+  [WARN]  SS10 | rmse_vs_sd_passer_random_forest
+          ratio=1.004
+  [WARN]  SS10 | rmse_vs_sd_passer_elastic_net
+          ratio=1.02
+  [WARN]  SS10 | rmse_vs_sd_passer_ensemble
+          ratio=1.022
+  [WARN]  SS10 | rmse_vs_sd_passer_season_avg_baseline
+          ratio=1.087
+  [WARN]  SS11 | ensemble_gain_passer
+          loss=1.74%
+  [WARN]  SS11 | ensemble_gain_rusher
+          loss=1.94%
+
+> cat("\n", strrep("-", 72), "\n")
+
+ ------------------------------------------------------------------------ 
+
+> cat("Output: output/assumption_tests/assumptions_week11.txt\n")
+Output: output/assumption_tests/assumptions_week11.txt
+
+> cat("Run date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+Run date: 2026-03-17 16:02:55 
+
+> cat(strrep("-", 72), "\n")
+------------------------------------------------------------------------ 
+
+> sink()
