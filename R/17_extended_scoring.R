@@ -165,6 +165,28 @@ MIN_PLAYS_FOR_APPEARANCE <- 1L
 #' @param sack_penalty Numeric. Negative points per sack taken. Applied to
 #'   the QB (passer_player_id). Common Sleeper value: -1.0. Default 0.
 #'
+#' # --- Sleeper parity parameters (all default to 0 / NULL = no effect) ---
+#' @param tiered_rec_tiers Numeric vector of length 6, or NULL. Per-reception
+#'   points by yardage bucket, in order: 0-4 yards, 5-9 yards, 10-19 yards,
+#'   20-29 yards, 30-39 yards, 40+ yards. When NULL (default), uses
+#'   TIERED_PPR_BREAKS (0, 0.5, 1.0, 1.5, 2.0, 2.0). Only applied when
+#'   use_tiered_ppr = TRUE. Maps from Sleeper fields:
+#'   rec_0_4, rec_5_9, rec_10_19, rec_20_29, rec_30_39, rec_40p.
+#' @param bonus_pass_yd_300 Numeric. Bonus for 300+ passing yards in a game.
+#'   Cumulative with bonus_pass_yd_400 (reaching 400 yards earns both).
+#'   Common Sleeper value: 2.0. Default 0.
+#' @param bonus_pass_yd_400 Numeric. Bonus for 400+ passing yards in a game.
+#'   Common Sleeper value: 4.0. Default 0.
+#' @param bonus_rec_yd_200 Numeric. Bonus for 200+ receiving yards in a game.
+#'   Cumulative with hundred_yard_bonus (reaching 200 yards earns both).
+#'   Common Sleeper value: 4.0. Default 0.
+#' @param bonus_rush_yd_200 Numeric. Bonus for 200+ rushing yards in a game.
+#'   Cumulative with hundred_yard_bonus. Common Sleeper value: 4.0. Default 0.
+#' @param pass_2pt Numeric. Points awarded to the PASSER for a successful
+#'   passing 2-point conversion. The scorer (receiver) still earns
+#'   two_point_conversion points separately. Common Sleeper value: 2.0.
+#'   Default 0.
+#'
 #' @return Tibble with one row per player per game (season + week + game_id +
 #'   player_id). Columns:
 #'   - season (int)
@@ -180,7 +202,10 @@ MIN_PLAYS_FOR_APPEARANCE <- 1L
 #'   - two_pt_fantasy_points (dbl): NEW -- 2PC scoring only
 #'   - first_down_fantasy_points (dbl): NEW -- first down bonus only
 #'   - long_td_fantasy_points (dbl): NEW -- long TD bonus only
-#'   - hundred_yard_fantasy_points (dbl): NEW -- 100-yard game bonus only
+#'   - hundred_yard_fantasy_points (dbl): NEW -- yardage milestone bonus
+#'     (100-yard + 200-yard bonuses combined, rush and receiving)
+#'   - pass_milestone_fantasy_points (dbl): NEW -- QB passing yardage
+#'     milestone bonuses (300-yard and 400-yard game bonuses combined)
 #'   - total_fantasy_points (dbl): Sum of all components
 #'   - pass_yards (dbl), pass_tds (int), pass_ints (int): raw stats
 #'   - rush_yards (dbl), rush_tds (int), rush_attempts (int): raw stats
@@ -316,7 +341,14 @@ calculate_fantasy_points_ext <- function(
   hundred_yard_bonus   = 0,
   superflex_pass_td    = 0,
   two_point_conversion = 0,
-  sack_penalty         = 0
+  sack_penalty         = 0,
+  # --- New Sleeper parity parameters (all default to 0 / NULL = no effect) ---
+  tiered_rec_tiers  = NULL,
+  bonus_pass_yd_300 = 0,
+  bonus_pass_yd_400 = 0,
+  bonus_rec_yd_200  = 0,
+  bonus_rush_yd_200 = 0,
+  pass_2pt          = 0
 ) {
 
   # ============================================================================
@@ -353,7 +385,11 @@ calculate_fantasy_points_ext <- function(
     rush_att_bonus = rush_att_bonus, first_down_points = first_down_points,
     long_td_bonus = long_td_bonus, long_td_threshold = long_td_threshold,
     hundred_yard_bonus = hundred_yard_bonus, superflex_pass_td = superflex_pass_td,
-    two_point_conversion = two_point_conversion, sack_penalty = sack_penalty
+    two_point_conversion = two_point_conversion, sack_penalty = sack_penalty,
+    tiered_rec_tiers = tiered_rec_tiers,
+    bonus_pass_yd_300 = bonus_pass_yd_300, bonus_pass_yd_400 = bonus_pass_yd_400,
+    bonus_rec_yd_200 = bonus_rec_yd_200, bonus_rush_yd_200 = bonus_rush_yd_200,
+    pass_2pt = pass_2pt
   )
   if (!params_check$valid) {
     stop(paste(params_check$errors, collapse = "\n"))
@@ -443,51 +479,57 @@ calculate_fantasy_points_ext <- function(
 
   # -- Passing --
   passing_pts <- .build_ext_passing_fantasy(
-    pbp          = pbp_filtered,
-    pass_yd      = pass_yd,
-    pass_td      = effective_pass_td,
-    pass_int     = pass_int,
-    pick6_penalty = pick6_penalty,
-    sack_penalty = sack_penalty,
-    fumbles      = fumbles
+    pbp               = pbp_filtered,
+    pass_yd           = pass_yd,
+    pass_td           = effective_pass_td,
+    pass_int          = pass_int,
+    pick6_penalty     = pick6_penalty,
+    sack_penalty      = sack_penalty,
+    fumbles           = fumbles,
+    bonus_pass_yd_300 = bonus_pass_yd_300,
+    bonus_pass_yd_400 = bonus_pass_yd_400
   )
   message(glue("    Passing: {nrow(passing_pts)} player-games"))
 
   # -- Rushing --
   rushing_pts <- .build_ext_rushing_fantasy(
-    pbp              = pbp_filtered,
-    rush_yd          = rush_yd,
-    rush_td          = rush_td,
-    rush_att_bonus   = rush_att_bonus,
-    fumbles          = fumbles,
+    pbp               = pbp_filtered,
+    rush_yd           = rush_yd,
+    rush_td           = rush_td,
+    rush_att_bonus    = rush_att_bonus,
+    fumbles           = fumbles,
     first_down_points = first_down_points,
-    long_td_bonus    = long_td_bonus,
+    long_td_bonus     = long_td_bonus,
     long_td_threshold = long_td_threshold,
-    hundred_yard_bonus = hundred_yard_bonus
+    hundred_yard_bonus = hundred_yard_bonus,
+    bonus_rush_yd_200  = bonus_rush_yd_200
   )
   message(glue("    Rushing: {nrow(rushing_pts)} player-games"))
 
   # -- Receiving --
   receiving_pts <- .build_ext_receiving_fantasy(
-    pbp              = pbp_filtered,
-    rec_yd           = rec_yd,
-    rec_td           = rec_td,
-    ppr              = ppr,
-    fumbles          = fumbles,
-    use_tiered_ppr   = use_tiered_ppr,
-    te_premium       = te_premium,
-    position_lookup  = position_lookup,
+    pbp               = pbp_filtered,
+    rec_yd            = rec_yd,
+    rec_td            = rec_td,
+    ppr               = ppr,
+    fumbles           = fumbles,
+    use_tiered_ppr    = use_tiered_ppr,
+    te_premium        = te_premium,
+    position_lookup   = position_lookup,
     first_down_points = first_down_points,
-    long_td_bonus    = long_td_bonus,
-    long_td_threshold = long_td_threshold,
-    hundred_yard_bonus = hundred_yard_bonus
+    long_td_bonus     = long_td_bonus,
+    long_td_threshold  = long_td_threshold,
+    hundred_yard_bonus = hundred_yard_bonus,
+    tiered_rec_tiers   = tiered_rec_tiers,
+    bonus_rec_yd_200   = bonus_rec_yd_200
   )
   message(glue("    Receiving: {nrow(receiving_pts)} player-games"))
 
   # -- Two-point conversions --
   two_pt_pts <- .build_two_point_fantasy(
     pbp                  = pbp_filtered,
-    two_point_conversion = two_point_conversion
+    two_point_conversion = two_point_conversion,
+    pass_2pt             = pass_2pt
   )
   message(glue("    Two-point: {nrow(two_pt_pts)} player-games"))
 
@@ -531,7 +573,9 @@ calculate_fantasy_points_ext <- function(
     "pass_yards", "pass_tds", "pass_ints", "sacks_taken",
     "rush_yards", "rush_tds", "rush_attempts", "rush_first_downs",
     "rec_yards", "rec_tds", "receptions", "targets", "rec_first_downs",
-    "two_point_successes"
+    "two_point_successes",
+    # New passing milestone column
+    "pass_milestone_pts"
   )
 
   combined <- combined %>%
@@ -551,7 +595,8 @@ calculate_fantasy_points_ext <- function(
       long_td_fantasy_points      = dplyr::coalesce(long_td_rush_pts, 0) +
                                      dplyr::coalesce(long_td_rec_pts, 0),
       hundred_yard_fantasy_points = dplyr::coalesce(hundred_yard_rush_pts, 0) +
-                                     dplyr::coalesce(hundred_yard_rec_pts, 0)
+                                     dplyr::coalesce(hundred_yard_rec_pts, 0),
+      pass_milestone_fantasy_points = dplyr::coalesce(pass_milestone_pts, 0)
     )
 
   # Resolve position. position was stripped before the full_join to prevent
@@ -593,8 +638,9 @@ calculate_fantasy_points_ext <- function(
         dplyr::coalesce(rec_fantasy_points,          0) +
         dplyr::coalesce(two_pt_fantasy_points,       0) +
         dplyr::coalesce(first_down_fantasy_points,   0) +
-        dplyr::coalesce(long_td_fantasy_points,      0) +
-        dplyr::coalesce(hundred_yard_fantasy_points, 0)
+        dplyr::coalesce(long_td_fantasy_points,        0) +
+        dplyr::coalesce(hundred_yard_fantasy_points,   0) +
+        dplyr::coalesce(pass_milestone_fantasy_points, 0)
     )
 
   # ============================================================================
@@ -610,6 +656,8 @@ calculate_fantasy_points_ext <- function(
       # New Season 2 components
       two_pt_fantasy_points, first_down_fantasy_points,
       long_td_fantasy_points, hundred_yard_fantasy_points,
+      # Passing milestone bonuses (new Sleeper parity)
+      pass_milestone_fantasy_points,
       # Total (Season 1 col name preserved)
       total_fantasy_points,
       # Raw stats (Season 1 set)
@@ -658,7 +706,8 @@ calculate_fantasy_points_ext <- function(
 #'
 #' @keywords internal
 .build_ext_passing_fantasy <- function(
-  pbp, pass_yd, pass_td, pass_int, pick6_penalty, sack_penalty, fumbles
+  pbp, pass_yd, pass_td, pass_int, pick6_penalty, sack_penalty, fumbles,
+  bonus_pass_yd_300 = 0, bonus_pass_yd_400 = 0
 ) {
 
   # Guard: coalesce optional columns to 0 before use
@@ -734,12 +783,16 @@ calculate_fantasy_points_ext <- function(
         (pass_ints       * pass_int) +
         (pick6_count     * pick6_penalty) +
         (sacks_taken     * sack_penalty) +
-        (pass_fumbles_lost * fumbles)
+        (pass_fumbles_lost * fumbles),
+      # Passing yardage milestone bonuses (cumulative: 400+ also earns 300+ bonus)
+      pass_milestone_pts =
+        dplyr::if_else(pass_yards >= 300, bonus_pass_yd_300, 0) +
+        dplyr::if_else(pass_yards >= 400, bonus_pass_yd_400, 0)
     ) %>%
     dplyr::select(
       season, week, game_id, player_id, player_name, team, position,
       pass_yards, pass_tds, pass_ints, sacks_taken,
-      pass_fantasy_points
+      pass_fantasy_points, pass_milestone_pts
     )
 
   return(pass_agg)
@@ -752,7 +805,8 @@ calculate_fantasy_points_ext <- function(
     player_id = character(), player_name = character(),
     team = character(), position = character(),
     pass_yards = numeric(), pass_tds = integer(), pass_ints = integer(),
-    sacks_taken = integer(), pass_fantasy_points = numeric()
+    sacks_taken = integer(), pass_fantasy_points = numeric(),
+    pass_milestone_pts = numeric()
   )
 }
 
@@ -785,7 +839,8 @@ calculate_fantasy_points_ext <- function(
 #' @keywords internal
 .build_ext_rushing_fantasy <- function(
   pbp, rush_yd, rush_td, rush_att_bonus, fumbles,
-  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus
+  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus,
+  bonus_rush_yd_200 = 0
 ) {
 
   # Guard optional columns
@@ -871,10 +926,10 @@ calculate_fantasy_points_ext <- function(
       # Long TD bonus (rushing)
       long_td_rush_pts = long_rush_tds * long_td_bonus,
 
-      # Hundred-yard bonus: 1 if rush_yards >= 100 in this game, else 0
-      hundred_yard_rush_pts = dplyr::if_else(
-        rush_yards >= 100, hundred_yard_bonus, 0
-      )
+      # Yardage milestone bonus (cumulative: 200+ yards also earns 100-yard bonus)
+      hundred_yard_rush_pts =
+        dplyr::if_else(rush_yards >= 100, hundred_yard_bonus, 0) +
+        dplyr::if_else(rush_yards >= 200, bonus_rush_yd_200, 0)
     ) %>%
     dplyr::select(
       season, week, game_id, player_id, player_name, team, position,
@@ -926,7 +981,8 @@ calculate_fantasy_points_ext <- function(
 .build_ext_receiving_fantasy <- function(
   pbp, rec_yd, rec_td, ppr, fumbles,
   use_tiered_ppr, te_premium, position_lookup,
-  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus
+  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus,
+  tiered_rec_tiers = NULL, bonus_rec_yd_200 = 0
 ) {
 
   two_pt_vec <- if ("two_point_attempt" %in% names(pbp))
@@ -949,6 +1005,15 @@ calculate_fantasy_points_ext <- function(
     return(.empty_receiving_component())
   }
 
+  # Resolve active tier values once (before play-level mutation for performance)
+  # Order: 0-4 yds, 5-9 yds, 10-19 yds, 20-29 yds, 30-39 yds, 40+ yds
+  active_tiers <- as.numeric(
+    if (!is.null(tiered_rec_tiers)) tiered_rec_tiers else TIERED_PPR_BREAKS
+  )
+  if (length(active_tiers) != 6L) {
+    stop("tiered_rec_tiers must have exactly 6 values.", call. = FALSE)
+  }
+
   # Flag long TDs at play level
   target_plays <- target_plays %>%
     dplyr::mutate(
@@ -957,15 +1022,16 @@ calculate_fantasy_points_ext <- function(
         dplyr::coalesce(pass_touchdown, 0L) == 1L &
         dplyr::coalesce(receiving_yards, 0) > long_td_threshold
       ),
-      # Tiered PPR: per-play reception value based on yards gained
+      # Tiered PPR: per-play reception value using active_tiers
+      # (either from tiered_rec_tiers param or TIERED_PPR_BREAKS default)
       tiered_ppr_pts = dplyr::case_when(
-        !is_reception                        ~ 0,
-        dplyr::coalesce(receiving_yards, 0) < 5   ~ 0,
-        dplyr::coalesce(receiving_yards, 0) < 10  ~ 0.5,
-        dplyr::coalesce(receiving_yards, 0) < 20  ~ 1.0,
-        dplyr::coalesce(receiving_yards, 0) < 30  ~ 1.5,
-        dplyr::coalesce(receiving_yards, 0) < 40  ~ 2.0,
-        TRUE                                 ~ 2.0
+        !is_reception                              ~ 0,
+        dplyr::coalesce(receiving_yards, 0) < 5   ~ active_tiers[1],
+        dplyr::coalesce(receiving_yards, 0) < 10  ~ active_tiers[2],
+        dplyr::coalesce(receiving_yards, 0) < 20  ~ active_tiers[3],
+        dplyr::coalesce(receiving_yards, 0) < 30  ~ active_tiers[4],
+        dplyr::coalesce(receiving_yards, 0) < 40  ~ active_tiers[5],
+        TRUE                                       ~ active_tiers[6]
       )
     )
 
@@ -1020,10 +1086,10 @@ calculate_fantasy_points_ext <- function(
       # Long TD bonus (receiving)
       long_td_rec_pts = long_rec_tds * long_td_bonus,
 
-      # Hundred-yard bonus
-      hundred_yard_rec_pts = dplyr::if_else(
-        rec_yards >= 100, hundred_yard_bonus, 0
-      )
+      # Yardage milestone bonus (cumulative: 200+ yards also earns 100-yard bonus)
+      hundred_yard_rec_pts =
+        dplyr::if_else(rec_yards >= 100, hundred_yard_bonus, 0) +
+        dplyr::if_else(rec_yards >= 200, bonus_rec_yd_200, 0)
     )
 
   # Apply TE premium if requested and roster lookup is available
@@ -1091,10 +1157,10 @@ calculate_fantasy_points_ext <- function(
 #' @return Tibble with player-game level two-point conversion data.
 #'
 #' @keywords internal
-.build_two_point_fantasy <- function(pbp, two_point_conversion) {
+.build_two_point_fantasy <- function(pbp, two_point_conversion, pass_2pt = 0) {
 
   # Short-circuit: if parameter is 0, no need to process
-  if (two_point_conversion == 0) {
+  if (two_point_conversion == 0 && pass_2pt == 0) {
     return(.empty_two_point_component())
   }
 
@@ -1157,6 +1223,50 @@ calculate_fantasy_points_ext <- function(
       two_point_successes, two_pt_fantasy_points
     )
 
+  # --- Passer credit on passing 2-point conversions ---
+  # Awarded to the QB separately from scorer credit. A receiving 2PC
+  # is identified by receiver_player_id being non-NA on the 2PC play.
+  if (pass_2pt != 0) {
+    two_pt_pass_credit <- two_pt_plays %>%
+      dplyr::filter(
+        !is.na(passer_player_id),
+        !is.na(passer_player_name),
+        !is.na(receiver_player_id)  # confirms this was a passing 2PC
+      ) %>%
+      dplyr::group_by(
+        season, week, game_id,
+        player_id   = passer_player_id,
+        player_name = passer_player_name
+      ) %>%
+      dplyr::summarise(
+        team                  = dplyr::last(posteam),
+        two_point_successes   = as.integer(dplyr::n()),
+        .groups               = "drop"
+      ) %>%
+      dplyr::mutate(
+        position              = "QB",
+        two_pt_fantasy_points = two_point_successes * pass_2pt
+      ) %>%
+      dplyr::select(
+        season, week, game_id, player_id, player_name, team, position,
+        two_point_successes, two_pt_fantasy_points
+      )
+
+    two_pt_combined <- dplyr::bind_rows(two_pt_combined, two_pt_pass_credit)
+  }
+
+  # Collapse duplicate player-game rows (e.g., QB rushes for a 2PC AND
+  # throws a passing 2PC in the same game -- appears in both tables)
+  two_pt_combined <- two_pt_combined %>%
+    dplyr::group_by(
+      season, week, game_id, player_id, player_name, team, position
+    ) %>%
+    dplyr::summarise(
+      two_point_successes   = sum(two_point_successes, na.rm = TRUE),
+      two_pt_fantasy_points = sum(two_pt_fantasy_points, na.rm = TRUE),
+      .groups               = "drop"
+    )
+
   return(two_pt_combined)
 }
 
@@ -1217,7 +1327,11 @@ validate_ext_scoring_params <- function(
   rush_att_bonus = 0.25,
   first_down_points = 0, long_td_bonus = 0, long_td_threshold = 40L,
   hundred_yard_bonus = 0, superflex_pass_td = 0,
-  two_point_conversion = 0, sack_penalty = 0
+  two_point_conversion = 0, sack_penalty = 0,
+  tiered_rec_tiers  = NULL,
+  bonus_pass_yd_300 = 0, bonus_pass_yd_400 = 0,
+  bonus_rec_yd_200  = 0, bonus_rush_yd_200  = 0,
+  pass_2pt          = 0
 ) {
   errors   <- character(0)
   warnings <- character(0)
@@ -1250,6 +1364,19 @@ validate_ext_scoring_params <- function(
   assert_numeric_scalar(superflex_pass_td,    "superflex_pass_td")
   assert_numeric_scalar(two_point_conversion, "two_point_conversion")
   assert_numeric_scalar(sack_penalty,         "sack_penalty")
+
+  # Sleeper parity parameters
+  if (!is.null(tiered_rec_tiers)) {
+    if (!is.numeric(tiered_rec_tiers) || length(tiered_rec_tiers) != 6L) {
+      errors <- c(errors,
+        "tiered_rec_tiers must be NULL or a numeric vector of exactly 6 values")
+    }
+  }
+  assert_numeric_scalar(bonus_pass_yd_300, "bonus_pass_yd_300")
+  assert_numeric_scalar(bonus_pass_yd_400, "bonus_pass_yd_400")
+  assert_numeric_scalar(bonus_rec_yd_200,  "bonus_rec_yd_200")
+  assert_numeric_scalar(bonus_rush_yd_200, "bonus_rush_yd_200")
+  assert_numeric_scalar(pass_2pt,          "pass_2pt")
 
   # Domain checks
   if (is.numeric(pass_int) && pass_int > 0) {
@@ -1458,7 +1585,14 @@ get_ext_scoring_defaults <- function(show_new_only = FALSE) {
     hundred_yard_bonus   = 0,
     superflex_pass_td    = 0,
     two_point_conversion = 0,
-    sack_penalty         = 0
+    sack_penalty         = 0,
+    # Sleeper parity parameters
+    tiered_rec_tiers  = NULL,
+    bonus_pass_yd_300 = 0,
+    bonus_pass_yd_400 = 0,
+    bonus_rec_yd_200  = 0,
+    bonus_rush_yd_200 = 0,
+    pass_2pt          = 0
   )
 
   if (show_new_only) {
