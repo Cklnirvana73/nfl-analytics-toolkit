@@ -860,13 +860,13 @@ load_normalized_cfb_season <- function(season,
   pbp <- readRDS(cache_file)
 
   # --- Deduplication guard ---
-  # cfbfastR cached files for actively-updated seasons (e.g. 2025) can
-  # contain duplicate rows from double-loading during mid-season cache builds.
-  # Confirmed in 2025: 23,800 duplicate game_id + id_play rows, concentrated
-  # in Week 1, inflating player-season row counts ~5x vs expected.
-  # Deduplication is applied at read time so all callers receive clean data
-  # without requiring a cache rebuild. If duplicates are found, a warning
-  # directs the user to fix the cache with force_reload = TRUE.
+  # cfbfastR's upstream data source contains duplicate game_id + id_play rows
+  # across all seasons. Confirmed via direct load_cfb_pbp() inspection:
+  # 2024 raw download contains 113,209 duplicates out of 276,267 total rows.
+  # Root cause is upstream in cfbfastR's sportsdataverse data pipeline, not
+  # in the local cache. force_reload = TRUE downloads the same duplicated
+  # source and does NOT resolve this. Deduplication is applied at read time
+  # on every load so all callers receive clean data automatically.
   # id_play is the cfbfastR play identifier; game_id scopes it to a game.
   if (all(c("game_id", "id_play") %in% names(pbp))) {
     n_before_dedup <- nrow(pbp)
@@ -875,9 +875,9 @@ load_normalized_cfb_season <- function(season,
     if (n_removed > 0L) {
       warning(
         glue("Season {season}: removed {format(n_removed, big.mark = ',')} ",
-             "duplicate game_id + id_play rows at read time. ",
-             "Run load_multi_season_cfb_pbp(seasons = {season}, ",
-             "force_reload = TRUE) to rebuild a clean cache."),
+             "duplicate game_id + id_play rows originating in cfbfastR upstream ",
+             "data. This is expected behavior -- force_reload = TRUE will not ",
+             "resolve it. Data returned from this call is deduplicated and clean."),
         call. = FALSE
       )
     }
