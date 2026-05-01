@@ -1,0 +1,180 @@
+
+============================================================
+SECTION A: Data Integrity
+============================================================
+
+A1: Age range plausibility
+  [PASS] QB age range
+        ages 21-45 | no implausible values
+  [PASS] RB age range
+        ages 20-38 | no implausible values
+  [PASS] TE age range
+        ages 20-40 | no implausible values
+  [PASS] WR age range
+        ages 20-38 | no implausible values
+
+A2: WR/TE split completeness
+  [PASS] WR_TE split
+        All WR_TE rows resolved to WR or TE. No unsplit rows remain.
+
+A3: Birth date (DOB) coverage
+  [PASS] DOB coverage
+        100% of skill position player-seasons have birth date
+
+A4: Career filter impact (4-season minimum)
+  [PASS] QB career filter
+        821 -> 620 transitions | 24.5% dropped (short-career/low-volume players removed)
+  [PASS] RB career filter
+        1,745 -> 1,187 transitions | 32% dropped (short-career/low-volume players removed)
+  [PASS] WR career filter
+        2,284 -> 1,514 transitions | 33.7% dropped (short-career/low-volume players removed)
+  [PASS] TE career filter
+        1,281 -> 763 transitions | 40.4% dropped (short-career/low-volume players removed)
+
+============================================================
+SECTION B: Delta Method Validity
+============================================================
+
+B1: Delta normality at prime ages (24-30) -- Shapiro-Wilk
+  [FLAG] QB normality (ages 24-30)
+        W=0.9763, p=0 | Non-normal. LOESS is robust to this. Quadratic CIs may be slightly liberal.
+  [PASS] RB normality (ages 24-30)
+        W=0.9983, p=0.4933 | Normal distribution -- quadratic CIs are valid
+  [FLAG] WR normality (ages 24-30)
+        W=0.9962, p=0.0065 | Non-normal. LOESS is robust to this. Quadratic CIs may be slightly liberal.
+  [FLAG] TE normality (ages 24-30)
+        W=0.9902, p=4e-04 | Non-normal. LOESS is robust to this. Quadratic CIs may be slightly liberal.
+
+B2: Delta autocorrelation (player-level AR1)
+  [FLAG] QB delta autocorrelation
+        Median AR1 = -0.466 (n=96 players) | Strong persistence -- delta method underestimates uncertainty
+  [FLAG] RB delta autocorrelation
+        Median AR1 = -0.505 (n=224 players) | Strong persistence -- delta method underestimates uncertainty
+  [FLAG] WR delta autocorrelation
+        Median AR1 = -0.459 (n=258 players) | Strong persistence -- delta method underestimates uncertainty
+  [FLAG] TE delta autocorrelation
+        Median AR1 = -0.463 (n=130 players) | Strong persistence -- delta method underestimates uncertainty
+
+B3: Delta variance across age (homoscedasticity)
+  [FLAG] QB delta variance
+        Max/min variance ratio = 4.2x | Some heteroscedasticity. Expected at older ages (small n). LOESS handles this better than quadratic.
+  [PASS] RB delta variance
+        Max/min variance ratio = 3.3x | Approximately homoscedastic -- quadratic SE estimates are reliable
+  [FLAG] WR delta variance
+        Max/min variance ratio = 4.3x | Some heteroscedasticity. Expected at older ages (small n). LOESS handles this better than quadratic.
+  [PASS] TE delta variance
+        Max/min variance ratio = 2.6x | Approximately homoscedastic -- quadratic SE estimates are reliable
+
+============================================================
+SECTION C: Sample Adequacy
+============================================================
+
+C1: Transitions per age bucket (filtered data)
+  [PASS] QB age bucket coverage
+        17 age buckets | n range: 10-56 | median: 35
+  [FLAG] RB age bucket coverage
+        13 adequate, 3 sparse (n<5) | Sparse ages: 35, 36, 37 | These are flagged in plots, not dropped
+  [FLAG] WR age bucket coverage
+        14 adequate, 2 sparse (n<5) | Sparse ages: 36, 37 | These are flagged in plots, not dropped
+  [FLAG] TE age bucket coverage
+        14 adequate, 3 sparse (n<5) | Sparse ages: 36, 37, 38 | These are flagged in plots, not dropped
+
+C2: Qualifying player count (>= 4 seasons in panel)
+  [PASS] QB qualifying players
+        122 of 271 players (45%) meet 4-season threshold
+  [PASS] RB qualifying players
+        304 of 733 players (41.5%) meet 4-season threshold
+  [PASS] WR qualifying players
+        374 of 959 players (39%) meet 4-season threshold
+  [PASS] TE qualifying players
+        204 of 487 players (41.9%) meet 4-season threshold
+
+C3: Consecutive transition rate (after career + low_volume filter)
+  [PASS] Consecutive transition rate
+        4,084 of 4,141 potential (98.6%) | Gap-year absences excluded by design
+
+============================================================
+SECTION D: Survivor Bias Quantification
+============================================================
+
+D1: Survivor bias -- raw PPG mean vs cumulative delta at age thresholds
+    (Positive raw mean + negative avg delta = survivor bias confirmed)
+QB:
+  [PASS] Age 28
+        raw PPG = 12.5 (n=79) | avg YoY change = -1.04 (n=53) | survivor bias confirmed
+  [PASS] Age 30
+        raw PPG = 12.45 (n=63) | avg YoY change = -0.97 (n=45) | survivor bias confirmed
+  [PASS] Age 32
+        raw PPG = 13.84 (n=44) | avg YoY change = -0.52 (n=35) | survivor bias confirmed
+  [PASS] Age 34
+        raw PPG = 13.84 (n=34) | avg YoY change = -0.13 (n=26) | survivor bias confirmed
+RB:
+  [PASS] Age 28
+        raw PPG = 7.44 (n=153) | avg YoY change = -1.27 (n=120) | survivor bias confirmed
+  [PASS] Age 30
+        raw PPG = 7.1 (n=65) | avg YoY change = -1.54 (n=51) | survivor bias confirmed
+  [PASS] Age 32
+        raw PPG = 6.6 (n=25) | avg YoY change = -1.24 (n=21) | survivor bias confirmed
+  [PASS] Age 34
+        raw PPG = 6.44 (n=9) | avg YoY change = -3.43 (n=5) | survivor bias confirmed
+WR:
+  [PASS] Age 28
+        raw PPG = 8.59 (n=189) | avg YoY change = -0.93 (n=153) | survivor bias confirmed
+  [PASS] Age 30
+        raw PPG = 8.31 (n=102) | avg YoY change = -1.99 (n=81) | survivor bias confirmed
+  [PASS] Age 32
+        raw PPG = 9.65 (n=50) | avg YoY change = -2.17 (n=41) | survivor bias confirmed
+  [PASS] Age 34
+        raw PPG = 8.35 (n=20) | avg YoY change = -2.91 (n=16) | survivor bias confirmed
+TE:
+  [PASS] Age 28
+        raw PPG = 6.75 (n=102) | avg YoY change = -0.32 (n=92) | survivor bias confirmed
+  [PASS] Age 30
+        raw PPG = 6.25 (n=76) | avg YoY change = -1.03 (n=59) | survivor bias confirmed
+  [PASS] Age 32
+        raw PPG = 7.43 (n=29) | avg YoY change = -1.15 (n=25) | survivor bias confirmed
+  [FLAG] Age 34
+        raw PPG = 9.46 (n=13) | avg YoY change = 0.32 (n=12) | check pattern
+
+============================================================
+SECTION E: NGS Data Quality
+============================================================
+
+E1: CPOE plausible range (QBs, should be -20% to +20%)
+  [PASS] CPOE range
+        Range: -11.2% to 9.1% | No extreme outliers
+
+E2: Avg separation plausible range (WR/TE, expect 1-4 yards)
+  [PASS] Avg separation range
+        Range: 1.71 to 5.66 yards | No implausible values
+
+E3: RYOE per attempt plausible range (RB, expect -3 to +3 yards)
+  [PASS] RYOE/att range
+        Range: -1.22 to 2.87 | No extreme outliers
+
+E4: NGS season coverage (expect 2016-2025)
+  [PASS] NGS season coverage
+        All 10 seasons present: 2016-2025
+
+E5: NGS player count by season (should be stable)
+  [PASS] NGS per-season coverage
+        Season range: 209-228 players | Median: 216 | No unusually low seasons
+
+============================================================
+ASSUMPTION VALIDATION SUMMARY
+============================================================
+Data: 9,488 player-seasons | 2,412 skill players | 2010-2025
+Deltas (filtered): 4,084 transitions | Career filter: 4 seasons | low_volume excluded
+NGS: 2,166 player-seasons | 2016-2025
+
+Key informational flags (not failures, but document in analysis):
+  - QB and WR deltas are non-normal at prime ages. LOESS is robust.
+  - TE quadratic vs LOESS peak age disagrees by 3 years. Quadratic
+    symmetry assumption fails for TE's gradual rise. Trust LOESS.
+  - Sparse age buckets at 34+ are expected and are flagged in plots.
+  - Consecutive rate ~60-65% is correct given career filter design.
+
+Overall status: PROCEED with full 16-season run.
+All critical checks passed. Flagged items are documented above.
+Results saved to: C:/Users/cklni/Documents/nfl-analytics-toolkit/output/assumption_tests/assumptions_season2_week9.txt
+============================================================
