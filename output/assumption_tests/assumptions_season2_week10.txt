@@ -1,0 +1,286 @@
+============================================================
+  Translation Model Assumption Validation
+  Season 2, Week 10
+  Training classes: 2015-2023 (9 LOCO folds)
+  Cutoff year: 2023
+============================================================
+
+============================================================
+SECTION A: ID Linkage Quality
+============================================================
+
+A1: Overall match rate
+  [PASS] Overall match rate
+        88.8% matched (850 / 957 draft entries)
+
+A2: Match rate by method
+  [INFO] exact_name_college
+        641 entries (67%)
+  [INFO] exact_name_only
+        203 entries (21.2%)
+  [INFO] unmatched
+        107 entries (11.2%)
+  [INFO] fuzzy_name
+        6 entries (0.6%)
+
+A3: Match rate by position
+  [PASS] QB match rate
+        94.2% (129 / 137)
+  [PASS] RB match rate
+        92.7% (227 / 245)
+  [FLAG] TE match rate
+        78.6% (143 / 182)
+  [PASS] WR match rate
+        89.3% (351 / 393)
+
+A4: Fuzzy match confidence (matched players only)
+  [FLAG] Fuzzy match confidence
+        6 fuzzy matches | 4 with confidence < 0.85 (candidates for manual review)
+        Low-confidence matches:
+          2017 QB: Mitch Trubisky (conf=0.812)
+          2024 TE: Tez Johnson (conf=0.818)
+          2022 RB: Isaih Pacheco (conf=0.833)
+          2022 TE: Jalen Mitchell (conf=0.846)
+
+A5: GSIS ID coverage (matched players)
+  [PASS] GSIS ID coverage
+        98.8% of matched players have GSIS ID (10 missing -- may be historical or UDFA)
+
+============================================================
+SECTION B: Feature Distribution Integrity
+============================================================
+
+B1: SOS NA rate by position
+  [PASS] QB SOS NA rate
+        17.1% NA (22 / 129 players) -- median imputed for missing values
+  [PASS] RB SOS NA rate
+        15.9% NA (36 / 227 players) -- median imputed for missing values
+  [PASS] TE SOS NA rate
+        23.1% NA (33 / 143 players) -- median imputed for missing values
+  [PASS] WR SOS NA rate
+        18.8% NA (66 / 351 players) -- median imputed for missing values
+
+B2: Feature range plausibility (training data)
+  [PASS] QB feature ranges
+        All bounded features within plausible range (n=95)
+  [FLAG] RB feature range
+        rec_epa_per_target: 3 values outside [-2, 2]
+  [FLAG] WR feature range
+        rec_epa_per_target: 4 values outside [-2, 2]
+  [FLAG] WR feature range
+        games_played: 1 values outside [1, 16]
+  [FLAG] TE feature range
+        rec_epa_per_target: 3 values outside [-2, 2]
+
+B3: Per-game volume outlier check (> 6 SD from mean)
+  [PASS] QB volume outliers
+        No extreme outliers
+  [PASS] RB volume outliers
+        No extreme outliers
+  [PASS] WR volume outliers
+        No extreme outliers
+  [PASS] TE volume outliers
+        No extreme outliers
+
+B4: Draft age centering validity (expected 21-24 per position)
+  [PASS] QB age center
+        Mean draft age = 22.69 | Within expected range (21-24)
+  [PASS] RB age center
+        Mean draft age = 22.01 | Within expected range (21-24)
+  [PASS] WR age center
+        Mean draft age = 22.14 | Within expected range (21-24)
+  [PASS] TE age center
+        Mean draft age = 22.43 | Within expected range (21-24)
+B5: Feature collinearity (|r| > 0.9)
+        (Elastic Net regularization handles collinearity -- informational)
+  [INFO] Collinear feature pairs
+        6 pair(s) flagged -- documented below
+          QB: pass_att_pg x pass_yd_pg (r = 0.917)
+          QB: pass_epa_per_attempt x success_rate (r = 0.901)
+          RB: rush_att_pg x rush_yd_pg (r = 0.922)
+          RB: sos_opp_def_epa_per_play x sos_opp_def_success_rate_allowed (r = 0.93)
+          WR: sos_opp_def_epa_per_play x sos_opp_def_success_rate_allowed (r = 0.902)
+          TE: sos_opp_def_epa_per_play x sos_opp_def_success_rate_allowed (r = 0.901)
+
+============================================================
+SECTION C: Outcome Distribution Validity
+============================================================
+
+C1: PPR per game range (training outcomes)
+  [PASS] QB PPR range
+        min=0 | max=23.5 | mean=7.27 | sd=7.51 | n=95
+  [PASS] RB PPR range
+        min=0 | max=22.65 | mean=7.11 | sd=5.56 | n=174
+  [PASS] WR PPR range
+        min=0 | max=19.97 | mean=5.67 | sd=4.55 | n=251
+  [PASS] TE PPR range
+        min=0 | max=13.01 | mean=4.47 | sd=3.08 | n=101
+
+C2: Hit rate by position
+  [PASS] QB hit rate
+        18.9% (18 / 95) ever top-12 QB in Years 1-3
+  [PASS] RB hit rate
+        39.7% (69 / 174) ever top-36 RB in Years 1-3
+  [PASS] WR hit rate
+        21.1% (53 / 251) ever top-36 WR in Years 1-3
+  [PASS] TE hit rate
+        16.8% (17 / 101) ever top-12 TE in Years 1-3
+
+C3: Outcome non-degeneracy (not all zeros)
+  [PASS] QB non-degenerate outcomes
+        56 players with PPR > 0
+  [PASS] RB non-degenerate outcomes
+        146 players with PPR > 0
+  [PASS] WR non-degenerate outcomes
+        204 players with PPR > 0
+  [PASS] TE non-degenerate outcomes
+        88 players with PPR > 0
+
+C4: Qualifying NFL seasons (players with >= 1 qualifying season)
+  [FLAG] QB qualifying seasons
+        39 / 95 (41.1%) players with 0 qualifying seasons -- these contribute PPR = 0 to the outcome
+  [PASS] RB qualifying seasons
+        28 / 174 (16.1%) players with 0 qualifying seasons -- these contribute PPR = 0 to the outcome
+  [PASS] WR qualifying seasons
+        47 / 251 (18.7%) players with 0 qualifying seasons -- these contribute PPR = 0 to the outcome
+  [PASS] TE qualifying seasons
+        13 / 101 (12.9%) players with 0 qualifying seasons -- these contribute PPR = 0 to the outcome
+
+============================================================
+SECTION D: Model Performance Diagnostics
+============================================================
+
+D1: LOCO RMSE (lower = better)
+        Reminder: enriched model adds draft capital to base model
+  [INFO] QB RMSE
+        base=6.655 | enriched=6.068 | enriched improves by 0.587 PPR/game
+  [INFO] RB RMSE
+        base=4.89 | enriched=4.003 | enriched improves by 0.887 PPR/game
+  [INFO] WR RMSE
+        base=4.398 | enriched=3.894 | enriched improves by 0.504 PPR/game
+  [INFO] TE RMSE
+        base=3.251 | enriched=2.648 | enriched improves by 0.602 PPR/game
+
+D2: R-squared (LOCO out-of-sample)
+        Negative R-squared: model predicts worse than position mean
+  [PASS] QB base R-squared
+        0.206 | Meaningful signal in college production alone
+  [PASS] QB enriched R-squared
+        0.34 | Model predicts better than position mean
+  [PASS] RB base R-squared
+        0.222 | Meaningful signal in college production alone
+  [PASS] RB enriched R-squared
+        0.479 | Model predicts better than position mean
+  [FLAG] WR base R-squared
+        0.062 | Weak -- draft capital likely required for meaningful signal
+  [PASS] WR enriched R-squared
+        0.265 | Model predicts better than position mean
+  [FAIL] TE base R-squared
+        -0.126 | College production does not translate above mean (expected for TE)
+  [PASS] TE enriched R-squared
+        0.253 | Model predicts better than position mean
+
+D3: Hit classification accuracy (predicted top-half = hit)
+  [PASS] QB hit accuracy
+        64.2% correct (enriched model) | Above random baseline
+  [PASS] RB hit accuracy
+        73.6% correct (enriched model) | Above random baseline
+  [PASS] WR hit accuracy
+        65.3% correct (enriched model) | Above random baseline
+  [FLAG] TE hit accuracy
+        58.4% correct (enriched model) | Near random -- model struggles with hit/bust classification
+
+D4: Draft capital contribution (accuracy_delta = enriched RMSE - base RMSE)
+        Negative delta = enriched model improves over base
+        Large negative delta = NFL opportunity drives outcomes more than production
+  [PASS] QB draft capital contribution
+        delta = -0.587 | Strong -- draft capital is a major predictor at this position
+  [PASS] RB draft capital contribution
+        delta = -0.887 | Strong -- draft capital is a major predictor at this position
+  [PASS] WR draft capital contribution
+        delta = -0.504 | Strong -- draft capital is a major predictor at this position
+  [PASS] TE draft capital contribution
+        delta = -0.602 | Strong -- draft capital is a major predictor at this position
+
+============================================================
+SECTION E: Prediction Residual Structure
+============================================================
+
+E1: Residual normality (Shapiro-Wilk on enriched model residuals)
+        Elastic Net does not require normality -- FLAG is informational only
+  [PASS] QB residual normality
+        W=0.9899, p=0.693 | Normal -- no concern
+  [FLAG] RB residual normality
+        W=0.9728, p=0.00171 | Non-normal. Elastic Net is robust to this. CIs may be approximate.
+  [FLAG] WR residual normality
+        W=0.9578, p=1.04e-06 | Non-normal. Elastic Net is robust to this. CIs may be approximate.
+  [FLAG] TE residual normality
+        W=0.9731, p=0.0369 | Non-normal. Elastic Net is robust to this. CIs may be approximate.
+
+E2: Residual bias check (mean residual near zero = unbiased)
+  [PASS] QB residual bias
+        Mean residual = -0.116 PPR/game | No systematic bias
+  [PASS] RB residual bias
+        Mean residual = -0.032 PPR/game | No systematic bias
+  [PASS] WR residual bias
+        Mean residual = -0.028 PPR/game | No systematic bias
+  [PASS] TE residual bias
+        Mean residual = 0.005 PPR/game | No systematic bias
+
+E3: Residual heteroscedasticity (|residual| vs predicted)
+        High correlation = variance grows with prediction = concern for interval accuracy
+  [PASS] QB heteroscedasticity
+        |r| = 0.148 | Low -- prediction intervals approximately uniform
+  [PASS] RB heteroscedasticity
+        |r| = 0.067 | Low -- prediction intervals approximately uniform
+  [PASS] WR heteroscedasticity
+        |r| = 0.121 | Low -- prediction intervals approximately uniform
+  [PASS] TE heteroscedasticity
+        |r| = 0.06 | Low -- prediction intervals approximately uniform
+
+E4: Prediction compression check
+        Elastic Net regularization compresses predictions toward mean by design
+  [INFO] QB prediction compression
+        Actual range: 23.5 PPR/game | Predicted range: 21.02 | Compression ratio: 0.894 (1.0 = no compression, <1.0 = compressed toward mean)
+  [INFO] RB prediction compression
+        Actual range: 22.65 PPR/game | Predicted range: 16.29 | Compression ratio: 0.719 (1.0 = no compression, <1.0 = compressed toward mean)
+  [INFO] WR prediction compression
+        Actual range: 19.97 PPR/game | Predicted range: 10.44 | Compression ratio: 0.523 (1.0 = no compression, <1.0 = compressed toward mean)
+  [INFO] TE prediction compression
+        Actual range: 13.01 PPR/game | Predicted range: 7.11 | Compression ratio: 0.547 (1.0 = no compression, <1.0 = compressed toward mean)
+
+E5: LOCO fold stability (per-class RMSE)
+        One anomalous fold suggests a structural shift, not noise
+  [PASS] QB fold stability
+        Overall RMSE=6.068 | Worst fold: 2020 (RMSE=7.109, 1.17x overall) | No anomalous fold
+        Per-class RMSE: 2015:6.41 | 2016:6.79 | 2017:6.8 | 2018:5.16 | 2019:6 | 2020:7.11 | 2021:5.37 | 2022:7.11 | 2023:3.81
+  [PASS] RB fold stability
+        Overall RMSE=4.003 | Worst fold: 2017 (RMSE=5.832, 1.46x overall) | No anomalous fold
+        Per-class RMSE: 2015:3 | 2016:3.62 | 2017:5.83 | 2018:3.95 | 2019:3.61 | 2020:3.23 | 2021:3.15 | 2022:4.17 | 2023:4.04
+  [PASS] WR fold stability
+        Overall RMSE=3.894 | Worst fold: 2023 (RMSE=4.729, 1.21x overall) | No anomalous fold
+        Per-class RMSE: 2015:3.74 | 2016:3.49 | 2017:3.5 | 2018:3.38 | 2019:4.65 | 2020:3.89 | 2021:3.94 | 2022:3.42 | 2023:4.73
+  [PASS] TE fold stability
+        Overall RMSE=2.648 | Worst fold: 2017 (RMSE=3.819, 1.44x overall) | No anomalous fold
+        Per-class RMSE: 2015:1.58 | 2016:1.95 | 2017:3.82 | 2018:3.03 | 2019:2.63 | 2020:2.09 | 2021:2.48 | 2022:2.59 | 2023:2.74
+
+============================================================
+ASSUMPTION VALIDATION SUMMARY
+============================================================
+Model scope: 2015-2023 training classes | 9 LOCO folds
+Total training players: 621
+ID match rate: 88.8%
+
+Key findings:
+  - TE base R-squared = -0.126 -- college TE production does not translate above mean without draft capital
+  - WR base R-squared = 0.062 -- college WR production carries limited independent signal
+  - QB base R-squared = 0.206 -- strongest base-model signal of any position
+  - RB enriched R-squared = 0.479 -- most predictable position with full feature set
+
+Key informational flags (not failures):
+  - Elastic Net compression is by design -- prediction range < actual range
+  - SOS NA rate reflects R/22 coverage gaps -- median imputation applied
+  - Residual non-normality does not affect Elastic Net point estimates
+  - Collinear SOS features are handled by regularization, not removed
+Results saved to: C:/Users/cklni/Documents/nfl-analytics-toolkit/output/assumption_tests/assumptions_season2_week10.txt
+============================================================
