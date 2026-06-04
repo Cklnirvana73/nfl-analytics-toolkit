@@ -1543,3 +1543,193 @@ get_user_leagues <- function(username, season = CURRENT_NFL_SEASON) {
   message(glue("  {nrow(leagues_tbl)} league(s) found for season {season}."))
   return(leagues_tbl)
 }
+
+# ==============================================================================
+# SECTION 10: ALL PLAYERS (FRESH ROSTER REFRESH)
+# ==============================================================================
+#
+# Added Week 15 (Phase 4): provides an authoritative current-team data source
+# for downstream projection pipelines. nflreadr::load_rosters() depends on PFR
+# which lags 1-4 weeks behind actual NFL roster moves during the offseason.
+# Sleeper updates its player database within hours. Use this function as the
+# canonical "who plays for whom right now" lookup.
+#
+# ==============================================================================
+
+#' Pull All NFL Players from Sleeper with Current Team Assignments
+#'
+#' @description
+#' Fetches the complete NFL player database from Sleeper's /players/nfl
+#' endpoint, returning a tidy tibble with current team assignments, depth
+#' chart positions, status flags, and free-agent detection.
+#'
+#' WHY: nflreadr::load_rosters() pulls from PFR which lags 1-4 weeks during
+#' the offseason. Sleeper updates within hours of any trade, signing, or
+#' release. For projection pipelines built during the offseason, Sleeper is
+#' the authoritative current-roster source.
+#'
+#' CACHING: The /players/nfl endpoint returns approximately 10MB of JSON
+#' covering ~10,000 player records. Sleeper documentation recommends calling
+#' it at most once per day. This function caches the result locally and
+#' refreshes only when the cache is older than max_cache_age_hours.
+#'
+#' FREE AGENT DETECTION: Players with team = NA in Sleeper are free agents
+#' (not on any active NFL roster). The is_free_agent column is provided as
+#' a convenience flag for downstream filtering.
+#'
+#' @param cache_path Character. Path to the RDS cache file.
+#'   Default: data/season2_cache/sleeper_players.rds
+#' @param max_cache_age_hours Numeric. Maximum cache age in hours before
+#'   triggering an automatic refresh. Default 24.
+#' @param force_refresh Logical. Force endpoint hit even if cache is fresh.
+#'
+#' @return A tibble with one row per Sleeper player record. Columns:
+#'   \describe{
+#'     \item{sleeper_player_id}{Character. Sleeper's internal player ID.}
+#'     \item{nfl_gsis_id}{Character. nflfastR-compatible GSIS ID. NA when
+#'       Sleeper has no mapping (typically very recent rookies or undrafted
+#'       FAs that haven't been cross-referenced yet).}
+#'     \item{player_name}{Character. Full name.}
+#'     \item{position}{Character. QB/RB/WR/TE/K/DEF/LB/CB/etc.}
+#'     \item{team}{Character. NFL team abbreviation, or NA if free agent.}
+#'     \item{status}{Character. Active / Inactive / Injured Reserve / etc.}
+#'     \item{injury_status}{Character. Injury designation if any.}
+#'     \item{depth_chart_position}{Character. Sleeper's depth-chart position.}
+#'     \item{depth_chart_order}{Integer. 1 = starter, 2 = backup, etc.}
+#'     \item{years_exp}{Integer. NFL experience.}
+#'     \item{age}{Integer. Player age.}
+#'     \item{is_free_agent}{Logical. TRUE if team is NA.}
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' # Standard call -- uses cache if fresh
+#' players <- get_all_sleeper_players()
+#'
+#' # Force a fresh pull after a big trade
+#' players <- get_all_sleeper_players(force_refresh = TRUE)
+#'
+#' # Find skill-position free agents (Tyreek Hill, etc.)
+#' players %>%
+#'   dplyr::filter(is_free_agent,
+#'                  position %in% c("QB", "RB", "WR", "TE"),
+#'                  status == "Active")
+#'
+#' # Compare Sleeper to nflreadr to find stale team assignments
+#' nflreadr_roster <- nflreadr::load_rosters(seasons = 2026L)
+#' discrepancies <- nflreadr_roster %>%
+#'   dplyr::inner_join(players, by = c("gsis_id" = "nfl_gsis_id")) %>%
+#'   dplyr::filter(team.x != team.y | (is.na(team.y) & !is.na(team.x)))
+#' }
+#'
+#' @seealso match_sleeper_players, connect_sleeper_league
+#' @export
+get_all_sleeper_players <- function(
+    cache_path = here::here("data", "season2_cache", "sleeper_players.rds"),
+    max_cache_age_hours = 24,
+    force_refresh = FALSE) {
+
+  # ---- Cache check ----
+  use_cache <- !isTRUE(force_refresh) && file.exists(cache_path)
+
+  if (use_cache) {
+    cache_age_hours <- as.numeric(
+      difftime(Sys.time(), file.info(cache_path)$mtime, units = "hours")
+    )
+    if (cache_age_hours <= max_cache_age_hours) {
+      message(glue(
+        "  Loading Sleeper players from cache ",
+        "(age: {format(round(cache_age_hours, 1), nsmall = 1)}h, ",
+        "max: {max_cache_age_hours}h)"
+      ))
+      return(readRDS(cache_path))
+    }
+    message(glue(
+      "  Cache is stale ",
+      "(age: {format(round(cache_age_hours, 1), nsmall = 1)}h). ",
+      "Refreshing from Sleeper."
+    ))
+  }
+
+  # ---- Endpoint hit ----
+  message("  Fetching all NFL players from Sleeper (large payload, ~10MB)...")
+  raw <- .sleeper_get("/players/nfl", timeout_sec = 120L)
+
+  if (is.null(raw)) {
+    # Endpoint failed -- fall back to stale cache if available
+    if (file.exists(cache_path)) {
+      warning(glue(
+        "Sleeper /players/nfl endpoint failed. ",
+        "Falling back to stale cache: {cache_path}"
+      ), call. = FALSE)
+      return(readRDS(cache_path))
+    }
+    stop("Sleeper /players/nfl endpoint failed and no cache available.",
+         call. = FALSE)
+  }
+
+  message(glue("  Parsing {format(length(raw), big.mark = ',')} player records..."))
+
+  # ---- Helpers: safe scalar extraction (handles NULL and empty strings) ----
+  .pluck_chr <- function(p, field) {
+    val <- p[[field]]
+    if (is.null(val) || length(val) == 0L) return(NA_character_)
+    val <- as.character(val)[1]
+    if (nchar(trimws(val)) == 0L) return(NA_character_)
+    val
+  }
+
+  .pluck_int <- function(p, field) {
+    val <- p[[field]]
+    if (is.null(val) || length(val) == 0L) return(NA_integer_)
+    suppressWarnings(as.integer(val)[1])
+  }
+
+  # ---- Build tibble column-wise (faster than imap_dfr for ~10K rows) ----
+  players_tbl <- tibble::tibble(
+    sleeper_player_id    = names(raw),
+    nfl_gsis_id          = purrr::map_chr(raw, .pluck_chr, "gsis_id"),
+    player_name          = purrr::map_chr(raw, function(p) {
+      full <- .pluck_chr(p, "full_name")
+      if (!is.na(full)) return(full)
+      first <- .pluck_chr(p, "first_name")
+      last  <- .pluck_chr(p, "last_name")
+      first <- if (is.na(first)) "" else first
+      last  <- if (is.na(last))  "" else last
+      nm <- trimws(paste(first, last))
+      if (nchar(nm) == 0L) NA_character_ else nm
+    }),
+    position             = purrr::map_chr(raw, .pluck_chr, "position"),
+    team                 = purrr::map_chr(raw, .pluck_chr, "team"),
+    status               = purrr::map_chr(raw, .pluck_chr, "status"),
+    injury_status        = purrr::map_chr(raw, .pluck_chr, "injury_status"),
+    depth_chart_position = purrr::map_chr(raw, .pluck_chr, "depth_chart_position"),
+    depth_chart_order    = purrr::map_int(raw, .pluck_int, "depth_chart_order"),
+    years_exp            = purrr::map_int(raw, .pluck_int, "years_exp"),
+    age                  = purrr::map_int(raw, .pluck_int, "age")
+  ) %>%
+    dplyr::mutate(is_free_agent = is.na(.data$team))
+
+  # ---- Save cache ----
+  dir.create(dirname(cache_path), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(players_tbl, cache_path)
+
+  # ---- Summary ----
+  n_total     <- nrow(players_tbl)
+  n_with_gsis <- sum(!is.na(players_tbl$nfl_gsis_id))
+  n_fa        <- sum(players_tbl$is_free_agent, na.rm = TRUE)
+  n_active_skill_fa <- sum(
+    players_tbl$is_free_agent &
+      players_tbl$status == "Active" &
+      players_tbl$position %in% c("QB", "RB", "WR", "TE"),
+    na.rm = TRUE
+  )
+
+  message(glue("  Pulled {format(n_total, big.mark = ',')} player records"))
+  message(glue("  With gsis_id mapping: {format(n_with_gsis, big.mark = ',')}"))
+  message(glue("  Free agents total:    {format(n_fa, big.mark = ',')} ",
+               "({n_active_skill_fa} Active at QB/RB/WR/TE)"))
+  message(glue("  Cached: {cache_path}"))
+
+  players_tbl
+}
