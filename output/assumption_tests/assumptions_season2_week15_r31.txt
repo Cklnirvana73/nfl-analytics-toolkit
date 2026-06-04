@@ -1,0 +1,108 @@
+======================================================================
+R/31 Player Volume Allocation -- Assumption Tests
+======================================================================
+Generated: 2026-05-22 14:57:20 CDT
+Source script: R/31_player_volume_allocation.R
+ALLOC output:  C:/Users/cklni/Documents/nfl-analytics-toolkit/data/season2_cache/s2_week15_player_volume_allocation.rds
+
+======================================================================
+CHECK 1: TARGET_SHARE_PRIORS sum to 1.0
+======================================================================
+  Computed sum:    1.005000
+  Expected:        1.000000
+  |deviation|:     0.005000
+  PASS threshold:  0.001
+  Result:          WARN
+
+  Breakdown by position group:
+    WR roles: 0.5850
+    TE roles: 0.2100
+    RB roles: 0.2100
+    QB roles: 0.0000
+
+======================================================================
+CHECK 2: RUSH_SHARE_PRIORS sum to 1.0
+======================================================================
+  Computed sum:    1.000000
+  Expected:        1.000000
+  |deviation|:     0.000000
+  PASS threshold:  0.001
+  Result:          PASS
+
+  Breakdown by position group:
+    QB scramble: 0.0150
+    RB carries:  0.9850
+
+======================================================================
+CHECK 3: Talent multipliers respect cap [TALENT_MULT_FLOOR, TALENT_MULT_CEILING]
+======================================================================
+  Players with R/28 score: 471
+  Cap floor:               0.70
+  Cap ceiling:             1.30
+  Below floor:             0
+  Above ceiling:           0
+  Min multiplier:          0.7754
+  Max multiplier:          1.1932
+  Cap respected:           PASS
+
+  Z-score distribution by position (informational):
+    QB: n=79, mean=0.284, sd=1.047, range=[-1.98, 1.88]
+    RB: n=113, mean=0.143, sd=0.939, range=[-1.77, 1.93]
+    TE: n=95, mean=0.150, sd=0.994, range=[-1.76, 1.86]
+    WR: n=184, mean=0.227, sd=0.990, range=[-2.25, 1.75]
+  NOTE: z-scores were computed against the full R/28 prospect pool.
+  The active-roster subset is expected to skew (design gap noted).
+
+======================================================================
+CHECK 4: Per-team share sums within [CONSTRAINT_LOWER, CONSTRAINT_UPPER]
+======================================================================
+  Soft constraint band: [0.95, 1.05]
+  Active teams summed:  32
+
+  Pre-constraint (adjusted) target_share sums:
+    min=1.0847, median=1.2282, max=1.3469
+  Pre-constraint (adjusted) rush_share sums:
+    min=0.9719, median=1.0834, max=1.2324
+
+  Post-constraint target_share sums:
+    min=1.0000, max=1.0000
+    teams outside band: 0
+
+  Post-constraint rush_share sums:
+    min=0.9719, max=1.0480
+    teams outside band: 0
+
+  Result: PASS
+
+======================================================================
+CHECK 5: No degenerate share values
+======================================================================
+  Rows checked: 963
+
+  target_share_base: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  target_share_adjusted: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  target_share: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  rush_share_base: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  rush_share_adjusted: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  rush_share: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  expected_targets_pg: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+  expected_carries_pg: NA=0, Inf=0, NaN=0, neg=0 -- PASS
+
+  Result: PASS
+
+======================================================================
+SUMMARY
+======================================================================
+  Total checks:  5
+  PASS:          4
+  WARN:          1
+  FAIL:          0
+  SKIP:          0
+
+  By check:
+    target_priors_sum: WARN
+    rush_priors_sum: PASS
+    talent_multipliers: PASS
+    team_share_sums: PASS
+    no_degenerate: PASS
+======================================================================

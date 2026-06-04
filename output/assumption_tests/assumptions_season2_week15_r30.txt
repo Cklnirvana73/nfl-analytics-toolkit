@@ -1,0 +1,105 @@
+======================================================================
+R/30 Team Volume Projections -- Assumption Tests
+======================================================================
+Generated: 2026-05-22 15:56:45 CDT
+Source script: R/30_team_volume_projections.R
+Historical window: 2023, 2024, 2025
+Prior season (QB quality): 2025
+Team volumes output: C:/Users/cklni/Documents/nfl-analytics-toolkit/data/season2_cache/s2_week15_team_volumes.rds
+
+Loading 2025 pbp for QB quality checks (shared by CHECKs 2 and 3)...
+
+======================================================================
+CHECK 1: MIN_GAMES_TEAM_SEASON = 14 met per active team per season
+======================================================================
+  Historical window: 2023, 2024, 2025
+  Threshold:         14 games
+
+  2023: 32 teams, 32 at 17 games, 0 below 17, 0 below 14
+  2024: 32 teams, 32 at 17 games, 0 below 17, 0 below 14
+  2025: 32 teams, 32 at 17 games, 0 below 17, 0 below 14
+
+  Result: PASS
+
+======================================================================
+CHECK 2: MIN_DROPBACKS_QB = 200 -- qualifying QB coverage in 2025
+======================================================================
+  Prior season: 2025
+  Dropback threshold:  200
+  Active teams:        32
+  Qualifying (>=200 dropbacks): 32
+  Below threshold:     0
+  No pbp record:       0
+  Teams defaulted to neutral quality: 0
+
+  Dropback distribution (qualifying starters only):
+    min=229, median=500, max=633
+
+  PASS threshold: >= 29 teams qualifying
+  WARN threshold: >= 25 teams qualifying
+  Result: PASS
+
+======================================================================
+CHECK 3: QB quality z-scores non-degenerate
+======================================================================
+  Qualifying starters: 32
+
+  Pre-standardization CPOE distribution:
+    mean=0.9567, sd=3.3597 -- non-degenerate
+  Pre-standardization EPA per dropback distribution:
+    mean=0.0393, sd=0.1310 -- non-degenerate
+
+  qb_quality_score distribution (informational):
+    mean=0.000, sd=0.927, range=[-2.18, 2.44]
+  NOTE: qb_quality_score is the average of two unit z-scores.
+  SD is expected between 0.5 and 1.0 depending on CPOE/EPA correlation.
+
+  Result: PASS
+
+======================================================================
+CHECK 4: No structural break in 2023-2025 historical window
+======================================================================
+
+  Part A: Season structure (game count consistency)
+    2023: 272 games, 32 distinct teams -- consistent
+    2024: 272 games, 32 distinct teams -- consistent
+    2025: 272 games, 32 distinct teams -- consistent
+
+    Active team-season combinations missing: 0
+    Team-seasons below floor (14 games):  0
+
+  Part B: R/30 historical volume distribution (informational)
+    historical_pass_pg: mean=39.2, sd=2.4, range=[34.4, 43.5]
+    historical_rush_pg: mean=24.8, sd=2.0, range=[20.8, 28.4]
+
+    Teams with historical_pass_pg >5% from league mean (39.2):
+      BAL: 34.4 (12.4% deviation)
+      CIN: 43.5 (10.8% deviation)
+      CLE: 43.4 (10.7% deviation)
+      KC: 43.3 (10.4% deviation)
+      GB: 35.3 (10.2% deviation)
+      DAL: 43.1 (9.8% deviation)
+      PIT: 36.1 (8.1% deviation)
+      PHI: 36.2 (7.8% deviation)
+      SF: 36.5 (6.9% deviation)
+      ATL: 36.7 (6.4% deviation)
+      MIA: 36.9 (6.0% deviation)
+      ARI: 41.4 (5.6% deviation)
+
+  Result: PASS
+
+======================================================================
+SUMMARY
+======================================================================
+  Total checks:  4
+  PASS:          4
+  WARN:          0
+  FAIL:          0
+  SKIP:          0
+
+  By check:
+    games_per_season: PASS
+    qb_dropback_coverage: PASS
+    qb_zscore_degeneracy: PASS
+    structural_break: PASS
+======================================================================
