@@ -49,6 +49,10 @@
 #   - Rookie priors    : Draft capital multiplier on depth-position prior
 #   - Talent signal    : R/28 score_final, z-scored by position
 #   - Injury logic     : NOT in R/31 (separate weekly function in R/32+)
+#   - In-season blend  : v2. Preseason shares taper toward observed
+#                        current-season shares via compute_prior_weight()
+#                        when as_of_week + current_season_volume supplied.
+#                        3-week observation floor mirrors R/29.
 #   - Positions        : QB, RB, WR, TE only (DEF/ST handled separately)
 #   - Sack adjustment  : R/30 team_pass_pg includes sacks; downstream may
 #                        apply a 0.93 multiplier to convert to thrown passes
@@ -94,19 +98,40 @@
 #   rookie_capital_mult        dbl   1.15 for R1 rookie down to 0.45 UDFA
 #                                    1.0 for non-rookies
 #   score_final                dbl   R/28 dynasty score (NA if not present)
-#   talent_z                   dbl   z-score within position from score_final
+#   talent_z                   dbl   within-position z-score. For prospects this
+#                                    derives from R/28 score_final; for veterans
+#                                    (years_exp >= VETERAN_MIN_EXP) it derives
+#                                    from NFL efficiency over the trailing window
 #   talent_multiplier          dbl   1 + 0.10 * talent_z, capped [0.70, 1.30]
+#   talent_source              chr   "veteran_nfl" (NFL-efficiency z),
+#                                    "prospect_college" (R/28 score z), or
+#                                    "neutral" (no signal; talent_z = 0)
+#   window_volume              dbl   veteran trailing-window volume (QB
+#                                    dropbacks, RB rush attempts, WR targets);
+#                                    NA for non-veterans
+#   n_window_seasons           int   veteran seasons observed in the window;
+#                                    NA for non-veterans
 #   target_share_base          dbl   depth-position prior
-#   target_share_adjusted      dbl   after rookie + talent multipliers
+#   target_share_adjusted      dbl   after rookie + talent multipliers (and
+#                                    in-season observed blend when as_of_week
+#                                    is supplied)
 #   target_share               dbl   after soft constraint per team
 #   rush_share_base            dbl   depth-position prior
-#   rush_share_adjusted        dbl   after rookie + talent multipliers
+#   rush_share_adjusted        dbl   after rookie + talent multipliers (and
+#                                    in-season observed blend when as_of_week
+#                                    is supplied)
 #   rush_share                 dbl   after soft constraint per team
+#   observed_target_share      dbl   caller-supplied observed share (in-season
+#                                    mode only; NA preseason / unmatched)
+#   observed_rush_share        dbl   caller-supplied observed share (in-season
+#                                    mode only; NA preseason / unmatched)
+#   share_blend_weight         dbl   compute_prior_weight(as_of_week) used in
+#                                    the blend (NA preseason / blend skipped)
 #   projected_team_pass_pg     dbl   from R/30
 #   projected_team_rush_pg     dbl   from R/30
 #   expected_targets_pg        dbl   target_share * team_pass_pg
 #   expected_carries_pg        dbl   rush_share * team_rush_pg
-#   schema_tag                 chr   "s2_w15_player_alloc_v1"
+#   schema_tag                 chr   "s2_w15_player_alloc_v3_2"
 #
 # SOURCE DEPENDENCIES
 # -------------------
@@ -118,16 +143,78 @@
 #     From R/30. Required.
 #
 #   data/season2_cache/s2_week14_final_prospect_scores.csv
-#     From R/28. Required for talent multiplier. Players missing from this
-#     file get talent_multiplier = 1.0 (neutral).
+#     From R/28. Required for prospect talent multiplier. Players missing from
+#     this file get talent_multiplier = 1.0 (neutral) unless a veteran signal
+#     applies.
+#
+#   data/season2_cache/s2_week15_player_season_panel_cache.rds
+#     From R/16 (built and cached by R/29). Optional. Supplies NFL efficiency
+#     for the veteran talent signal. If absent, all players keep the prospect
+#     talent_z.
 #
 # RUN
 # ---
 #   source(here::here("R", "31_player_volume_allocation.R"))
-#   alloc <- allocate_player_volumes()
+#   alloc <- allocate_player_volumes()                    # preseason
+#   alloc <- allocate_player_volumes(                     # in-season
+#     as_of_week = 6,
+#     current_season_volume = obs                         # caller-supplied
+#   )
 #
 # Author: Christian K. LeBlanc
-# Version: 1.0
+# Version: 3.2
+#
+# CHANGELOG
+# ---------
+# 3.2  Veteran volume floors recalibrated from the observed 2023-2025 qualifier
+#      distribution: RB 100 -> 200 rush attempts, WR 50 -> 150 targets (QB
+#      unchanged at 200 dropbacks). With shrinkage in place the remaining
+#      ranking distortion came entirely from marginal-volume backups clearing
+#      the old floors (e.g., a passing-down RB3 scored on a thin, efficient
+#      receiving sample). Raising the floors moves those players to the prospect
+#      or neutral path. Downstream effect is small either way, since the capped
+#      talent multiplier sits on top of small depth-position base shares for low
+#      tiers; this change is about ranking credibility. Schema tag ->
+#      s2_w15_player_alloc_v3_2. No structural change to the output columns.
+# 3.1  Veteran efficiency rates now empirical-Bayes shrunk toward the position
+#      mean before standardizing, so low-volume players regress to neutral
+#      instead of producing extreme z-scores (a hard volume floor alone left
+#      boundary backups topping the talent ranking). Each component is a
+#      trust-weighted standardized value, z_i = B_i * (theta_i - mu0) / sd0 with
+#      B_i = n_i / (n_i + K). K is estimated per position-component from the
+#      cross-section (moment regression of squared deviations on 1/volume) and
+#      floored at the median window volume, since the moment estimate is not
+#      robust to the outliers it must tame. RB rushing and receiving components
+#      are shrunk by their own sample sizes; the WR slope is shrunk like the
+#      level. Two diagnostic columns added: window_volume, n_window_seasons.
+#      Schema tag -> s2_w15_player_alloc_v3_1.
+# 3.0  Veteran talent split added. Established veterans
+#      (years_exp >= VETERAN_MIN_EXP, sourced from nflreadr::load_rosters)
+#      replace the stale R/28 college score with an NFL-efficiency talent_z
+#      computed from the R/16 player-season panel over the trailing
+#      VETERAN_WINDOW_SEASONS. Per-position metric grounded in the R/28
+#      residual analysis: QB = CPOE z + EPA/dropback z (reuses the R/30
+#      QB-quality construct); RB = rush success rate z + receiving EPA/target
+#      z; WR = receiving EPA/target level z + trajectory (slope) z; TE has no
+#      clean efficiency signal so veteran TEs keep the prospect talent_z.
+#      Composite is re-standardized to unit z within position so it shares the
+#      prospect z scale. Veterans below the per-position volume floor fall back
+#      to the prospect talent_z (hard switch at the threshold, no blend band).
+#      New audit column talent_source. Schema tag -> s2_w15_player_alloc_v3.
+#      Prospect and preseason behavior otherwise unchanged.
+# 2.0  In-season share blend added. New optional as_of_week and
+#      current_season_volume arguments: each player's preseason adjusted
+#      share is blended toward their observed current-season share using
+#      R/29's compute_prior_weight() decay curve (same curve as R/29, R/30
+#      SOS, and R/34 -- no divergence). Blend runs BEFORE the soft constraint
+#      so per-team sums stay coherent. Observation floor mirrors R/29's
+#      MIN_WEEKS_OBSERVED = 3: below week 3, preseason shares are retained.
+#      Caller supplies observed shares (same contract as R/30's
+#      current_season_sos); players without an observed record retain
+#      preseason shares at full weight. Three new audit columns:
+#      observed_target_share, observed_rush_share, share_blend_weight.
+#      Schema tag -> s2_w15_player_alloc_v2. Preseason behavior unchanged.
+# 1.0  Initial build.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -145,6 +232,14 @@ library(nflreadr)
 source(here::here("R", "30_team_volume_projections.R"))
 source(here::here("R", "19_sleeper_api.R"))   # for get_all_sleeper_players()
 
+# compute_prior_weight() (R/29) normally arrives via R/30's guarded source
+# chain above. This guard protects against future refactors of R/30: the
+# in-season share blend depends on the canonical decay curve and must fail
+# loudly if it is unavailable, never fall back to a local copy.
+if (!exists("compute_prior_weight")) {
+  source(here::here("R", "29_projection_engine.R"))
+}
+
 # ------------------------------------------------------------------------------
 # CONSTANTS
 # ------------------------------------------------------------------------------
@@ -159,10 +254,84 @@ ALLOC_POSITIONS <- c("QB", "RB", "WR", "TE")
 CONSTRAINT_LOWER <- 0.95
 CONSTRAINT_UPPER <- 1.05
 
+# ------------------------------------------------------------------------------
+# IN-SEASON SHARE BLEND (v2)
+# ------------------------------------------------------------------------------
+# When allocate_player_volumes() is called with as_of_week and a
+# current_season_volume table, each player's preseason adjusted share is
+# blended toward their OBSERVED current-season share using R/29's
+# compute_prior_weight(as_of_week) -- the same validated decay curve used
+# across the engine (week 1 = full preseason weight, ~week 9 crossover,
+# 0.05 floor). The blend happens BEFORE the soft constraint, so the
+# constraint runs once on the blended shares and per-team sums stay coherent.
+#
+# Minimum-weeks guard: observed shares from one or two games are dominated
+# by single-game noise (one big game can spike a WR3's share). Below this
+# threshold, preseason shares are retained regardless. Mirrors R/29's
+# MIN_WEEKS_OBSERVED = 3 convention so R/31's in-season behavior is
+# consistent with the projection engine's.
+MIN_WEEKS_OBSERVED_ALLOC <- 3L
+
 # Talent multiplier sensitivity: 1 + 0.10 * z-score, capped
 TALENT_MULT_SENSITIVITY <- 0.10
 TALENT_MULT_FLOOR <- 0.70
 TALENT_MULT_CEILING <- 1.30
+
+# ------------------------------------------------------------------------------
+# VETERAN TALENT SIGNAL (talent-z veteran split)
+# ------------------------------------------------------------------------------
+# For established veterans, R/28's college-based score_final is stale. Veterans
+# instead receive an NFL-efficiency talent_z from the R/16 player-season panel
+# over a trailing window, replacing the prospect score (hard switch at the
+# threshold). Players below the threshold, veteran TEs, and veterans with thin
+# recent NFL data keep the R/28 prospect talent_z.
+#
+# Per-position metric is grounded in the R/28 residual analysis (which features
+# separate model hits from misses):
+#   QB : CPOE z + EPA/dropback z, equal weight (reuses the R/30 QB-quality
+#        construct; EPA/dropback already absorbs interceptions, so INT rate is
+#        not added as a separate term)
+#   RB : rush success rate z + receiving EPA/target z, equal weight
+#   WR : receiving EPA/target level z + trajectory (slope across window) z;
+#        trajectory was the dominant pass-catcher separator in the analysis
+#   TE : no clean efficiency separator found -> veteran TEs keep prospect z
+# Each position composite is re-standardized to unit z within position so it is
+# on the same scale as the prospect talent_z and TALENT_MULT_SENSITIVITY
+# applies consistently to both signals.
+
+# Years of NFL experience at/above which a player is treated as a veteran.
+# Sourced from nflreadr::load_rosters(season)$years_exp.
+VETERAN_MIN_EXP <- 3L
+
+# Trailing completed NFL seasons used to measure veteran efficiency.
+VETERAN_WINDOW_SEASONS <- 3L
+
+# Minimum trailing-window volume for a stable veteran read. Below these floors
+# the veteran is treated as thin-data and falls back to the prospect talent_z.
+# The QB floor mirrors R/30's 200-dropback QB-quality rule. The RB and WR floors
+# were recalibrated from the observed 2023-2025 qualifier distribution (RB rush
+# median ~471, WR target median ~190): set well below the median to keep
+# committee-or-better backs and rotational-or-better receivers, but high enough
+# to exclude pure backups whose efficiency on a thin sample distorted the
+# ranking (e.g., a ~40-carry-per-year RB3 or ~40-target-per-year WR5). Tunable.
+VETERAN_MIN_QB_DROPBACKS <- 200L
+VETERAN_MIN_RB_ATTEMPTS  <- 200L
+VETERAN_MIN_WR_TARGETS   <- 150L
+
+# WR composite weighting: share of the WR veteran z coming from the EPA/target
+# trajectory (slope) vs the level. Equal weight by default; tunable.
+VETERAN_WR_SLOPE_WEIGHT <- 0.5
+
+# Empirical-Bayes shrinkage of veteran efficiency rates toward the position
+# mean, weighted by sample size, so low-volume players regress to neutral
+# rather than producing extreme z-scores. The shrinkage constant K (in volume
+# units) is estimated per position-component from the cross-section
+# (K = within-variance / between-variance via a moment regression of squared
+# deviations on 1/volume). When a position-component has fewer than
+# VETERAN_EB_MIN_PLAYERS usable players, or the moment estimate is degenerate
+# (non-positive variance), K falls back to the median window volume of that
+# component (a median-volume player is then shrunk halfway).
+VETERAN_EB_MIN_PLAYERS <- 8L
 
 # Target share priors by depth position (sum across all positions ~= 1.0)
 TARGET_SHARE_PRIORS <- c(
@@ -207,7 +376,12 @@ OUTPUT_RDS_PATH_ALLOC <- here::here("data", "season2_cache",
 OUTPUT_CSV_PATH_ALLOC <- here::here("data", "season2_cache",
                                      "s2_week15_player_volume_allocation.csv")
 
-SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v1"
+# R/16 player-season panel cache (built and cached by R/29). Same path R/29
+# uses. Optional input for the veteran talent signal.
+PANEL_CACHE_PATH_ALLOC <- here::here("data", "season2_cache",
+                                      "s2_week15_player_season_panel_cache.rds")
+
+SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v3_2"
 
 # ------------------------------------------------------------------------------
 # NSE DECLARATIONS
@@ -229,7 +403,15 @@ utils::globalVariables(c(
   "depth_pos_clean", "depth_rank_raw", "key",
   "cfb_player_name", "position_score", "position_mean", "position_sd",
   "team_target_sum", "team_rush_sum", "team_target_rescale",
-  "team_rush_rescale", "schema_tag"
+  "team_rush_rescale", "schema_tag",
+  "observed_target_share", "observed_rush_share", "share_blend_weight",
+  "talent_source", "talent_z_prospect", "veteran_talent_z", "years_exp",
+  "player_id", "qb_dropbacks", "pass_epa_per_dropback", "mean_cpoe",
+  "rush_attempts", "rush_success_rate", "rush_epa_per_attempt",
+  "targets", "rec_epa_per_target", "window_volume", "n_window_seasons",
+  "n_window_targets", "vet_composite", "comp_a", "comp_b", "cpoe_w", "epa_w",
+  "rsr_w", "reptt_w", "level_w", "slope_w", "cpoe_s", "epa_s", "rsr_s",
+  "reptt_s", "level_s", "slope_s", "inv_n"
 ))
 
 # ==============================================================================
@@ -743,58 +925,501 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 }
 
 # ------------------------------------------------------------------------------
+# Small numeric helpers for the veteran talent signal
+# ------------------------------------------------------------------------------
+
+#' Weighted mean with NA/zero-weight guards
+#'
+#' @param x Numeric vector of values.
+#' @param w Numeric vector of weights (same length as x).
+#' @return Weighted mean over entries with non-NA value and positive weight,
+#'   or NA_real_ if no such entry exists.
+#' @keywords internal
+.wmean <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+#' Z-score a vector; sd <= 0 or NA guarded to 1.0
+#'
+#' @param x Numeric vector.
+#' @return (x - mean) / sd, computed over non-NA values.
+#' @keywords internal
+.zscore <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- stats::sd(x, na.rm = TRUE)
+  if (is.na(s) || s <= 0) s <- 1.0
+  (x - m) / s
+}
+
+#' OLS slope of y on x with degenerate-input guards
+#'
+#' Used for the WR EPA/target trajectory over the trailing window. Returns 0
+#' when fewer than two distinct x values are available (a single season gives
+#' no trajectory), so the slope component is neutral rather than NA.
+#'
+#' @param x Numeric predictor (season).
+#' @param y Numeric response (per-season efficiency).
+#' @return Slope coefficient, or 0.0 when undefined.
+#' @keywords internal
+.slope <- function(x, y) {
+  ok <- !is.na(x) & !is.na(y)
+  if (sum(ok) < 2L || length(unique(x[ok])) < 2L) return(0.0)
+  xv <- x[ok]
+  yv <- y[ok]
+  vx <- sum((xv - mean(xv))^2)
+  if (vx <= 0) return(0.0)
+  sum((xv - mean(xv)) * (yv - mean(yv))) / vx
+}
+
+#' Sample-size-shrunk standardized component via empirical Bayes
+#'
+#' Returns a standardized, shrinkage-attenuated component for each player:
+#'   z_i = B_i * (theta_i - mu0) / sd0,   B_i = n_i / (n_i + K)
+#' where mu0 and sd0 are the volume-weighted mean and SD of the rate, and K is
+#' the empirical-Bayes shrinkage constant. Low-volume players have small B_i and
+#' are pulled toward 0; high-volume players keep their standardized signal. This
+#' attenuates the z directly (rather than shrinking the value and re-z-scoring,
+#' which recompresses the spread and can re-inflate a moderate-volume outlier).
+#'
+#' K is estimated by moments: under theta_i ~ Normal(mu_i, c / n_i) with
+#' mu_i ~ Normal(mu0, tau2), E[(theta_i - mu0)^2] = tau2 + c * (1 / n_i).
+#' Regressing observed squared deviations on 1/n_i gives intercept tau2 and
+#' slope c, and K = c / tau2. The moment estimate is not robust (a low-volume
+#' outlier inflates the estimated between-variance and depresses its own
+#' shrinkage), so K is floored at the median volume among qualifying players:
+#' K = max(moment estimate, median volume). This keeps EB when it is stronger
+#' and falls back to the robust median anchor when it is degenerate or too
+#' weak. With realistic qualifying-veteran volumes the moment estimate is
+#' typically the binding (stronger) term.
+#'
+#' Players with a non-finite theta (no usable sample for this component) return
+#' 0 (neutral).
+#'
+#' @param theta Numeric vector of per-player rate estimates.
+#' @param n Numeric vector of per-player sample sizes (same length as theta).
+#' @param label Character tag for the diagnostic message.
+#' @return Numeric vector of shrunk standardized components, same length as
+#'   theta.
+#' @keywords internal
+.eb_shrink <- function(theta, n, label = "") {
+  out <- rep(0.0, length(theta))
+  ok  <- is.finite(theta) & is.finite(n) & n > 0
+  if (!any(ok)) return(out)
+
+  w   <- n[ok]
+  mu0 <- sum(theta[ok] * w) / sum(w)
+  sd0 <- sqrt(sum(w * (theta[ok] - mu0)^2) / sum(w))
+  if (!is.finite(sd0) || sd0 <= 0) sd0 <- 1.0
+
+  K      <- NA_real_
+  method <- "EB"
+  if (sum(ok) < VETERAN_EB_MIN_PLAYERS) {
+    method <- "fallback (insufficient n)"
+  } else {
+    inv_n <- 1 / n[ok]
+    d     <- (theta[ok] - mu0)^2
+    if (stats::var(inv_n) > 0) {
+      fit <- tryCatch(stats::lm(d ~ inv_n), error = function(e) NULL)
+      if (!is.null(fit)) {
+        co   <- stats::coef(fit)
+        tau2 <- unname(co[[1]])
+        cwin <- unname(co[[2]])
+        if (is.finite(tau2) && is.finite(cwin) && tau2 > 0 && cwin > 0) {
+          K <- cwin / tau2
+        }
+      }
+    }
+    if (!is.finite(K) || K <= 0) method <- "fallback (degenerate EB)"
+  }
+
+  # Robust anchor (option-2 fallback): median volume among qualifying players.
+  # K is never allowed to shrink WEAKER than this, because the moment estimate
+  # of K is not robust (a low-volume outlier inflates the estimated between-
+  # variance and depresses its own shrinkage). Using max() keeps EB when it is
+  # stronger and floors it at the robust anchor otherwise.
+  anchor <- stats::median(n[ok], na.rm = TRUE)
+  if (!is.finite(K) || K <= 0) {
+    K <- anchor
+  } else if (K < anchor) {
+    K      <- anchor
+    method <- paste0(method, " -> floored at median anchor")
+  }
+
+  B <- n / (n + K)
+  z <- B * (theta - mu0) / sd0
+  z[!is.finite(theta)] <- 0.0
+
+  message(glue("    EB shrink [{label}]: method={method}, ",
+               "K={format(round(K, 1), nsmall = 1)}, ",
+               "mu0={round(mu0, 4)}, n_players={sum(ok)}"))
+
+  z
+}
+
+# ------------------------------------------------------------------------------
+# .load_player_season_panel
+# ------------------------------------------------------------------------------
+
+#' Load the R/16 player-season panel from the R/29-built cache
+#'
+#' Optional input for the veteran talent signal. If the cache is missing,
+#' unreadable, or lacks required columns, returns an empty tibble and the
+#' veteran signal is skipped (all players keep the prospect talent_z).
+#'
+#' @param cache_path Character. Path to the cached R/16 panel RDS.
+#' @return Tibble with nfl_gsis_id, season, position, and the efficiency
+#'   columns needed for veteran scoring.
+#' @keywords internal
+.load_player_season_panel <- function(cache_path = PANEL_CACHE_PATH_ALLOC) {
+
+  empty <- tibble::tibble(
+    nfl_gsis_id           = character(),
+    season                = integer(),
+    position              = character(),
+    qb_dropbacks          = numeric(),
+    pass_epa_per_dropback = numeric(),
+    mean_cpoe             = numeric(),
+    rush_attempts         = numeric(),
+    rush_success_rate     = numeric(),
+    rush_epa_per_attempt  = numeric(),
+    targets               = numeric(),
+    rec_epa_per_target    = numeric()
+  )
+
+  if (!file.exists(cache_path)) {
+    message(glue("  R/16 panel cache not found at: {cache_path}"))
+    message("  Veteran talent signal skipped; all players keep prospect talent_z")
+    return(empty)
+  }
+
+  panel <- tryCatch(
+    readRDS(cache_path),
+    error = function(e) {
+      message(glue("  R/16 panel read failed: {e$message}"))
+      NULL
+    }
+  )
+
+  if (is.null(panel) || nrow(panel) == 0L) {
+    return(empty)
+  }
+
+  needed <- c("player_id", "season", "position", "qb_dropbacks",
+              "pass_epa_per_dropback", "mean_cpoe", "rush_attempts",
+              "rush_success_rate", "rush_epa_per_attempt", "targets",
+              "rec_epa_per_target")
+  missing_cols <- setdiff(needed, names(panel))
+  if (length(missing_cols) > 0L) {
+    message(glue("  R/16 panel missing columns: ",
+                 "{paste(missing_cols, collapse = ', ')}; ",
+                 "veteran signal skipped"))
+    return(empty)
+  }
+
+  panel %>%
+    dplyr::transmute(
+      nfl_gsis_id           = .data$player_id,
+      season                = as.integer(.data$season),
+      position              = .data$position,
+      qb_dropbacks          = .data$qb_dropbacks,
+      pass_epa_per_dropback = .data$pass_epa_per_dropback,
+      mean_cpoe             = .data$mean_cpoe,
+      rush_attempts         = .data$rush_attempts,
+      rush_success_rate     = .data$rush_success_rate,
+      rush_epa_per_attempt  = .data$rush_epa_per_attempt,
+      targets               = .data$targets,
+      rec_epa_per_target    = .data$rec_epa_per_target
+    )
+}
+
+# ------------------------------------------------------------------------------
+# .load_roster_experience
+# ------------------------------------------------------------------------------
+
+#' Load years-of-experience per player for the target season
+#'
+#' Sources years_exp from nflreadr::load_rosters(season). If unavailable or the
+#' expected columns are absent (older nflreadr), returns an empty tibble and no
+#' player is flagged as a veteran (everyone keeps the prospect talent_z).
+#'
+#' @param season Integer. Target season (default SEASON_ALLOC).
+#' @return Tibble: nfl_gsis_id, years_exp.
+#' @keywords internal
+.load_roster_experience <- function(season = SEASON_ALLOC) {
+
+  empty <- tibble::tibble(nfl_gsis_id = character(), years_exp = integer())
+
+  rosters <- tryCatch(
+    nflreadr::load_rosters(seasons = season),
+    error = function(e) {
+      message(glue("  load_rosters({season}) failed: {e$message}"))
+      NULL
+    }
+  )
+
+  if (is.null(rosters) || nrow(rosters) == 0L) {
+    message("  Roster experience unavailable; no veterans flagged")
+    return(empty)
+  }
+
+  if (!all(c("gsis_id", "years_exp") %in% names(rosters))) {
+    message("  Roster data missing gsis_id/years_exp; no veterans flagged")
+    return(empty)
+  }
+
+  rosters %>%
+    dplyr::filter(!is.na(.data$gsis_id), nchar(.data$gsis_id) > 0) %>%
+    dplyr::transmute(
+      nfl_gsis_id = .data$gsis_id,
+      years_exp   = suppressWarnings(as.integer(.data$years_exp))
+    ) %>%
+    dplyr::filter(!is.na(.data$years_exp)) %>%
+    dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# .compute_veteran_talent_z
+# ------------------------------------------------------------------------------
+
+#' Compute the NFL-efficiency veteran talent_z per position
+#'
+#' Restricts the R/16 panel to the trailing window and to veterans
+#' (years_exp >= VETERAN_MIN_EXP), aggregates a per-position efficiency
+#' composite, applies the per-position volume floor, and re-standardizes the
+#' composite to unit z within position. Only QB, RB, and WR are scored; veteran
+#' TEs are intentionally excluded (no clean efficiency separator in the R/28
+#' residual analysis) and fall back to the prospect talent_z downstream.
+#'
+#' @param panel Tibble from .load_player_season_panel().
+#' @param roster_exp Tibble from .load_roster_experience().
+#' @param season Integer. Target season (default SEASON_ALLOC).
+#' @return Tibble: nfl_gsis_id, position, veteran_talent_z, window_volume,
+#'   n_window_seasons. Empty if no veteran clears its floor.
+#' @keywords internal
+.compute_veteran_talent_z <- function(panel, roster_exp,
+                                       season = SEASON_ALLOC) {
+
+  empty <- tibble::tibble(
+    nfl_gsis_id      = character(),
+    position         = character(),
+    veteran_talent_z = numeric(),
+    window_volume    = numeric(),
+    n_window_seasons = integer()
+  )
+
+  if (nrow(panel) == 0L || nrow(roster_exp) == 0L) return(empty)
+
+  window_seasons <- (season - VETERAN_WINDOW_SEASONS):(season - 1L)
+
+  veteran_ids <- roster_exp %>%
+    dplyr::filter(.data$years_exp >= VETERAN_MIN_EXP) %>%
+    dplyr::select(nfl_gsis_id)
+
+  vets <- panel %>%
+    dplyr::filter(.data$season %in% window_seasons,
+                  .data$position %in% c("QB", "RB", "WR")) %>%
+    dplyr::inner_join(veteran_ids, by = "nfl_gsis_id")
+
+  if (nrow(vets) == 0L) return(empty)
+
+  # QB: dropback-weighted CPOE and EPA/dropback over the window (R/30 construct).
+  # Both components share the dropback sample size, so shrink each by dropbacks.
+  qb <- vets %>%
+    dplyr::filter(.data$position == "QB") %>%
+    dplyr::group_by(.data$nfl_gsis_id) %>%
+    dplyr::summarise(
+      position         = "QB",
+      window_volume    = sum(.data$qb_dropbacks, na.rm = TRUE),
+      n_window_seasons = dplyr::n_distinct(.data$season),
+      cpoe_w           = .wmean(.data$mean_cpoe, .data$qb_dropbacks),
+      epa_w            = .wmean(.data$pass_epa_per_dropback,
+                                .data$qb_dropbacks),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(.data$window_volume >= VETERAN_MIN_QB_DROPBACKS) %>%
+    dplyr::mutate(
+      comp_a        = .eb_shrink(.data$cpoe_w, .data$window_volume, "QB cpoe"),
+      comp_b        = .eb_shrink(.data$epa_w, .data$window_volume, "QB epa/db"),
+      vet_composite = 0.5 * .data$comp_a + 0.5 * .data$comp_b
+    )
+
+  # RB: attempt-weighted rush success rate + target-weighted rec EPA/target.
+  # The two components have different sample sizes (carries vs targets), so each
+  # is shrunk by its own volume. The volume floor is on rush attempts.
+  rb <- vets %>%
+    dplyr::filter(.data$position == "RB") %>%
+    dplyr::group_by(.data$nfl_gsis_id) %>%
+    dplyr::summarise(
+      position         = "RB",
+      window_volume    = sum(.data$rush_attempts, na.rm = TRUE),
+      n_window_targets = sum(.data$targets, na.rm = TRUE),
+      n_window_seasons = dplyr::n_distinct(.data$season),
+      rsr_w            = .wmean(.data$rush_success_rate, .data$rush_attempts),
+      reptt_w          = .wmean(.data$rec_epa_per_target, .data$targets),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(.data$window_volume >= VETERAN_MIN_RB_ATTEMPTS) %>%
+    dplyr::mutate(
+      comp_a        = .eb_shrink(.data$rsr_w, .data$window_volume, "RB rush SR"),
+      comp_b        = .eb_shrink(.data$reptt_w, .data$n_window_targets,
+                                 "RB rec EPA/tgt"),
+      vet_composite = 0.5 * .data$comp_a + 0.5 * .data$comp_b
+    )
+
+  # WR: target-weighted rec EPA/target level + trajectory (slope across window).
+  # Both the level and the slope precision scale with targets, so shrink each
+  # by the target sample.
+  wr <- vets %>%
+    dplyr::filter(.data$position == "WR") %>%
+    dplyr::group_by(.data$nfl_gsis_id) %>%
+    dplyr::summarise(
+      position         = "WR",
+      window_volume    = sum(.data$targets, na.rm = TRUE),
+      n_window_seasons = dplyr::n_distinct(.data$season),
+      level_w          = .wmean(.data$rec_epa_per_target, .data$targets),
+      slope_w          = .slope(.data$season, .data$rec_epa_per_target),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(.data$window_volume >= VETERAN_MIN_WR_TARGETS) %>%
+    dplyr::mutate(
+      comp_a        = .eb_shrink(.data$level_w, .data$window_volume,
+                                 "WR rec EPA/tgt level"),
+      comp_b        = .eb_shrink(.data$slope_w, .data$window_volume,
+                                 "WR EPA/tgt slope"),
+      vet_composite = (1 - VETERAN_WR_SLOPE_WEIGHT) * .data$comp_a +
+                       VETERAN_WR_SLOPE_WEIGHT * .data$comp_b
+    )
+
+  combined <- dplyr::bind_rows(
+    qb %>% dplyr::select(nfl_gsis_id, position, window_volume,
+                          n_window_seasons, vet_composite),
+    rb %>% dplyr::select(nfl_gsis_id, position, window_volume,
+                          n_window_seasons, vet_composite),
+    wr %>% dplyr::select(nfl_gsis_id, position, window_volume,
+                          n_window_seasons, vet_composite)
+  )
+
+  if (nrow(combined) == 0L) return(empty)
+
+  # Re-standardize the composite to unit z within position so the veteran z
+  # matches the prospect talent_z scale.
+  combined %>%
+    dplyr::group_by(.data$position) %>%
+    dplyr::mutate(veteran_talent_z = .zscore(.data$vet_composite)) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(nfl_gsis_id, position, veteran_talent_z,
+                  window_volume, n_window_seasons)
+}
+
+# ------------------------------------------------------------------------------
 # .compute_talent_multipliers
 # ------------------------------------------------------------------------------
 
 #' Compute talent multiplier per player from R/28 score_final
 #'
-#' For each position, computes the league mean and SD of score_final.
-#' Each player gets talent_z = (score - mean) / sd, then
-#' talent_multiplier = 1 + TALENT_MULT_SENSITIVITY * talent_z, capped at
+#' Compute talent multiplier per player, with veteran override
+#'
+#' Prospects receive talent_z from R/28 score_final, z-scored within position
+#' (formula unchanged). Veterans with a usable NFL-efficiency signal
+#' (veteran_z) replace that with their veteran talent_z (hard switch). The
+#' multiplier is 1 + TALENT_MULT_SENSITIVITY * talent_z, capped at
 #' [TALENT_MULT_FLOOR, TALENT_MULT_CEILING].
 #'
-#' Players missing from R/28 get talent_z = 0 and multiplier = 1.0.
+#' Resolution per player: veteran NFL z if present, else prospect college z if
+#' present, else neutral (talent_z = 0). talent_source records which applied.
 #'
 #' @param scores Tibble from .load_dynasty_scores().
-#' @return Tibble: nfl_gsis_id, score_final, talent_z, talent_multiplier.
+#' @param veteran_z Tibble from .compute_veteran_talent_z(), or NULL.
+#' @return Tibble: nfl_gsis_id, score_final, talent_z, talent_multiplier,
+#'   talent_source.
 #' @keywords internal
-.compute_talent_multipliers <- function(scores) {
+.compute_talent_multipliers <- function(scores, veteran_z = NULL) {
 
-  if (nrow(scores) == 0L) {
-    return(tibble::tibble(
-      nfl_gsis_id       = character(),
-      score_final       = numeric(),
-      talent_z          = numeric(),
-      talent_multiplier = numeric()
-    ))
+  if (is.null(veteran_z)) {
+    veteran_z <- tibble::tibble(
+      nfl_gsis_id      = character(),
+      position         = character(),
+      veteran_talent_z = numeric()
+    )
   }
 
-  pos_stats <- scores %>%
-    dplyr::group_by(.data$position) %>%
-    dplyr::summarise(
-      position_mean = mean(.data$score_final, na.rm = TRUE),
-      position_sd   = stats::sd(.data$score_final, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::mutate(
-      position_sd = dplyr::if_else(
-        is.na(.data$position_sd) | .data$position_sd <= 0,
-        1.0, .data$position_sd
-      )
-    )
+  empty_out <- tibble::tibble(
+    nfl_gsis_id       = character(),
+    score_final       = numeric(),
+    talent_z          = numeric(),
+    talent_multiplier = numeric(),
+    talent_source     = character(),
+    window_volume     = numeric(),
+    n_window_seasons  = integer()
+  )
 
-  scores %>%
-    dplyr::left_join(pos_stats, by = "position") %>%
+  if (nrow(scores) == 0L && nrow(veteran_z) == 0L) {
+    return(empty_out)
+  }
+
+  # ---- Prospect talent_z from R/28 score_final (unchanged formula) ----
+  if (nrow(scores) > 0L) {
+    pos_stats <- scores %>%
+      dplyr::group_by(.data$position) %>%
+      dplyr::summarise(
+        position_mean = mean(.data$score_final, na.rm = TRUE),
+        position_sd   = stats::sd(.data$score_final, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        position_sd = dplyr::if_else(
+          is.na(.data$position_sd) | .data$position_sd <= 0,
+          1.0, .data$position_sd
+        )
+      )
+
+    prospect <- scores %>%
+      dplyr::left_join(pos_stats, by = "position") %>%
+      dplyr::transmute(
+        nfl_gsis_id       = .data$nfl_gsis_id,
+        score_final       = .data$score_final,
+        talent_z_prospect = (.data$score_final - .data$position_mean) /
+                            .data$position_sd
+      )
+  } else {
+    prospect <- tibble::tibble(
+      nfl_gsis_id       = character(),
+      score_final       = numeric(),
+      talent_z_prospect = numeric()
+    )
+  }
+
+  # ---- Combine: veteran NFL z overrides prospect z (hard switch) ----
+  vet <- veteran_z %>%
+    dplyr::select(dplyr::any_of(c("nfl_gsis_id", "veteran_talent_z",
+                                  "window_volume", "n_window_seasons")))
+
+  # Ensure diagnostic columns exist even when veteran_z came in without them
+  if (!"window_volume" %in% names(vet))    vet$window_volume <- numeric(0)
+  if (!"n_window_seasons" %in% names(vet)) vet$n_window_seasons <- integer(0)
+
+  dplyr::full_join(prospect, vet, by = "nfl_gsis_id") %>%
     dplyr::mutate(
-      talent_z = (.data$score_final - .data$position_mean) /
-                 .data$position_sd,
+      talent_source = dplyr::case_when(
+        !is.na(.data$veteran_talent_z)  ~ "veteran_nfl",
+        !is.na(.data$talent_z_prospect) ~ "prospect_college",
+        TRUE                            ~ "neutral"
+      ),
+      talent_z = dplyr::case_when(
+        !is.na(.data$veteran_talent_z)  ~ .data$veteran_talent_z,
+        !is.na(.data$talent_z_prospect) ~ .data$talent_z_prospect,
+        TRUE                            ~ 0.0
+      ),
       talent_multiplier = 1 + TALENT_MULT_SENSITIVITY * .data$talent_z,
       talent_multiplier = pmin(
         pmax(.data$talent_multiplier, TALENT_MULT_FLOOR),
         TALENT_MULT_CEILING
       )
     ) %>%
-    dplyr::select(nfl_gsis_id, score_final, talent_z, talent_multiplier)
+    dplyr::select(nfl_gsis_id, score_final, talent_z, talent_multiplier,
+                  talent_source, window_volume, n_window_seasons)
 }
 
 # ------------------------------------------------------------------------------
@@ -846,12 +1471,14 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
   with_talent <- with_rookie %>%
     dplyr::left_join(
       talent %>% dplyr::select(nfl_gsis_id, score_final, talent_z,
-                                 talent_multiplier),
+                                 talent_multiplier, talent_source,
+                                 window_volume, n_window_seasons),
       by = "nfl_gsis_id"
     ) %>%
     dplyr::mutate(
       talent_multiplier = dplyr::coalesce(.data$talent_multiplier, 1.0),
-      talent_z          = dplyr::coalesce(.data$talent_z, 0.0)
+      talent_z          = dplyr::coalesce(.data$talent_z, 0.0),
+      talent_source     = dplyr::coalesce(.data$talent_source, "neutral")
     )
 
   with_talent
@@ -890,6 +1517,114 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
                                 .data$rookie_capital_mult *
                                 .data$talent_multiplier
     )
+}
+
+# ------------------------------------------------------------------------------
+# .blend_observed_shares
+# ------------------------------------------------------------------------------
+
+#' Blend preseason adjusted shares toward observed current-season shares
+#'
+#' In-season hook (v2). Blends each player's preseason adjusted target and
+#' rush share toward their observed current-season share:
+#'
+#'   blended = pw * preseason_adjusted + (1 - pw) * observed
+#'   where pw = compute_prior_weight(as_of_week)
+#'
+#' Runs BEFORE the soft constraint so the constraint operates once on the
+#' blended shares. Players with no observed record (injured all year, not in
+#' the supplied table) retain their preseason share at full weight -- their
+#' absence is not evidence of a zero share.
+#'
+#' Guards (all retain preseason shares unchanged, with a message):
+#'   - as_of_week < MIN_WEEKS_OBSERVED_ALLOC (single-game noise dominates)
+#'   - current_season_volume NULL or empty
+#'   - current_season_volume missing required columns
+#'
+#' @param alloc_table Tibble. Output of .compute_initial_shares(): must have
+#'   nfl_gsis_id, target_share_adjusted, rush_share_adjusted.
+#' @param current_season_volume Tibble or NULL. Caller-supplied observed
+#'   shares: nfl_gsis_id (chr), observed_target_share (dbl, player targets /
+#'   team targets to date), observed_rush_share (dbl, player carries / team
+#'   carries to date). NA in either share column means no observation for
+#'   that play type; the preseason share is retained for that component.
+#' @param as_of_week Integer 1-18 or NULL. NULL = preseason mode, no blend.
+#' @return alloc_table with target_share_adjusted / rush_share_adjusted
+#'   blended where observed data exists, plus audit columns
+#'   observed_target_share, observed_rush_share, share_blend_weight.
+#' @seealso compute_prior_weight (R/29), .enforce_soft_constraints
+#' @keywords internal
+.blend_observed_shares <- function(alloc_table,
+                                   current_season_volume = NULL,
+                                   as_of_week = NULL) {
+
+  # Audit columns exist in both modes so the output schema is stable.
+  neutral <- alloc_table %>%
+    dplyr::mutate(
+      observed_target_share = NA_real_,
+      observed_rush_share   = NA_real_,
+      share_blend_weight    = NA_real_
+    )
+
+  if (is.null(as_of_week)) return(neutral)
+
+  if (is.null(current_season_volume) || nrow(current_season_volume) == 0L) {
+    message("    In-season blend: no current_season_volume supplied -- ",
+            "preseason shares retained")
+    return(neutral)
+  }
+
+  req_cols <- c("nfl_gsis_id", "observed_target_share", "observed_rush_share")
+  missing_cols <- setdiff(req_cols, names(current_season_volume))
+  if (length(missing_cols) > 0L) {
+    message(glue("    In-season blend: current_season_volume missing ",
+                 "column(s) {paste(missing_cols, collapse = ', ')} -- ",
+                 "preseason shares retained"))
+    return(neutral)
+  }
+
+  if (as_of_week < MIN_WEEKS_OBSERVED_ALLOC) {
+    message(glue("    In-season blend: week {as_of_week} is below the ",
+                 "{MIN_WEEKS_OBSERVED_ALLOC}-week observation floor ",
+                 "(mirrors R/29) -- preseason shares retained"))
+    return(neutral)
+  }
+
+  pw <- compute_prior_weight(as_of_week)
+  message(glue("    In-season blend at week {as_of_week}: preseason weight ",
+               "{format(round(pw, 3), nsmall = 3)}, observed weight ",
+               "{format(round(1 - pw, 3), nsmall = 3)}"))
+
+  blended <- alloc_table %>%
+    dplyr::left_join(
+      current_season_volume %>%
+        dplyr::select(nfl_gsis_id, observed_target_share,
+                      observed_rush_share) %>%
+        dplyr::distinct(nfl_gsis_id, .keep_all = TRUE),
+      by = "nfl_gsis_id"
+    ) %>%
+    dplyr::mutate(
+      share_blend_weight = pw,
+      target_share_adjusted = dplyr::if_else(
+        is.na(.data$observed_target_share),
+        .data$target_share_adjusted,
+        pw * .data$target_share_adjusted +
+          (1 - pw) * .data$observed_target_share
+      ),
+      rush_share_adjusted = dplyr::if_else(
+        is.na(.data$observed_rush_share),
+        .data$rush_share_adjusted,
+        pw * .data$rush_share_adjusted +
+          (1 - pw) * .data$observed_rush_share
+      )
+    )
+
+  n_matched <- sum(!is.na(blended$observed_target_share) |
+                     !is.na(blended$observed_rush_share))
+  message(glue("    In-season blend: {n_matched} of {nrow(blended)} ",
+               "players matched to observed shares"))
+
+  blended
 }
 
 # ------------------------------------------------------------------------------
@@ -1082,20 +1817,38 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 #' @param team_volumes_path Character. Path to R/30 output RDS.
 #' @param dynasty_scores_path Character. Path to R/28 output CSV.
 #' @param season Integer. Target season (default SEASON_ALLOC).
+#' @param as_of_week Integer 1-18 or NULL. When NULL (default), allocation is
+#'   fully preseason. When supplied (and >= MIN_WEEKS_OBSERVED_ALLOC), each
+#'   player's preseason share is blended toward their observed current-season
+#'   share via compute_prior_weight(as_of_week). Requires
+#'   current_season_volume to have an effect.
+#' @param current_season_volume Tibble or NULL. Caller-supplied observed
+#'   shares with columns nfl_gsis_id, observed_target_share,
+#'   observed_rush_share (player share of team targets / carries to date).
+#'   Only consulted when as_of_week is non-NULL. Same caller-supplies-data
+#'   contract as R/30's current_season_sos.
 #' @param save_output Logical. Write RDS + CSV outputs.
 #' @return Tibble with one row per active 2026 offensive player.
 #'
-#' @seealso project_team_volumes (R/30)
+#' @seealso project_team_volumes (R/30), compute_prior_weight (R/29)
 #' @export
 allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
                                       dynasty_scores_path = DYNASTY_SCORES_CSV,
                                       season             = SEASON_ALLOC,
+                                      as_of_week         = NULL,
+                                      current_season_volume = NULL,
                                       save_output        = TRUE) {
 
   message(glue("\n{strrep('=', 70)}"))
   message(glue("R/31: Allocating player volumes for season {season}"))
   message(glue("Soft constraint bounds: [{CONSTRAINT_LOWER}, ",
                "{CONSTRAINT_UPPER}]"))
+  if (is.null(as_of_week)) {
+    message("Allocation mode: preseason (depth chart + capital + talent)")
+  } else {
+    message(glue("Allocation mode: in-season at week {as_of_week} ",
+                 "(preseason shares taper toward observed)"))
+  }
   message(glue("{strrep('=', 70)}"))
 
   # STEP 1: Load R/30 team volumes
@@ -1123,10 +1876,15 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   message("\nSTEP 3.5/7: Correcting rookie depth ranks via draft capital")
   depth_chart <- .correct_rookie_depth_ranks(depth_chart, rookies)
 
-  # STEP 4: Load R/28 dynasty scores and compute talent multipliers
-  message("\nSTEP 4/7: Loading dynasty scores and computing talent multipliers")
-  scores <- .load_dynasty_scores(path = dynasty_scores_path)
-  talent <- .compute_talent_multipliers(scores)
+  # STEP 4: Load talent inputs and compute talent multipliers.
+  # Prospects keep the R/28 college score; veterans (years_exp >=
+  # VETERAN_MIN_EXP) receive an NFL-efficiency talent_z from the R/16 panel.
+  message("\nSTEP 4/7: Loading talent inputs and computing talent multipliers")
+  scores     <- .load_dynasty_scores(path = dynasty_scores_path)
+  panel      <- .load_player_season_panel()
+  roster_exp <- .load_roster_experience(season = season)
+  veteran_z  <- .compute_veteran_talent_z(panel, roster_exp, season = season)
+  talent     <- .compute_talent_multipliers(scores, veteran_z = veteran_z)
 
   # STEP 5: Build the per-player allocation table
   message("\nSTEP 5/7: Assembling per-player allocation inputs")
@@ -1136,10 +1894,19 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
     talent      = talent
   )
 
-  # STEP 6: Compute initial shares and enforce soft constraints
+  # STEP 6: Compute initial shares, blend with observed (in-season), constrain
   message("\nSTEP 6/7: Computing shares and enforcing soft constraints")
   alloc_with_shares <- .compute_initial_shares(alloc_table)
-  alloc_constrained <- .enforce_soft_constraints(alloc_with_shares)
+
+  # STEP 6.5: In-season blend (no-op in preseason mode). Runs BEFORE the
+  # constraint so the constraint operates once on the blended shares.
+  alloc_blended <- .blend_observed_shares(
+    alloc_table           = alloc_with_shares,
+    current_season_volume = current_season_volume,
+    as_of_week            = as_of_week
+  )
+
+  alloc_constrained <- .enforce_soft_constraints(alloc_blended)
 
   # STEP 7: Apply team volume to get expected volumes per player
   message("\nSTEP 7/7: Applying team volumes to get expected per-player volumes")
@@ -1154,9 +1921,11 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
     dplyr::select(
       nfl_gsis_id, player_name, team, position, depth_position, depth_rank,
       is_rookie, draft_round, rookie_capital_mult,
-      score_final, talent_z, talent_multiplier,
+      score_final, talent_z, talent_multiplier, talent_source,
+      window_volume, n_window_seasons,
       target_share_base, target_share_adjusted, target_share,
       rush_share_base, rush_share_adjusted, rush_share,
+      observed_target_share, observed_rush_share, share_blend_weight,
       projected_team_pass_pg, projected_team_rush_pg,
       expected_targets_pg, expected_carries_pg,
       schema_tag
@@ -1178,6 +1947,12 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   n_rookies <- sum(output$is_rookie, na.rm = TRUE)
   n_with_scores <- sum(!is.na(output$score_final), na.rm = TRUE)
   n_teams <- dplyr::n_distinct(output$team)
+
+  # Talent-source split (computed from data, never hardcoded)
+  n_veteran_nfl <- sum(output$talent_source == "veteran_nfl", na.rm = TRUE)
+  n_prospect    <- sum(output$talent_source == "prospect_college",
+                       na.rm = TRUE)
+  n_neutral     <- sum(output$talent_source == "neutral", na.rm = TRUE)
 
   # Soft constraint diagnostics: how many teams were rescaled?
   team_check <- output %>%
@@ -1213,8 +1988,24 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   message(glue("  Active teams covered:     {n_teams}"))
   message(glue("  Rookies in pool:          {n_rookies}"))
   message(glue("  Players with R/28 score:  {n_with_scores}"))
+  message(glue("  Talent source - veteran:  {n_veteran_nfl} (NFL efficiency)"))
+  message(glue("  Talent source - prospect: {n_prospect} (R/28 college)"))
+  message(glue("  Talent source - neutral:  {n_neutral} (no signal)"))
   message(glue("  Teams rescaled (targets): {n_target_rescaled} of {n_teams}"))
   message(glue("  Teams rescaled (rushes):  {n_rush_rescaled} of {n_teams}"))
+  if (!is.null(as_of_week)) {
+    n_blended <- sum(!is.na(output$observed_target_share) |
+                       !is.na(output$observed_rush_share), na.rm = TRUE)
+    blend_w <- unique(stats::na.omit(output$share_blend_weight))
+    blend_w_label <- if (length(blend_w) == 1L) {
+      format(round(blend_w, 3), nsmall = 3)
+    } else {
+      "n/a (blend not applied)"
+    }
+    message(glue("  In-season blend:          week {as_of_week}, ",
+                 "preseason weight {blend_w_label}, ",
+                 "{n_blended} players blended"))
+  }
   message(glue("  Highest expected targets: {top_target_player} ",
                "({top_target_team}) at ",
                "{format(round(top_target_pg, 1), nsmall = 1)} per game"))

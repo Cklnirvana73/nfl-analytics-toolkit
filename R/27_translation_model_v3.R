@@ -23,6 +23,15 @@
 #   6. Breakout age          -- age at first season above position efficiency
 #                               median (training-set median, computed per pos).
 #                               seasons_since_breakout also included.
+#   7. Teammate talent density -- judges production relative to the position
+#                               opportunity environment: pos_recruiting_density
+#                               (recruited talent stacked at the position),
+#                               pos_volume_concentration and
+#                               pos_scoring_concentration (teammate share of
+#                               touches / points -- high = opportunity
+#                               suppressed), plus density_x_role interaction.
+#                               Same team, same position group, any career
+#                               overlap. WR/TE share the receiver pool.
 #
 # Architecture:
 #   Sources R/24_translation_model.R, inheriting all internal helpers:
@@ -33,6 +42,8 @@
 #     .normalize_team_name(), .load_combine_features(),
 #     .load_recruiting_features(), .compute_production_slopes(),
 #     .compute_breakout_age()
+#   Plus two for teammate talent density (v3.1):
+#     .load_recruiting_board(), .compute_teammate_density()
 #   Exports two new functions:
 #     build_translation_features_v3()
 #     run_week13_pipeline()
@@ -129,7 +140,7 @@ if (!exists("link_cfb_to_nfl", mode = "function")) {
 # ==============================================================================
 
 # Schema tag for v3 outputs
-V3_SCHEMA_TAG <- "s2_w13_v3"
+V3_SCHEMA_TAG <- "s2_w13_v3_1"
 
 # Output prefix for all v3 files
 V3_OUTPUT_PREFIX <- "s2_week13_"
@@ -160,6 +171,46 @@ RECRUITING_YEAR_OFFSETS <- c(-3L, -4L, -5L)
 # Minimum college seasons required to compute production slope.
 # Players with only one CFB season get NA (imputed at median).
 MIN_SEASONS_FOR_SLOPE <- 2L
+
+# ------------------------------------------------------------------------------
+# TEAMMATE TALENT DENSITY (v3.1 feature group)
+# ------------------------------------------------------------------------------
+# Judges college production relative to the opportunity environment, not in a
+# vacuum. Three measures over each player's overlap window at his college team,
+# at his position group, plus an interaction:
+#   pos_recruiting_density   -- sum of overlapping same-position teammates' full
+#                               247Sports recruiting composite (talent stacked
+#                               at the position; full rating, not overlap-
+#                               weighted)
+#   pos_volume_concentration -- avg over the player's seasons of the share of
+#                               same-position-group TOUCHES captured by teammates
+#                               (high = player's opportunity was suppressed)
+#   pos_scoring_concentration-- same, for a simple yards+TD points composite
+#   density_x_role           -- player's own role share x volume concentration
+#                               (held a role despite a dense, productive room)
+#
+# Teammate set: same primary_team, same position_group, ANY career-window
+# overlap (a one-season brush counts; full recruiting rating regardless of
+# overlap length). Position group is the CFB panel's QB/RB/WR_TE, so WR and TE
+# share the receiver opportunity pool by design (they compete for targets and
+# the panel groups them as WR_TE).
+#
+# All four enter the feature matrix; the Elastic Net learns the weights. No
+# hand-tuned multiplier on score_final downstream (R/28 inherits via the model).
+#
+# Recruiting density requires the NATIONAL recruiting board (all recruits at the
+# position, not just future-NFL ones), a broader pull than the matched-only
+# .load_recruiting_features(). Cached separately.
+RECRUITING_BOARD_CACHE_PATH <- here::here(
+  "data", "season2_cfb_cache", "s2_week13_recruiting_board.rds"
+)
+
+# Points composite weights for scoring concentration (position-agnostic, simple
+# and stable: yards contribute at 0.1/yd, TDs at 6). Used only for the relative
+# concentration ratio, so absolute scale is irrelevant -- only the split between
+# a player and his teammates matters.
+DENSITY_POINTS_PER_YARD <- 0.1
+DENSITY_POINTS_PER_TD   <- 6.0
 
 # Percentile threshold for breakout detection. 0.50 = first season above
 # position median on primary efficiency metric.
@@ -210,6 +261,15 @@ utils::globalVariables(c(
   "rec_role_share", "rush_to_rec_ratio", "total_plays",
   # interaction
   "sos_x_age",
+  # teammate density (v3.1)
+  "pos_recruiting_density", "pos_volume_concentration",
+  "pos_scoring_concentration", "density_x_role",
+  "position_group", "primary_team", "norm_primary_team",
+  "team_pos_recruiting", "teammate_recruiting", "own_recruiting",
+  "pos_touches", "pos_points", "team_pos_touches", "team_pos_points",
+  "teammate_touches_share", "teammate_points_share",
+  "first_season", "last_season", "overlap_start", "overlap_end",
+  "board_rating", "norm_board_name", "norm_board_team",
   # misc v3
   "offset", "rec_year", "norm_recruit_name", "norm_player_name_v3",
   "combine_join_season", "pfr_player_name"
@@ -826,6 +886,332 @@ utils::globalVariables(c(
 }
 
 
+# ------------------------------------------------------------------------------
+# .load_recruiting_board
+#
+# National recruiting board: all recruits at QB/RB/WR/TE across the relevant
+# year range, aggregated to a normalized name + normalized school + recruit
+# year key with their 247Sports composite rating. Unlike
+# .load_recruiting_features() (which keeps only matched/future-NFL players),
+# this retains EVERYONE so a player's non-NFL teammates carry ratings for the
+# pos_recruiting_density computation. Cache-first.
+#
+# Returns: tibble(norm_board_name, norm_board_team, recruit_year, board_rating).
+# Not exported.
+# ------------------------------------------------------------------------------
+.load_recruiting_board <- function(years,
+                                   positions_to_pull = c("PRO", "DUAL", "RB",
+                                                         "WR", "TE"),
+                                   cache_path = RECRUITING_BOARD_CACHE_PATH,
+                                   verbose = TRUE) {
+
+  # NOTE: cfbd_recruiting_player() does not accept "QB". Quarterbacks are split
+  # into "PRO" (pro-style) and "DUAL" (dual-threat) in the 247 recruiting
+  # taxonomy. Both map to the panel's QB position_group. RB/WR/TE match
+  # directly. This is why positions_to_pull defaults to the recruiting codes,
+  # not the panel labels.
+  if (file.exists(cache_path)) {
+    if (verbose) message(glue("  Recruiting board cache hit: {cache_path}"))
+    return(readRDS(cache_path))
+  }
+
+  if (verbose) message(glue(
+    "  Building national recruiting board for years ",
+    "{min(years)}-{max(years)} (no cache)..."
+  ))
+
+  board_list <- list()
+  for (yr in years) {
+    for (pos in positions_to_pull) {
+      key <- glue("{yr}_{pos}")
+      result <- tryCatch({
+        dat <- cfbfastR::cfbd_recruiting_player(year = yr, position = pos)
+        if (!is.null(dat) && nrow(dat) > 0L) dat else NULL
+      }, error = function(e) {
+        if (verbose) message(glue(
+          "    WARNING: board pull failed year={yr} pos={pos}: ",
+          "{conditionMessage(e)}"
+        ))
+        NULL
+      })
+      if (!is.null(result)) board_list[[key]] <- result
+    }
+  }
+
+  if (length(board_list) == 0L) {
+    if (verbose) message(
+      "  WARNING: recruiting board empty. pos_recruiting_density will be NA."
+    )
+    empty <- tibble::tibble(
+      norm_board_name = character(0L),
+      norm_board_team = character(0L),
+      recruit_year    = integer(0L),
+      board_rating    = numeric(0L)
+    )
+    dir.create(dirname(cache_path), recursive = TRUE, showWarnings = FALSE)
+    saveRDS(empty, cache_path)
+    return(empty)
+  }
+
+  board_all <- dplyr::bind_rows(board_list)
+
+  required_cols <- c("name", "committed_to", "year", "rating")
+  missing_cols  <- setdiff(required_cols, names(board_all))
+  if (length(missing_cols) > 0L) {
+    stop(glue(
+      ".load_recruiting_board(): cfbd_recruiting_player() missing columns: ",
+      "{paste(missing_cols, collapse = ', ')}"
+    ), call. = FALSE)
+  }
+
+  board <- board_all %>%
+    dplyr::transmute(
+      norm_board_name = .normalize_player_name(.data$name),
+      norm_board_team = .normalize_team_name(.data$committed_to),
+      recruit_year    = as.integer(.data$year),
+      board_rating    = as.numeric(.data$rating)
+    ) %>%
+    dplyr::filter(!is.na(.data$board_rating), nchar(.data$norm_board_name) > 0) %>%
+    # One rating per name-team-year (recruiting sources occasionally duplicate).
+    dplyr::distinct(.data$norm_board_name, .data$norm_board_team,
+                    .data$recruit_year, .keep_all = TRUE)
+
+  if (verbose) message(glue(
+    "  Recruiting board: {format(nrow(board), big.mark = ',')} rated recruits"
+  ))
+
+  dir.create(dirname(cache_path), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(board, cache_path)
+  board
+}
+
+
+# ------------------------------------------------------------------------------
+# .compute_teammate_density
+#
+# Per-matched-player teammate talent density features. For each player in the
+# crosswalk, finds same-team, same-position-group teammates with ANY career
+# overlap and computes:
+#   pos_recruiting_density   -- sum of those teammates' board_rating
+#   pos_volume_concentration -- avg over the player's seasons of teammate share
+#                               of position-group touches
+#   pos_scoring_concentration-- same for a yards+TD points composite
+# The density_x_role interaction is built later in build_translation_features_v3
+# (it needs the player's role share, joined there).
+#
+# Position-group touch/scoring definitions (CFB panel position_group values
+# are QB / RB / WR_TE; WR_TE is the combined receiver pool by design):
+#   QB    : touches = pass_attempts; points = passing_yards*0.1 + pass_tds*6
+#   RB    : touches = rush_attempts; points = rushing_yards*0.1 + rush_tds*6
+#   WR_TE : touches = targets;       points = receiving_yards*0.1 + rec_tds*6
+#
+# Returns: tibble(cfb_player_name, pos_recruiting_density,
+#   pos_volume_concentration, pos_scoring_concentration). Not exported.
+# ------------------------------------------------------------------------------
+.compute_teammate_density <- function(cfb_panel, crosswalk, recruiting_board,
+                                      verbose = TRUE) {
+
+  stopifnot(is.data.frame(cfb_panel), is.data.frame(crosswalk),
+            is.data.frame(recruiting_board))
+
+  required_panel <- c("player_name", "season", "primary_team",
+                      "position_group",
+                      "pass_attempts", "rush_attempts", "targets",
+                      "passing_yards", "rushing_yards", "receiving_yards",
+                      "pass_tds", "rush_tds", "rec_tds")
+  missing_panel <- setdiff(required_panel, names(cfb_panel))
+  if (length(missing_panel) > 0L) {
+    stop(glue(
+      ".compute_teammate_density(): cfb_panel missing columns: ",
+      "{paste(missing_panel, collapse = ', ')}"
+    ), call. = FALSE)
+  }
+
+  if (verbose) message("Computing teammate talent density...")
+
+  # Per player-season touches and points by position group, with a normalized
+  # team key. One row per player-season (panel is already collapsed to
+  # primary_team per player-season).
+  panel_pos <- cfb_panel %>%
+    dplyr::filter(
+      !is.na(.data$position_group),
+      !is.na(.data$primary_team),
+      nchar(.data$primary_team) > 0
+    ) %>%
+    dplyr::mutate(
+      norm_primary_team = .normalize_team_name(.data$primary_team),
+      pos_touches = dplyr::case_when(
+        .data$position_group == "QB"    ~ dplyr::coalesce(.data$pass_attempts, 0),
+        .data$position_group == "RB"    ~ dplyr::coalesce(.data$rush_attempts, 0),
+        .data$position_group == "WR_TE" ~ dplyr::coalesce(.data$targets, 0),
+        TRUE ~ 0
+      ),
+      pos_points = dplyr::case_when(
+        .data$position_group == "QB" ~
+          dplyr::coalesce(.data$passing_yards, 0) * DENSITY_POINTS_PER_YARD +
+          dplyr::coalesce(.data$pass_tds, 0) * DENSITY_POINTS_PER_TD,
+        .data$position_group == "RB" ~
+          dplyr::coalesce(.data$rushing_yards, 0) * DENSITY_POINTS_PER_YARD +
+          dplyr::coalesce(.data$rush_tds, 0) * DENSITY_POINTS_PER_TD,
+        .data$position_group == "WR_TE" ~
+          dplyr::coalesce(.data$receiving_yards, 0) * DENSITY_POINTS_PER_YARD +
+          dplyr::coalesce(.data$rec_tds, 0) * DENSITY_POINTS_PER_TD,
+        TRUE ~ 0
+      )
+    ) %>%
+    dplyr::select(.data$player_name, .data$season, .data$norm_primary_team,
+                  .data$position_group, .data$pos_touches, .data$pos_points)
+
+  # Team-position-season totals for the concentration denominators.
+  team_pos_season <- panel_pos %>%
+    dplyr::group_by(.data$norm_primary_team, .data$position_group,
+                    .data$season) %>%
+    dplyr::summarise(
+      team_pos_touches = sum(.data$pos_touches, na.rm = TRUE),
+      team_pos_points  = sum(.data$pos_points,  na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Matched players to score, with their college career window and team.
+  matched <- crosswalk %>%
+    dplyr::filter(!is.na(.data$cfb_player_name),
+                  !is.na(.data$cfb_primary_team)) %>%
+    dplyr::select(.data$cfb_player_name, .data$cfb_primary_team) %>%
+    dplyr::distinct()
+
+  # Each matched player's panel seasons (their actual career rows).
+  player_career <- panel_pos %>%
+    dplyr::rename(cfb_player_name = .data$player_name)
+
+  density <- purrr::map_dfr(seq_len(nrow(matched)), function(i) {
+    p_name <- matched$cfb_player_name[i]
+    p_team_norm <- .normalize_team_name(matched$cfb_primary_team[i])
+
+    # The player's own seasons at his primary team.
+    own <- player_career %>%
+      dplyr::filter(.data$cfb_player_name == p_name,
+                    .data$norm_primary_team == p_team_norm)
+
+    if (nrow(own) == 0L) {
+      return(tibble::tibble(
+        cfb_player_name = p_name,
+        pos_recruiting_density   = NA_real_,
+        pos_volume_concentration = NA_real_,
+        pos_scoring_concentration = NA_real_
+      ))
+    }
+
+    p_pos    <- own$position_group[1L]
+    p_seasons <- sort(unique(own$season))
+
+    # --- Volume / scoring concentration ---
+    # For each of the player's seasons, teammate share = (team total - own) /
+    # team total at that team-position-season. Average across the player's
+    # seasons. Teammate share, not player share, so high = suppressed.
+    own_by_season <- own %>%
+      dplyr::group_by(.data$season) %>%
+      dplyr::summarise(
+        own_touches = sum(.data$pos_touches, na.rm = TRUE),
+        own_points  = sum(.data$pos_points,  na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    conc <- own_by_season %>%
+      dplyr::left_join(
+        team_pos_season %>%
+          dplyr::filter(.data$norm_primary_team == p_team_norm,
+                        .data$position_group == p_pos) %>%
+          dplyr::select(.data$season, .data$team_pos_touches,
+                        .data$team_pos_points),
+        by = "season"
+      ) %>%
+      dplyr::mutate(
+        teammate_touches_share = dplyr::if_else(
+          !is.na(.data$team_pos_touches) & .data$team_pos_touches > 0,
+          (.data$team_pos_touches - .data$own_touches) / .data$team_pos_touches,
+          NA_real_
+        ),
+        teammate_points_share = dplyr::if_else(
+          !is.na(.data$team_pos_points) & .data$team_pos_points > 0,
+          (.data$team_pos_points - .data$own_points) / .data$team_pos_points,
+          NA_real_
+        )
+      )
+
+    vol_conc   <- mean(conc$teammate_touches_share, na.rm = TRUE)
+    score_conc <- mean(conc$teammate_points_share,  na.rm = TRUE)
+
+    # --- Recruiting density ---
+    # Same-team, same-position-group teammates with ANY season overlap. Their
+    # full board rating summed. Exclude the player himself. The board is keyed
+    # by recruit class year, not panel season, so a teammate is anyone who
+    # appears in the panel at the same team+position-group in any of the
+    # player's seasons (career-window overlap), then matched to the board by
+    # normalized name + team for their rating.
+    teammates <- panel_pos %>%
+      dplyr::filter(
+        .data$norm_primary_team == p_team_norm,
+        .data$position_group == p_pos,
+        .data$season %in% p_seasons,
+        .data$player_name != p_name
+      ) %>%
+      dplyr::distinct(.data$player_name)
+
+    if (nrow(teammates) == 0L) {
+      rec_density <- 0
+    } else {
+      # Board is pre-filtered to non-NA ratings at load. Collapse to one rating
+      # per teammate name via mean (avoids max()'s empty-group -Inf edge), then
+      # sum. Unmatched teammates join to NA and are dropped by na.rm; the final
+      # guard ensures no non-finite value can flow into the feature.
+      board_team <- recruiting_board %>%
+        dplyr::filter(.data$norm_board_team == p_team_norm,
+                      is.finite(.data$board_rating)) %>%
+        dplyr::group_by(.data$norm_board_name) %>%
+        dplyr::summarise(
+          board_rating = mean(.data$board_rating, na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      tm_ratings <- teammates %>%
+        dplyr::mutate(
+          norm_board_name = .normalize_player_name(.data$player_name)
+        ) %>%
+        dplyr::left_join(board_team, by = "norm_board_name")
+
+      matched_ratings <- tm_ratings$board_rating[
+        is.finite(tm_ratings$board_rating)
+      ]
+      rec_density <- if (length(matched_ratings) == 0L) {
+        0
+      } else {
+        sum(matched_ratings)
+      }
+    }
+
+    tibble::tibble(
+      cfb_player_name = p_name,
+      pos_recruiting_density    = rec_density,
+      pos_volume_concentration  = if (is.nan(vol_conc))   NA_real_ else vol_conc,
+      pos_scoring_concentration = if (is.nan(score_conc)) NA_real_ else score_conc
+    )
+  })
+
+  if (verbose) {
+    n_rec <- sum(!is.na(density$pos_recruiting_density) &
+                   density$pos_recruiting_density > 0)
+    n_vol <- sum(!is.na(density$pos_volume_concentration))
+    message(glue(
+      "  Density computed: {nrow(density)} players, ",
+      "{n_rec} with recruiting density > 0, ",
+      "{n_vol} with volume concentration"
+    ))
+  }
+
+  density
+}
+
+
 # ==============================================================================
 # FUNCTION: build_translation_features_v3
 # ==============================================================================
@@ -888,6 +1274,7 @@ build_translation_features_v3 <- function(cfb_panel,
                                             recruiting_features,
                                             production_slopes,
                                             breakout_features,
+                                            teammate_density,
                                             cutoff_year    = CUTOFF_YEAR,
                                             min_ppr_outcome = MIN_PPR_OUTCOME,
                                             verbose        = TRUE) {
@@ -902,6 +1289,7 @@ build_translation_features_v3 <- function(cfb_panel,
     is.data.frame(recruiting_features),
     is.data.frame(production_slopes),
     is.data.frame(breakout_features),
+    is.data.frame(teammate_density),
     is.numeric(cutoff_year), length(cutoff_year) == 1L
   )
   cutoff_year <- as.integer(cutoff_year)
@@ -1008,6 +1396,24 @@ build_translation_features_v3 <- function(cfb_panel,
     "  Breakout age available: {n_breakout} / {nrow(all_players)} players"
   ))
 
+  # --- Step 5.5: Join teammate talent density ---
+  message("\nStep 5.5: Joining teammate talent density features...")
+
+  n_before <- nrow(all_players)
+
+  density_keyed <- teammate_density %>%
+    dplyr::distinct(cfb_player_name, .keep_all = TRUE)
+
+  all_players <- all_players %>%
+    dplyr::left_join(density_keyed, by = "cfb_player_name")
+
+  stopifnot(nrow(all_players) == n_before)
+
+  n_density <- sum(!is.na(all_players$pos_volume_concentration))
+  message(glue(
+    "  Teammate density available: {n_density} / {nrow(all_players)} players"
+  ))
+
   # --- Step 6: Compute derived features ---
   message("\nStep 6: Computing derived features (role proxy, interaction)...")
 
@@ -1060,12 +1466,22 @@ build_translation_features_v3 <- function(cfb_panel,
         !is.na(sos_opp_def_epa_per_play) & !is.na(draft_age),
         sos_opp_def_epa_per_play * draft_age,
         NA_real_
+      ),
+      # Density x role: held a role despite a productive, crowded position room.
+      # rec_role_share is the player's own opportunity share; multiplied by the
+      # teammate volume concentration so the model can reward "produced while
+      # buried behind productive teammates".
+      density_x_role = dplyr::if_else(
+        !is.na(rec_role_share) & !is.na(pos_volume_concentration),
+        rec_role_share * pos_volume_concentration,
+        NA_real_
       )
     )
 
   message(glue(
     "  rec_role_share non-NA: {sum(!is.na(all_players$rec_role_share))} | ",
-    "sos_x_age non-NA: {sum(!is.na(all_players$sos_x_age))}"
+    "sos_x_age non-NA: {sum(!is.na(all_players$sos_x_age))} | ",
+    "density_x_role non-NA: {sum(!is.na(all_players$density_x_role))}"
   ))
 
   # --- Step 7: Define v3 feature columns per position ---
@@ -1080,21 +1496,27 @@ build_translation_features_v3 <- function(cfb_panel,
     "ht", "wt", "forty",
     "pass_epa_slope",
     "recruiting_rating",
-    "breakout_age", "seasons_since_breakout"
+    "breakout_age", "seasons_since_breakout",
+    "pos_recruiting_density", "pos_volume_concentration",
+    "pos_scoring_concentration"
   )
   v3_cols_RB <- c(
     "ht", "wt", "forty", "vertical", "broad_jump",
     "rec_epa_slope", "rush_epa_slope",
     "recruiting_rating",
     "rec_role_share", "rush_to_rec_ratio",
-    "breakout_age", "seasons_since_breakout"
+    "breakout_age", "seasons_since_breakout",
+    "pos_recruiting_density", "pos_volume_concentration",
+    "pos_scoring_concentration", "density_x_role"
   )
   v3_cols_WR <- c(
     "ht", "wt", "forty", "vertical", "broad_jump",
     "rec_epa_slope",
     "recruiting_rating",
     "rec_role_share",
-    "breakout_age", "seasons_since_breakout"
+    "breakout_age", "seasons_since_breakout",
+    "pos_recruiting_density", "pos_volume_concentration",
+    "pos_scoring_concentration", "density_x_role"
   )
   v3_cols_TE <- v3_cols_WR  # same as WR
 
@@ -1114,7 +1536,9 @@ build_translation_features_v3 <- function(cfb_panel,
     "sos_x_age",
     "recruiting_rating", "recruiting_stars",
     "rec_role_share", "rush_to_rec_ratio",
-    "breakout_age", "seasons_since_breakout"
+    "breakout_age", "seasons_since_breakout",
+    "pos_recruiting_density", "pos_volume_concentration",
+    "pos_scoring_concentration", "density_x_role"
   ))
   for (.col in v3_numeric_cols_all) {
     if (.col %in% names(all_players)) {
@@ -1437,6 +1861,18 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
   )
   gc(verbose = FALSE)
 
+  # National recruiting board for teammate density (all recruits, not just
+  # future-NFL). Recruit classes precede college play by ~3-5 years, so pull a
+  # window starting 5 years before the earliest panel season.
+  panel_seasons <- sort(unique(cfb_panel$season))
+  board_years <- (min(panel_seasons) - 5L):max(panel_seasons)
+  if (verbose) message("\n--- Step 2b: Loading National Recruiting Board ---")
+  recruiting_board <- .load_recruiting_board(
+    years   = board_years,
+    verbose = verbose
+  )
+  gc(verbose = FALSE)
+
   # --- Step 3: Compute derived features ---
   if (verbose) message("\n--- Step 3: Computing Production Slopes ---")
   production_slopes <- .compute_production_slopes(
@@ -1446,6 +1882,11 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
   if (verbose) message("\n--- Step 4: Computing Breakout Ages ---")
   breakout_features <- .compute_breakout_age(
     cfb_panel, crosswalk, cutoff_year = cutoff_year, verbose = verbose
+  )
+
+  if (verbose) message("\n--- Step 4b: Computing Teammate Talent Density ---")
+  teammate_density <- .compute_teammate_density(
+    cfb_panel, crosswalk, recruiting_board, verbose = verbose
   )
 
   # --- Step 5: Build v3 feature matrix ---
@@ -1459,6 +1900,7 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
     recruiting_features = recruiting_features,
     production_slopes   = production_slopes,
     breakout_features   = breakout_features,
+    teammate_density    = teammate_density,
     cutoff_year         = cutoff_year,
     min_ppr_outcome     = min_ppr_outcome,
     verbose             = verbose

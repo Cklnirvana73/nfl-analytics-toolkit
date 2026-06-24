@@ -93,7 +93,8 @@
 #   league_format            chr   "standard"/"ppr"/"best_ball"/"superflex"
 #   league_teams             int
 #   r32_posterior_mu         dbl   from R/32
-#   r32_projection_upper_80  dbl
+#   r32_projection_lower_80  dbl   from R/32 (80% interval lower bound)
+#   r32_projection_upper_80  dbl   from R/32 (80% interval upper bound)
 #   boom_probability         dbl
 #   bust_probability         dbl
 #   replacement_ppg          dbl   for this position in this league
@@ -104,7 +105,7 @@
 #   adjusted_vorp            dbl
 #   overall_rank             int   1 = best in this league
 #   position_rank            int   within position
-#   schema_tag               chr   "s2_w15_vorp_v1"
+#   schema_tag               chr   "s2_w15_vorp_v2"
 #
 # SOURCE DEPENDENCIES
 # -------------------
@@ -194,7 +195,7 @@ OUTPUT_CSV_PATH_VORP <- here::here(
   "data", "season2_cache", "s2_week15_vorp_rankings.csv"
 )
 
-SCHEMA_TAG_VORP <- "s2_w15_vorp_v1"
+SCHEMA_TAG_VORP <- "s2_w15_vorp_v2"
 
 # ------------------------------------------------------------------------------
 # NSE DECLARATIONS
@@ -648,7 +649,7 @@ compute_vorp_rankings <- function(projections, config) {
     dplyr::select(
       nfl_gsis_id, player_name, team, position,
       league_name, league_format, league_teams,
-      r32_posterior_mu, r32_projection_upper_80,
+      r32_posterior_mu, r32_projection_lower_80, r32_projection_upper_80,
       boom_probability, bust_probability,
       replacement_ppg, vorp_base,
       boom_modifier, bust_modifier, ceiling_modifier,

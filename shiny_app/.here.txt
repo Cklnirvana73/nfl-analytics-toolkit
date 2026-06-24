@@ -1,0 +1,12 @@
+# This file marks shiny_app/ as the here::here() project root.
+#
+# The here package treats a .here file as its highest-priority root marker and
+# ignores the contents, so these comment lines have no effect on resolution.
+#
+# Why it exists: the deployed bundle on shinyapps.io is the contents of
+# shiny_app/, and the app's working directory there is the bundle root. With
+# this sentinel present, here::here() anchors to shiny_app in both places:
+#   - locally, when launched via shiny::runApp(here::here("shiny_app"))
+#   - on the server, where the working dir is the bundle root
+# so every source() and cache path in app.R and R/data_layer.R resolves the
+# same way in both environments. Do not delete this file.

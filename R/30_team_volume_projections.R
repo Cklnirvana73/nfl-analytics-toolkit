@@ -135,29 +135,56 @@
 #   blended_plays_pg           dbl   70/30 blend with coach pattern
 #   blended_proe               dbl   70/30 blend with coach pattern
 #   qb_quality_score           dbl   Z-score composite of CPOE + EPA/dropback
-#   projected_pass_pg          dbl   FINAL projection: blended * (1 + qb adjustment)
+#   pass_sos_factor            dbl   Pass strength-of-schedule multiplier
+#                                      (>1 = easier pass schedule, applied to
+#                                       pass volume and efficiency)
+#   rush_sos_factor            dbl   Rush strength-of-schedule multiplier
+#                                      (>1 = easier rush schedule, applied to
+#                                       rush volume and efficiency)
+#   projected_pass_pg          dbl   FINAL projection: blended * qb adj * SOS
 #   projected_rush_pg          dbl   FINAL projection: blended * (1 - qb adjustment)
 #   projected_plays_pg         dbl   FINAL projection: pace
 #   projected_pass_yds_pg      dbl   FINAL projection: historical scaled by qb_quality
 #   projected_rush_yds_pg      dbl   FINAL projection: historical (no qb adj)
 #   projected_pass_tds_pg      dbl   FINAL projection: historical scaled by qb_quality
 #   projected_rush_tds_pg      dbl   FINAL projection: historical
-#   schema_tag                 chr   "s2_w15_team_vol_v1"
+#   schema_tag                 chr   "s2_w15_team_vol_v2"
 #
 # SOURCE DEPENDENCIES
 # -------------------
 #   R/15_multi_season_pbp.R -- load_normalized_season()
+#   R/29_projection_engine.R -- compute_prior_weight() (in-season SOS taper)
 #
 # RUN
 # ---
 #   source(here::here("R", "30_team_volume_projections.R"))
-#   team_vols <- project_team_volumes()
+#   team_vols <- project_team_volumes()                  # preseason
+#   team_vols <- project_team_volumes(as_of_week = 6)    # in-season (with
+#                                                          current_season_sos)
 #
 # Author: Christian K. LeBlanc
-# Version: 1.1
+# Version: 2.0
 #
 # CHANGELOG
 # ---------
+# 2.0  Strength-of-schedule (SOS) v2 added. Defensive quality measured as EPA
+#      allowed per play type (pass/rush) relative to league average, following
+#      R/10's EPA-not-yards principle. Two preseason components: retrospective
+#      (recency-weighted quality of opponents actually faced over the 3 prior
+#      seasons) and forward (recency-weighted quality of the published 2026
+#      opponents). New optional as_of_week argument tapers the preseason SOS
+#      signal toward observed current-season opponent quality using R/29's
+#      compute_prior_weight() decay curve, so the SOS leg updates in-season on
+#      the same schedule as the rest of the engine. SOS adjusts both volume
+#      (smaller sensitivity) and efficiency (larger sensitivity), with separate
+#      pass/rush factors bounded to 0.80-1.20. The sensitivities converting
+#      the SOS signal into factors are FITTED FROM DATA each run by
+#      .calibrate_sos_sensitivity(): team-game relative efficiency and volume
+#      regressed on leave-one-out opponent defensive EPA with team-season
+#      fixed effects (within transformation), four separate slopes
+#      (pass/rush x efficiency/volume). Fallback constants exist only for
+#      calibration failure and warn loudly. Two new output columns:
+#      pass_sos_factor, rush_sos_factor. Schema tag -> s2_w15_team_vol_v2.
 # 1.1  QB quality made player-centric and starter-aware. Prior-season CPOE/EPA
 #      now keyed by qb_id; each 2026 team mapped to its resolved starter via
 #      depth charts (primary), rosters + dropbacks (fallback), and an optional
@@ -182,6 +209,20 @@ library(nflreadr)
 
 source(here::here("R", "15_multi_season_pbp.R"))
 
+# compute_prior_weight() is the project-wide validated in-season decay curve
+# (defined in R/29, reused by R/34). It is the single source of truth for how
+# prior-season information tapers toward live current-season data: week 1 gives
+# the prior full weight, the crossover is ~week 9, and the prior never falls
+# below a 0.05 floor. R/30 reuses the identical function so the SOS in-season
+# blend tapers on exactly the same schedule as the rest of the engine -- no
+# divergence. Guarded source mirrors R/29's own idempotent pattern: in a full
+# chain run R/29 is already loaded and this is a no-op; a standalone R/30 run
+# triggers the source and fails loudly if R/29 cannot load (preferable to a
+# silently drifting local copy of the curve).
+if (!exists("compute_prior_weight")) {
+  source(here::here("R", "29_projection_engine.R"))
+}
+
 # ------------------------------------------------------------------------------
 # CONSTANTS
 # ------------------------------------------------------------------------------
@@ -204,6 +245,75 @@ MIN_DROPBACKS_QB <- 200L       # Roughly 14 games at modern dropback rates
 QB_VOLUME_SENSITIVITY <- 0.015
 QB_EFFICIENCY_SENSITIVITY <- 0.015
 
+# ------------------------------------------------------------------------------
+# STRENGTH OF SCHEDULE (SOS) -- v2
+# ------------------------------------------------------------------------------
+# SOS adjusts projected volume and efficiency for the quality of defenses a
+# team faces. Defensive quality is measured as EPA allowed per play, split by
+# play type (pass vs rush), expressed relative to league average. This metric
+# choice follows R/10's classify_defensive_style(): EPA allowed, not yards
+# allowed, because yards conflate defensive quality with game script.
+#
+# Two components, blended by the in-season decay curve:
+#   - HISTORICAL (retrospective): for each team, the recency-weighted average
+#     defensive quality of the opponents it actually faced over the 3 prior
+#     seasons. Corrects the historical volume base for past schedule luck.
+#   - FORWARD: for each team, the average defensive quality of its 2026
+#     opponents (from the published schedule), each opponent scored by that
+#     opponent's own recency-weighted historical defense. Answers "is the
+#     2026 slate hard or easy?"
+#
+# In-season blend (as_of_week): before the season (as_of_week = NULL) the SOS
+# factor is 100% historical+forward preseason signal. Once games are played,
+# compute_prior_weight(as_of_week) tapers the preseason SOS toward the team's
+# observed current-season opponent quality, on the same curve R/29 and R/34
+# use. The current-season opponent quality is supplied by the caller via
+# current_season_def (optional); absent it, the preseason signal is retained.
+#
+# SENSITIVITY CALIBRATION: the sensitivities that convert the SOS signal
+# (opponent EPA allowed vs league) into multiplicative factors are FITTED FROM
+# DATA at run time by .calibrate_sos_sensitivity(), not hardcoded. The
+# calibration regresses team-game relative efficiency (yards per play vs
+# league) and relative volume (plays per game vs league) on leave-one-out
+# opponent defensive EPA, with team-season fixed effects (within
+# transformation) so the slope is identified from how the SAME offense
+# performs against varying defenses -- not from comparing different offenses.
+# Separate slopes are fitted for pass/rush and efficiency/volume (4 total).
+
+# FALLBACK sensitivities, used ONLY if the empirical calibration fails (cache
+# unavailable, insufficient sample). These are unvalidated reasoned priors,
+# not fitted values -- the same status as the QB2/QB3 depth multipliers in
+# R/32. A run that falls back warns loudly.
+SOS_VOLUME_SENSITIVITY_FALLBACK     <- 0.15
+SOS_EFFICIENCY_SENSITIVITY_FALLBACK <- 0.40
+
+# Minimum plays of a given type in a team-game for that game to enter the
+# sensitivity calibration (ratio outcomes are unstable on tiny denominators),
+# and minimum qualifying team-games for a fitted slope to be trusted.
+SOS_CALIB_MIN_PLAYS_PER_GAME <- 10L
+SOS_CALIB_MIN_GAMES          <- 100L
+
+# Recency weights for the 3 prior seasons when averaging a defense's quality
+# or a team's faced-schedule quality. Derived from the project in-season decay
+# curve applied to season age (most recent season = age 1): normalized
+# compute_prior_weight(1), (2), (3). Computed at load (see below) so the
+# weights track the canonical curve rather than hardcoding 1.00/0.94/0.88.
+SOS_SEASON_RECENCY_WEIGHTS <- local({
+  raw <- vapply(seq_len(HISTORICAL_WINDOW), compute_prior_weight, numeric(1))
+  raw / sum(raw)
+})
+
+# Minimum defensive plays (of a given type) for a team-season to be a valid
+# SOS input. Below this the team-season is dropped from the opponent-quality
+# average. Mirrors R/10's min_def_plays guard.
+SOS_MIN_DEF_PLAYS <- 100L
+
+# Bounds on the final SOS multipliers so an extreme schedule cannot dominate
+# the projection. Mirrors the capped schedule multiplier used in the R/14
+# capstone (0.80-1.20).
+SOS_FACTOR_FLOOR <- 0.80
+SOS_FACTOR_CEILING <- 1.20
+
 # Paths
 CACHE_DIR_DEFAULT <- here::here("data", "season2_cache")
 COACHING_CHANGES_PATH <- here::here("data", "ref", "coaching_changes_2026.csv")
@@ -213,7 +323,7 @@ OUTPUT_RDS_PATH <- here::here("data", "season2_cache",
 OUTPUT_CSV_PATH <- here::here("data", "season2_cache",
                               "s2_week15_team_volumes.csv")
 
-SCHEMA_TAG <- "s2_w15_team_vol_v1"
+SCHEMA_TAG <- "s2_w15_team_vol_v2"
 
 # Active 2026 NFL teams. Used to filter the output to only active teams
 # (excludes historical codes like STL, OAK, SD that may appear in older pbp).
@@ -262,6 +372,22 @@ utils::globalVariables(c(
   "home_team", "away_team", "home_coach", "away_coach",
   "coach", "coach_target", "coach_target_n", "coach_prior",
   "coach_prior_n", "coach_n", "n_games",
+  "def_pass_epa_allowed", "def_rush_epa_allowed",
+  "def_pass_plays", "def_rush_plays",
+  "pass_epa_vs_league", "rush_epa_vs_league",
+  "opponent", "opp_pass_quality", "opp_rush_quality",
+  "hist_pass_sos", "hist_rush_sos",
+  "fwd_pass_sos", "fwd_rush_sos",
+  "cur_pass_sos", "cur_rush_sos",
+  "pass_sos_signal", "rush_sos_signal",
+  "pass_sos_factor", "rush_sos_factor",
+  "pass_vol_factor", "rush_vol_factor",
+  "recency_weight", "season_age",
+  "pass_w", "rush_w", "pass_weight_sum", "rush_weight_sum",
+  "yards_gained", "epa_sum", "n_plays", "yds", "opponent_team",
+  "opp_total_epa", "opp_total_plays",
+  "league_mean_epa", "league_ypp", "league_plays_per_tg",
+  "x", "y", "y_eff", "y_vol", "xd", "yd", "team_season",
   ".data", "passer_id"
 ))
 
@@ -1515,6 +1641,687 @@ utils::globalVariables(c(
     )
 }
 
+# ------------------------------------------------------------------------------
+# .compute_team_defense_allowed
+# ------------------------------------------------------------------------------
+
+#' Compute per-team-season defensive EPA allowed, split by play type
+#'
+#' For each season in \code{seasons}, loads the R/15 normalized pbp, filters to
+#' regular-season pass/rush plays (excluding kneels, spikes, two-point
+#' attempts), and aggregates EPA allowed at the \code{defteam}-season level,
+#' separately for pass and rush. This is the raw material for every SOS
+#' computation: a defense's quality is how much EPA it allows relative to the
+#' league.
+#'
+#' Memory: each season is loaded, aggregated, and dropped before the next.
+#'
+#' @param seasons Integer vector. Seasons to aggregate.
+#' @param cache_dir Character. R/15 cache directory.
+#' @return Tibble: team, season, def_pass_epa_allowed, def_rush_epa_allowed,
+#'   def_pass_plays, def_rush_plays. One row per defensive team-season.
+#'   Empty tibble if no seasons load.
+#' @keywords internal
+.compute_team_defense_allowed <- function(seasons, cache_dir = CACHE_DIR_DEFAULT) {
+
+  empty <- tibble::tibble(
+    team = character(), season = integer(),
+    def_pass_epa_allowed = numeric(), def_rush_epa_allowed = numeric(),
+    def_pass_plays = integer(), def_rush_plays = integer()
+  )
+
+  agg <- purrr::map_dfr(seasons, function(s) {
+
+    pbp <- tryCatch(
+      load_normalized_season(s, cache_dir = cache_dir),
+      error = function(e) {
+        message(glue("    SOS: season {s} load failed -- {e$message}"))
+        NULL
+      }
+    )
+    if (is.null(pbp)) return(NULL)
+
+    pbp_use <- pbp %>%
+      dplyr::filter(
+        .data$season_type == "REG",
+        !is.na(.data$defteam),
+        nchar(.data$defteam) > 0,
+        !is.na(.data$epa),
+        .data$play_type %in% c("pass", "run")
+      ) %>%
+      dplyr::mutate(
+        defteam  = .normalize_team_codes(.data$defteam),
+        qb_kneel = dplyr::coalesce(.data$qb_kneel, 0L),
+        qb_spike = dplyr::coalesce(.data$qb_spike, 0L),
+        two_point_attempt = dplyr::coalesce(.data$two_point_attempt, 0L)
+      ) %>%
+      dplyr::filter(
+        .data$qb_kneel == 0L,
+        .data$qb_spike == 0L,
+        .data$two_point_attempt == 0L
+      )
+
+    rm(pbp)
+    invisible(gc(verbose = FALSE))
+
+    if (nrow(pbp_use) == 0L) return(NULL)
+
+    pbp_use %>%
+      dplyr::group_by(team = .data$defteam) %>%
+      dplyr::summarise(
+        season               = s,
+        def_pass_epa_allowed = mean(.data$epa[.data$play_type == "pass"],
+                                    na.rm = TRUE),
+        def_rush_epa_allowed = mean(.data$epa[.data$play_type == "run"],
+                                    na.rm = TRUE),
+        def_pass_plays       = sum(.data$play_type == "pass", na.rm = TRUE),
+        def_rush_plays       = sum(.data$play_type == "run",  na.rm = TRUE),
+        .groups              = "drop"
+      )
+  })
+
+  if (is.null(agg) || nrow(agg) == 0L) return(empty)
+  agg
+}
+
+# ------------------------------------------------------------------------------
+# .compute_defense_quality_by_team
+# ------------------------------------------------------------------------------
+
+#' Collapse team-season defense to one recency-weighted quality per team
+#'
+#' Takes the team-season defensive EPA-allowed table and produces, for each
+#' team, a single recency-weighted average pass and rush EPA allowed (weighting
+#' recent seasons more via SOS_SEASON_RECENCY_WEIGHTS), then expresses each
+#' relative to the league average across teams. Positive values mean the
+#' defense allows MORE EPA than average (a weaker defense = an easier matchup).
+#'
+#' Team-seasons below SOS_MIN_DEF_PLAYS (for the relevant play type) are
+#' dropped from that play type's average.
+#'
+#' @param def_team_season Tibble. Output of .compute_team_defense_allowed().
+#' @return Tibble: team, pass_epa_vs_league, rush_epa_vs_league. Empty tibble
+#'   if input is empty.
+#' @keywords internal
+.compute_defense_quality_by_team <- function(def_team_season) {
+
+  empty <- tibble::tibble(
+    team = character(),
+    pass_epa_vs_league = numeric(),
+    rush_epa_vs_league = numeric()
+  )
+  if (is.null(def_team_season) || nrow(def_team_season) == 0L) return(empty)
+
+  # Attach a recency weight by season age (most recent season = age 1).
+  max_season <- max(def_team_season$season, na.rm = TRUE)
+  weighted <- def_team_season %>%
+    dplyr::mutate(
+      season_age = max_season - .data$season + 1L,
+      recency_weight = dplyr::if_else(
+        .data$season_age >= 1L & .data$season_age <= HISTORICAL_WINDOW,
+        SOS_SEASON_RECENCY_WEIGHTS[pmin(.data$season_age, HISTORICAL_WINDOW)],
+        0
+      ),
+      # Per-play-type effective weight: zeroed when the team-season is below
+      # the minimum-plays guard for that play type. A weighted.mean with these
+      # weights then naturally excludes the under-sampled team-seasons.
+      pass_w = dplyr::if_else(
+        .data$def_pass_plays >= SOS_MIN_DEF_PLAYS, .data$recency_weight, 0
+      ),
+      rush_w = dplyr::if_else(
+        .data$def_rush_plays >= SOS_MIN_DEF_PLAYS, .data$recency_weight, 0
+      )
+    ) %>%
+    dplyr::filter(.data$recency_weight > 0)
+
+  # Recency-weighted mean EPA allowed per team, per play type. Teams whose
+  # qualifying weight sums to zero (all team-seasons under the plays guard)
+  # yield NaN from weighted.mean; converted to NA below.
+  per_team <- weighted %>%
+    dplyr::group_by(.data$team) %>%
+    dplyr::summarise(
+      pass_weight_sum = sum(.data$pass_w, na.rm = TRUE),
+      rush_weight_sum = sum(.data$rush_w, na.rm = TRUE),
+      def_pass_epa_allowed = stats::weighted.mean(
+        .data$def_pass_epa_allowed, .data$pass_w, na.rm = TRUE
+      ),
+      def_rush_epa_allowed = stats::weighted.mean(
+        .data$def_rush_epa_allowed, .data$rush_w, na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      def_pass_epa_allowed = dplyr::if_else(
+        .data$pass_weight_sum > 0, .data$def_pass_epa_allowed, NA_real_
+      ),
+      def_rush_epa_allowed = dplyr::if_else(
+        .data$rush_weight_sum > 0, .data$def_rush_epa_allowed, NA_real_
+      )
+    )
+
+  # League averages across teams, then express each team relative to league.
+  league_pass <- mean(per_team$def_pass_epa_allowed, na.rm = TRUE)
+  league_rush <- mean(per_team$def_rush_epa_allowed, na.rm = TRUE)
+
+  per_team %>%
+    dplyr::mutate(
+      pass_epa_vs_league = .data$def_pass_epa_allowed - league_pass,
+      rush_epa_vs_league = .data$def_rush_epa_allowed - league_rush
+    ) %>%
+    dplyr::select(.data$team, .data$pass_epa_vs_league,
+                  .data$rush_epa_vs_league)
+}
+
+# ------------------------------------------------------------------------------
+# .compute_historical_sos
+# ------------------------------------------------------------------------------
+
+#' Retrospective SOS: quality of opponents each team actually faced
+#'
+#' For each prior season, reconstructs each team's opponent list from the pbp
+#' (distinct posteam-defteam-game), then averages the opponents' defensive
+#' quality (recency-weighted defense table), recency-weighting the seasons
+#' themselves. The result is a per-team relative schedule-quality signal that
+#' corrects the historical volume base for past schedule luck.
+#'
+#' Positive pass value = the team historically faced weaker-than-average pass
+#' defenses (its historical pass volume was inflated by an easy slate).
+#'
+#' @param seasons Integer vector. Prior seasons (HISTORICAL_SEASONS).
+#' @param cache_dir Character. R/15 cache directory.
+#' @param def_quality Tibble. Output of .compute_defense_quality_by_team()
+#'   over the same seasons -- the opponent-quality lookup.
+#' @return Tibble: team, hist_pass_sos, hist_rush_sos. Empty tibble if no
+#'   schedule could be reconstructed.
+#' @keywords internal
+.compute_historical_sos <- function(seasons, cache_dir = CACHE_DIR_DEFAULT,
+                                    def_quality) {
+
+  empty <- tibble::tibble(
+    team = character(), hist_pass_sos = numeric(), hist_rush_sos = numeric()
+  )
+  if (is.null(def_quality) || nrow(def_quality) == 0L) return(empty)
+
+  # Reconstruct opponent pairings per season (team faced opponent).
+  pairings <- purrr::map_dfr(seasons, function(s) {
+    pbp <- tryCatch(
+      load_normalized_season(s, cache_dir = cache_dir),
+      error = function(e) NULL
+    )
+    if (is.null(pbp)) return(NULL)
+
+    pr <- pbp %>%
+      dplyr::filter(
+        .data$season_type == "REG",
+        !is.na(.data$posteam), nchar(.data$posteam) > 0,
+        !is.na(.data$defteam), nchar(.data$defteam) > 0
+      ) %>%
+      dplyr::mutate(
+        team     = .normalize_team_codes(.data$posteam),
+        opponent = .normalize_team_codes(.data$defteam)
+      ) %>%
+      dplyr::distinct(.data$team, .data$opponent, .data$game_id) %>%
+      dplyr::mutate(season = s) %>%
+      dplyr::select(.data$team, .data$opponent, .data$season)
+
+    rm(pbp)
+    invisible(gc(verbose = FALSE))
+    pr
+  })
+
+  if (is.null(pairings) || nrow(pairings) == 0L) return(empty)
+
+  # Attach each opponent's defensive quality and a season recency weight, then
+  # average per team (each game counts once; recent seasons weighted higher).
+  max_season <- max(pairings$season, na.rm = TRUE)
+  pairings %>%
+    dplyr::left_join(
+      def_quality %>%
+        dplyr::rename(opp_pass_quality = .data$pass_epa_vs_league,
+                      opp_rush_quality = .data$rush_epa_vs_league),
+      by = c("opponent" = "team")
+    ) %>%
+    dplyr::mutate(
+      season_age = max_season - .data$season + 1L,
+      recency_weight = dplyr::if_else(
+        .data$season_age >= 1L & .data$season_age <= HISTORICAL_WINDOW,
+        SOS_SEASON_RECENCY_WEIGHTS[pmin(.data$season_age, HISTORICAL_WINDOW)],
+        0
+      ),
+      # Zero the weight where the opponent has no quality score so weighted.mean
+      # naturally drops it; track per-play-type so each can be NA independently.
+      pass_w = dplyr::if_else(
+        !is.na(.data$opp_pass_quality) & .data$recency_weight > 0,
+        .data$recency_weight, 0
+      ),
+      rush_w = dplyr::if_else(
+        !is.na(.data$opp_rush_quality) & .data$recency_weight > 0,
+        .data$recency_weight, 0
+      ),
+      # weighted.mean errors on NA values even at zero weight, so neutralize
+      # the NA quality entries to 0 (their weight is already 0).
+      opp_pass_quality = dplyr::coalesce(.data$opp_pass_quality, 0),
+      opp_rush_quality = dplyr::coalesce(.data$opp_rush_quality, 0)
+    ) %>%
+    dplyr::filter(.data$team %in% ACTIVE_TEAMS_2026) %>%
+    dplyr::group_by(.data$team) %>%
+    dplyr::summarise(
+      pass_weight_sum = sum(.data$pass_w, na.rm = TRUE),
+      rush_weight_sum = sum(.data$rush_w, na.rm = TRUE),
+      hist_pass_sos = stats::weighted.mean(.data$opp_pass_quality,
+                                           .data$pass_w, na.rm = TRUE),
+      hist_rush_sos = stats::weighted.mean(.data$opp_rush_quality,
+                                           .data$rush_w, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      hist_pass_sos = dplyr::if_else(.data$pass_weight_sum > 0,
+                                     .data$hist_pass_sos, NA_real_),
+      hist_rush_sos = dplyr::if_else(.data$rush_weight_sum > 0,
+                                     .data$hist_rush_sos, NA_real_)
+    ) %>%
+    dplyr::select(.data$team, .data$hist_pass_sos, .data$hist_rush_sos)
+}
+
+# ------------------------------------------------------------------------------
+# .compute_forward_sos
+# ------------------------------------------------------------------------------
+
+#' Forward SOS: quality of each team's scheduled opponents in the target season
+#'
+#' Pulls the target-season schedule from nflreadr::load_schedules() and, for
+#' each team, averages the defensive quality of its scheduled opponents (each
+#' opponent scored by its own recency-weighted historical defense). Answers
+#' "is the 2026 slate hard or easy?"
+#'
+#' If the target-season schedule is not yet ingested by nflverse (typical in
+#' early offseason), returns an empty tibble and the caller falls back to
+#' historical-only SOS.
+#'
+#' @param season Integer. Target season.
+#' @param def_quality Tibble. Output of .compute_defense_quality_by_team().
+#' @return Tibble: team, fwd_pass_sos, fwd_rush_sos. Empty tibble if the
+#'   schedule is unavailable.
+#' @keywords internal
+.compute_forward_sos <- function(season = SEASON, def_quality) {
+
+  empty <- tibble::tibble(
+    team = character(), fwd_pass_sos = numeric(), fwd_rush_sos = numeric()
+  )
+  if (is.null(def_quality) || nrow(def_quality) == 0L) return(empty)
+
+  sched <- tryCatch(
+    nflreadr::load_schedules(seasons = season),
+    error = function(e) {
+      message(glue("    Forward SOS: schedule load failed -- {e$message}"))
+      NULL
+    }
+  )
+  if (is.null(sched) || nrow(sched) == 0L) {
+    message(glue("    Forward SOS: season {season} schedule unavailable -- ",
+                 "historical-only SOS will apply"))
+    return(empty)
+  }
+
+  req <- c("season", "week", "home_team", "away_team")
+  if (length(setdiff(req, names(sched))) > 0L) {
+    message("    Forward SOS: schedule missing home/away columns -- skipped")
+    return(empty)
+  }
+
+  # Long form: one row per team per game, with the opponent named.
+  team_opp <- dplyr::bind_rows(
+    sched %>% dplyr::transmute(
+      team = .normalize_team_codes(.data$home_team),
+      opponent = .normalize_team_codes(.data$away_team)
+    ),
+    sched %>% dplyr::transmute(
+      team = .normalize_team_codes(.data$away_team),
+      opponent = .normalize_team_codes(.data$home_team)
+    )
+  ) %>%
+    dplyr::filter(!is.na(.data$team), !is.na(.data$opponent),
+                  .data$team %in% ACTIVE_TEAMS_2026)
+
+  if (nrow(team_opp) == 0L) return(empty)
+
+  team_opp %>%
+    dplyr::left_join(
+      def_quality %>%
+        dplyr::rename(opp_pass_quality = .data$pass_epa_vs_league,
+                      opp_rush_quality = .data$rush_epa_vs_league),
+      by = c("opponent" = "team")
+    ) %>%
+    dplyr::group_by(.data$team) %>%
+    dplyr::summarise(
+      fwd_pass_sos = mean(.data$opp_pass_quality, na.rm = TRUE),
+      fwd_rush_sos = mean(.data$opp_rush_quality, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# ------------------------------------------------------------------------------
+# .calibrate_sos_sensitivity
+# ------------------------------------------------------------------------------
+
+#' Fit SOS sensitivities empirically from team-game data
+#'
+#' Estimates how much team offensive efficiency and volume actually move with
+#' opponent defensive quality, so the SOS multipliers are earned from data
+#' rather than guessed.
+#'
+#' Design (locked in session):
+#'   - Unit of observation: team-game (one row per team per game per play
+#'     type). The opponent effect is a per-game phenomenon; season-level
+#'     averaging washes it out.
+#'   - Identification: team-season fixed effects via the within transformation
+#'     (demean outcome and regressor inside each team-season, then fit the
+#'     pooled slope). The slope is identified from how the SAME offense
+#'     performs against varying defenses, removing offense-quality confounding.
+#'   - Regressor: leave-one-out opponent defensive EPA per play (the opponent's
+#'     season EPA allowed EXCLUDING the game being predicted, so the outcome
+#'     never appears on both sides), expressed vs league average.
+#'   - Outcomes (both relative, so slopes are directly the unitless
+#'     sensitivities the factor mechanism needs):
+#'       efficiency: (team-game yards per play / league yards per play) - 1
+#'       volume:     (team-game plays / league plays per team-game) - 1
+#'
+#' Sign handling: a negative EFFICIENCY slope (easier defense, worse output)
+#' is causally implausible and treated as noise -- clamped to 0 (neutral)
+#' with a message. A negative VOLUME slope is a real phenomenon (teams ahead
+#' against weak defenses run more / pass less) and is retained as fitted.
+#'
+#' @param seasons Integer vector. Seasons to calibrate on (HISTORICAL_SEASONS).
+#' @param cache_dir Character. R/15 cache directory.
+#' @return Named list: pass_eff, rush_eff, pass_vol, rush_vol (numeric
+#'   sensitivities), plus calibrated (lgl) and n_games (int). Falls back to
+#'   the *_FALLBACK constants with calibrated = FALSE if data is insufficient.
+#' @keywords internal
+.calibrate_sos_sensitivity <- function(seasons, cache_dir = CACHE_DIR_DEFAULT) {
+
+  fallback <- list(
+    pass_eff = SOS_EFFICIENCY_SENSITIVITY_FALLBACK,
+    rush_eff = SOS_EFFICIENCY_SENSITIVITY_FALLBACK,
+    pass_vol = SOS_VOLUME_SENSITIVITY_FALLBACK,
+    rush_vol = SOS_VOLUME_SENSITIVITY_FALLBACK,
+    calibrated = FALSE,
+    n_games = 0L
+  )
+
+  # Team-game aggregates per play type, one pass over each season.
+  team_games <- purrr::map_dfr(seasons, function(s) {
+    pbp <- tryCatch(
+      load_normalized_season(s, cache_dir = cache_dir),
+      error = function(e) NULL
+    )
+    if (is.null(pbp)) return(NULL)
+
+    tg <- pbp %>%
+      dplyr::filter(
+        .data$season_type == "REG",
+        .data$play_type %in% c("pass", "run"),
+        !is.na(.data$epa),
+        !is.na(.data$posteam), nchar(.data$posteam) > 0,
+        !is.na(.data$defteam), nchar(.data$defteam) > 0
+      ) %>%
+      dplyr::mutate(
+        qb_kneel = dplyr::coalesce(.data$qb_kneel, 0L),
+        qb_spike = dplyr::coalesce(.data$qb_spike, 0L),
+        two_point_attempt = dplyr::coalesce(.data$two_point_attempt, 0L)
+      ) %>%
+      dplyr::filter(
+        .data$qb_kneel == 0L, .data$qb_spike == 0L,
+        .data$two_point_attempt == 0L
+      ) %>%
+      dplyr::mutate(
+        team     = .normalize_team_codes(.data$posteam),
+        opponent = .normalize_team_codes(.data$defteam)
+      ) %>%
+      dplyr::group_by(.data$game_id, .data$team, .data$opponent,
+                      .data$play_type) %>%
+      dplyr::summarise(
+        n_plays = dplyr::n(),
+        yds     = sum(.data$yards_gained, na.rm = TRUE),
+        epa_sum = sum(.data$epa, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(season = s)
+
+    rm(pbp)
+    invisible(gc(verbose = FALSE))
+    tg
+  })
+
+  if (is.null(team_games) || nrow(team_games) == 0L) {
+    message("    SOS calibration: no team-game data -- using FALLBACK ",
+            "sensitivities (unvalidated priors)")
+    return(fallback)
+  }
+
+  # Fit one slope per play_type x outcome. All league reference quantities are
+  # season-specific so era drift does not contaminate the relative outcomes.
+  fit_slope <- function(pt, outcome) {
+
+    d <- team_games %>% dplyr::filter(.data$play_type == pt)
+
+    # Opponent season defensive totals (their EPA allowed = the epa_sum the
+    # offenses they faced produced), for the leave-one-out regressor.
+    opp_totals <- d %>%
+      dplyr::group_by(opponent_team = .data$opponent, .data$season) %>%
+      dplyr::summarise(
+        opp_total_epa   = sum(.data$epa_sum),
+        opp_total_plays = sum(.data$n_plays),
+        .groups = "drop"
+      )
+
+    d <- d %>%
+      dplyr::left_join(
+        opp_totals,
+        by = c("opponent" = "opponent_team", "season" = "season")
+      ) %>%
+      dplyr::group_by(.data$season) %>%
+      dplyr::mutate(
+        league_mean_epa     = sum(.data$epa_sum) / sum(.data$n_plays),
+        league_ypp          = sum(.data$yds) / sum(.data$n_plays),
+        league_plays_per_tg = sum(.data$n_plays) / dplyr::n()
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::filter(
+        .data$n_plays >= SOS_CALIB_MIN_PLAYS_PER_GAME,
+        (.data$opp_total_plays - .data$n_plays) > 0
+      ) %>%
+      dplyr::mutate(
+        # Leave-one-out opponent defensive EPA vs league: this game's own
+        # plays are removed from the opponent's season totals.
+        x = (.data$opp_total_epa - .data$epa_sum) /
+            (.data$opp_total_plays - .data$n_plays) - .data$league_mean_epa,
+        y_eff = (.data$yds / .data$n_plays) / .data$league_ypp - 1,
+        y_vol = .data$n_plays / .data$league_plays_per_tg - 1,
+        team_season = paste(.data$team, .data$season, sep = "_")
+      )
+
+    # outcome is a scalar -- base if/else per house convention.
+    d$y <- if (outcome == "eff") d$y_eff else d$y_vol
+
+    if (nrow(d) < SOS_CALIB_MIN_GAMES) return(NA_real_)
+
+    # Within transformation: demean x and y inside each team-season, then fit
+    # the pooled slope. Equivalent to OLS with team-season fixed effects.
+    d <- d %>%
+      dplyr::group_by(.data$team_season) %>%
+      dplyr::mutate(
+        xd = .data$x - mean(.data$x),
+        yd = .data$y - mean(.data$y)
+      ) %>%
+      dplyr::ungroup()
+
+    sxx <- sum(d$xd^2)
+    if (sxx <= 0) return(NA_real_)
+
+    sum(d$xd * d$yd) / sxx
+  }
+
+  slopes <- list(
+    pass_eff = fit_slope("pass", "eff"),
+    rush_eff = fit_slope("run",  "eff"),
+    pass_vol = fit_slope("pass", "vol"),
+    rush_vol = fit_slope("run",  "vol")
+  )
+
+  if (any(vapply(slopes, is.na, logical(1)))) {
+    message("    SOS calibration: insufficient sample for at least one slope ",
+            "-- using FALLBACK sensitivities (unvalidated priors)")
+    return(fallback)
+  }
+
+  # Negative efficiency slopes are causally implausible (easier defense should
+  # not reduce output) -- treat as noise and neutralize. Negative volume slopes
+  # are real game-script effects and are retained.
+  for (nm in c("pass_eff", "rush_eff")) {
+    if (slopes[[nm]] < 0) {
+      message(glue("    SOS calibration: fitted {nm} slope negative ",
+                   "({format(round(slopes[[nm]], 3), nsmall = 3)}) -- ",
+                   "clamped to 0 (neutral)"))
+      slopes[[nm]] <- 0
+    }
+  }
+
+  n_games <- team_games %>%
+    dplyr::distinct(.data$game_id, .data$team) %>%
+    nrow()
+
+  c(slopes, list(calibrated = TRUE, n_games = as.integer(n_games)))
+}
+
+
+
+#' Blend historical + forward (+ optional in-season) SOS and apply to projections
+#'
+#' Combines the retrospective and forward SOS signals into a preseason SOS
+#' signal per team and play type. When \code{as_of_week} is supplied and a
+#' \code{current_season_def} opponent-quality signal is available, the
+#' preseason signal is tapered toward the team's observed current-season
+#' opponent quality using compute_prior_weight(as_of_week) -- the same in-season
+#' decay curve used across the engine (week 1 = full preseason weight, ~week 9
+#' crossover, 0.05 floor on the preseason signal).
+#'
+#' The blended relative-EPA signal is converted to a multiplier:
+#'   factor = 1 + signal * sensitivity
+#' then bounded to [SOS_FACTOR_FLOOR, SOS_FACTOR_CEILING]. A positive signal
+#' means easier defenses faced, so volume and efficiency tick up.
+#'
+#' Volume: pass scales up with the pass factor; rush scales reciprocally so a
+#' tougher pass schedule does not also inflate rush attempts. Efficiency:
+#' pass yards and TDs scale with the pass factor; rush yards and TDs with the
+#' rush factor.
+#'
+#' @param projected Tibble. Output of .apply_qb_quality_adjustment().
+#' @param hist_sos Tibble. Output of .compute_historical_sos().
+#' @param fwd_sos Tibble. Output of .compute_forward_sos().
+#' @param as_of_week Integer or NULL. Current week for in-season taper.
+#' @param current_season_sos Tibble or NULL. Observed current-season schedule
+#'   quality per team (team, cur_pass_sos, cur_rush_sos). Only used when
+#'   as_of_week is non-NULL.
+#' @param sens Named list from .calibrate_sos_sensitivity(): pass_eff,
+#'   rush_eff, pass_vol, rush_vol. Fitted slopes converting the SOS signal
+#'   into multiplicative factors.
+#' @return Tibble with pass_sos_factor, rush_sos_factor, and SOS-adjusted
+#'   projected_* columns.
+#' @keywords internal
+.apply_sos_adjustment <- function(projected, hist_sos, fwd_sos,
+                                  as_of_week = NULL,
+                                  current_season_sos = NULL,
+                                  sens) {
+
+  # Assemble per-team preseason SOS signal. Historical and forward are averaged
+  # when both present; whichever is present is used alone otherwise; absent
+  # both, the signal is 0 (neutral).
+  sos <- projected %>%
+    dplyr::select(.data$team) %>%
+    dplyr::left_join(hist_sos, by = "team") %>%
+    dplyr::left_join(fwd_sos, by = "team") %>%
+    dplyr::mutate(
+      pass_sos_signal = dplyr::case_when(
+        !is.na(.data$hist_pass_sos) & !is.na(.data$fwd_pass_sos) ~
+          (.data$hist_pass_sos + .data$fwd_pass_sos) / 2,
+        !is.na(.data$fwd_pass_sos)  ~ .data$fwd_pass_sos,
+        !is.na(.data$hist_pass_sos) ~ .data$hist_pass_sos,
+        TRUE ~ 0
+      ),
+      rush_sos_signal = dplyr::case_when(
+        !is.na(.data$hist_rush_sos) & !is.na(.data$fwd_rush_sos) ~
+          (.data$hist_rush_sos + .data$fwd_rush_sos) / 2,
+        !is.na(.data$fwd_rush_sos)  ~ .data$fwd_rush_sos,
+        !is.na(.data$hist_rush_sos) ~ .data$hist_rush_sos,
+        TRUE ~ 0
+      )
+    )
+
+  # In-season taper toward observed current-season opponent quality.
+  if (!is.null(as_of_week) && !is.null(current_season_sos) &&
+      nrow(current_season_sos) > 0L) {
+    pw <- compute_prior_weight(as_of_week)  # preseason-signal weight
+    message(glue("    SOS in-season blend at week {as_of_week}: ",
+                 "preseason weight {format(round(pw, 3), nsmall = 3)}, ",
+                 "observed weight {format(round(1 - pw, 3), nsmall = 3)}"))
+    sos <- sos %>%
+      dplyr::left_join(current_season_sos, by = "team") %>%
+      dplyr::mutate(
+        pass_sos_signal = dplyr::if_else(
+          is.na(.data$cur_pass_sos),
+          .data$pass_sos_signal,
+          pw * .data$pass_sos_signal + (1 - pw) * .data$cur_pass_sos
+        ),
+        rush_sos_signal = dplyr::if_else(
+          is.na(.data$cur_rush_sos),
+          .data$rush_sos_signal,
+          pw * .data$rush_sos_signal + (1 - pw) * .data$cur_rush_sos
+        )
+      )
+  }
+
+  # Build bounded multipliers and apply, using the fitted sensitivities.
+  sos <- sos %>%
+    dplyr::mutate(
+      pass_sos_factor = pmin(pmax(
+        1 + .data$pass_sos_signal * sens$pass_eff,
+        SOS_FACTOR_FLOOR), SOS_FACTOR_CEILING),
+      rush_sos_factor = pmin(pmax(
+        1 + .data$rush_sos_signal * sens$rush_eff,
+        SOS_FACTOR_FLOOR), SOS_FACTOR_CEILING),
+      # Volume multipliers use the separately fitted volume slopes (volume
+      # responds to schedule differently than efficiency, including possible
+      # game-script sign reversal).
+      pass_vol_factor = pmin(pmax(
+        1 + .data$pass_sos_signal * sens$pass_vol,
+        SOS_FACTOR_FLOOR), SOS_FACTOR_CEILING),
+      rush_vol_factor = pmin(pmax(
+        1 + .data$rush_sos_signal * sens$rush_vol,
+        SOS_FACTOR_FLOOR), SOS_FACTOR_CEILING)
+    ) %>%
+    dplyr::select(.data$team, .data$pass_sos_factor, .data$rush_sos_factor,
+                  pass_vol_factor, rush_vol_factor)
+
+  projected %>%
+    dplyr::left_join(sos, by = "team") %>%
+    dplyr::mutate(
+      # Neutral fallback for any unmatched team.
+      pass_sos_factor = dplyr::coalesce(.data$pass_sos_factor, 1),
+      rush_sos_factor = dplyr::coalesce(.data$rush_sos_factor, 1),
+      pass_vol_factor = dplyr::coalesce(.data$pass_vol_factor, 1),
+      rush_vol_factor = dplyr::coalesce(.data$rush_vol_factor, 1),
+      # Volume (separate pass/rush volume factors).
+      projected_pass_pg     = .data$projected_pass_pg * .data$pass_vol_factor,
+      projected_rush_pg     = .data$projected_rush_pg * .data$rush_vol_factor,
+      # Efficiency (yards and TDs by play type).
+      projected_pass_yds_pg = .data$projected_pass_yds_pg * .data$pass_sos_factor,
+      projected_rush_yds_pg = .data$projected_rush_yds_pg * .data$rush_sos_factor,
+      projected_pass_tds_pg = .data$projected_pass_tds_pg * .data$pass_sos_factor,
+      projected_rush_tds_pg = .data$projected_rush_tds_pg * .data$rush_sos_factor
+    ) %>%
+    dplyr::select(-pass_vol_factor, -rush_vol_factor)
+}
+
 # ==============================================================================
 # PUBLIC ENTRY POINT
 # ==============================================================================
@@ -1535,16 +2342,28 @@ utils::globalVariables(c(
 #'
 #' @param cache_dir Character. R/15 cache directory.
 #' @param coaching_changes_path Character. Path to coaching changes CSV.
+#' @param qb_changes_path Character. Path to optional QB changes CSV override.
+#' @param as_of_week Integer 1-18 or NULL. When NULL (default), SOS is the
+#'   preseason historical+forward signal. When a week is supplied, the SOS
+#'   signal tapers toward observed current-season opponent quality via
+#'   compute_prior_weight(as_of_week). Requires current_season_sos to have an
+#'   effect; without it the preseason signal is retained.
+#' @param current_season_sos Tibble or NULL. Observed current-season schedule
+#'   quality per team (columns: team, cur_pass_sos, cur_rush_sos, expressed as
+#'   EPA allowed relative to league average, same convention as the preseason
+#'   signal). Only consulted when as_of_week is non-NULL.
 #' @param save_output Logical. If TRUE, write RDS + CSV to OUTPUT_*_PATH.
 #' @return Tibble with 32 rows (one per active 2026 team) and the full
 #'   set of historical, blended, and projected columns documented at the
 #'   top of this file.
 #'
-#' @seealso load_normalized_season (R/15)
+#' @seealso load_normalized_season (R/15), compute_prior_weight (R/29)
 #' @export
 project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
                                   coaching_changes_path = COACHING_CHANGES_PATH,
                                   qb_changes_path = QB_CHANGES_PATH,
+                                  as_of_week = NULL,
+                                  current_season_sos = NULL,
                                   save_output = TRUE) {
 
   message(glue("\n{strrep('=', 70)}"))
@@ -1552,31 +2371,37 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   message(glue("Historical window: {paste(HISTORICAL_SEASONS, collapse = ', ')}"))
   message(glue("Blend weights: team {TEAM_PATTERN_WEIGHT}, ",
                "coach {COACH_PATTERN_WEIGHT}"))
+  if (is.null(as_of_week)) {
+    message("SOS mode: preseason (historical + forward schedule)")
+  } else {
+    message(glue("SOS mode: in-season at week {as_of_week} ",
+                 "(preseason signal tapers toward observed)"))
+  }
   message(glue("{strrep('=', 70)}"))
 
   # STEP 1: Team historical volume aggregation
-  message("\nSTEP 1/5: Aggregating team historical volume")
+  message("\nSTEP 1/6: Aggregating team historical volume")
   team_history <- .compute_team_historical_volume(
     cache_dir = cache_dir,
     seasons   = HISTORICAL_SEASONS
   )
 
   # STEP 2: Load coaching changes (auto-detect from schedules + CSV override)
-  message("\nSTEP 2/5: Loading 2026 coaching changes")
+  message("\nSTEP 2/6: Loading 2026 coaching changes")
   coaching_changes <- .load_coaching_changes(
     path   = coaching_changes_path,
     season = SEASON
   )
 
   # STEP 3: Coach prior pattern
-  message("\nSTEP 3/5: Computing coach prior team patterns")
+  message("\nSTEP 3/6: Computing coach prior team patterns")
   coach_prior <- .compute_coach_prior_pattern(
     coaching_changes = coaching_changes,
     team_history     = team_history
   )
 
   # STEP 4: Blend team + coach
-  message("\nSTEP 4/5: Blending team and coach patterns (70/30)")
+  message("\nSTEP 4/6: Blending team and coach patterns (70/30)")
   blended <- .blend_team_and_coach_pattern(
     team_history = team_history,
     coach_prior  = coach_prior
@@ -1590,7 +2415,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
     )
 
   # STEP 5: QB quality adjustment
-  message("\nSTEP 5/5: Computing QB quality index and applying adjustment")
+  message("\nSTEP 5/6: Computing QB quality index and applying adjustment")
   qb_quality <- .compute_qb_quality_index(
     cache_dir       = cache_dir,
     qb_changes_path = qb_changes_path,
@@ -1599,6 +2424,55 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   projected <- .apply_qb_quality_adjustment(
     blended    = blended,
     qb_quality = qb_quality
+  )
+
+  # STEP 6: Strength-of-schedule adjustment (v2)
+  message("\nSTEP 6/6: Computing strength-of-schedule and applying adjustment")
+
+  # Fit the SOS sensitivities empirically from team-game data (see
+  # .calibrate_sos_sensitivity for the design). Computed from live data every
+  # run -- never hardcoded.
+  sens <- .calibrate_sos_sensitivity(
+    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir
+  )
+  if (sens$calibrated) {
+    message(glue(
+      "    SOS sensitivities fitted from ",
+      "{format(sens$n_games, big.mark = ',')} team-games: ",
+      "pass eff {format(round(sens$pass_eff, 3), nsmall = 3)}, ",
+      "rush eff {format(round(sens$rush_eff, 3), nsmall = 3)}, ",
+      "pass vol {format(round(sens$pass_vol, 3), nsmall = 3)}, ",
+      "rush vol {format(round(sens$rush_vol, 3), nsmall = 3)}"
+    ))
+  } else {
+    warning("SOS sensitivities NOT calibrated -- fallback priors in use. ",
+            "Factors this run are based on unvalidated constants.",
+            call. = FALSE)
+  }
+
+  # Defensive quality per team over the prior-season window (shared lookup).
+  def_team_season <- .compute_team_defense_allowed(
+    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir
+  )
+  def_quality <- .compute_defense_quality_by_team(def_team_season)
+
+  hist_sos <- .compute_historical_sos(
+    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir,
+    def_quality = def_quality
+  )
+  fwd_sos <- .compute_forward_sos(season = SEASON, def_quality = def_quality)
+
+  message(glue("    SOS inputs: {nrow(def_quality)} defenses scored, ",
+               "{nrow(hist_sos)} teams with historical SOS, ",
+               "{nrow(fwd_sos)} teams with forward SOS"))
+
+  projected <- .apply_sos_adjustment(
+    projected          = projected,
+    hist_sos           = hist_sos,
+    fwd_sos            = fwd_sos,
+    as_of_week         = as_of_week,
+    current_season_sos = current_season_sos,
+    sens               = sens
   )
 
   # Final output columns in documented order
@@ -1618,6 +2492,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
       .data$blended_pass_pg, .data$blended_rush_pg,
       .data$blended_plays_pg, .data$blended_proe,
       .data$qb_quality_score,
+      .data$pass_sos_factor, .data$rush_sos_factor,
       .data$projected_pass_pg, .data$projected_rush_pg,
       .data$projected_plays_pg,
       .data$projected_pass_yds_pg, .data$projected_rush_yds_pg,
@@ -1647,6 +2522,17 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   top_qb_team   <- output$team[which.max(output$qb_quality_score)]
   top_qb_score  <- max(output$qb_quality_score, na.rm = TRUE)
 
+  # SOS: most favorable and toughest pass schedules (computed from output)
+  easiest_pass_team <- output$team[which.max(output$pass_sos_factor)]
+  easiest_pass_fac  <- max(output$pass_sos_factor, na.rm = TRUE)
+  hardest_pass_team <- output$team[which.min(output$pass_sos_factor)]
+  hardest_pass_fac  <- min(output$pass_sos_factor, na.rm = TRUE)
+  n_sos_adjusted    <- sum(
+    abs(output$pass_sos_factor - 1) > 0.001 |
+      abs(output$rush_sos_factor - 1) > 0.001,
+    na.rm = TRUE
+  )
+
   message(glue("\n{strrep('=', 70)}"))
   message("KEY INSIGHTS")
   message(glue("{strrep('=', 70)}"))
@@ -1660,6 +2546,11 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
                "{format(round(top_rush_pg, 1), nsmall = 1)} attempts/game"))
   message(glue("  Highest QB quality:       {top_qb_team} at z = ",
                "{format(round(top_qb_score, 2), nsmall = 2)}"))
+  message(glue("  Teams SOS-adjusted:       {n_sos_adjusted}"))
+  message(glue("  Easiest pass schedule:    {easiest_pass_team} ",
+               "(factor {format(round(easiest_pass_fac, 3), nsmall = 3)})"))
+  message(glue("  Toughest pass schedule:   {hardest_pass_team} ",
+               "(factor {format(round(hardest_pass_fac, 3), nsmall = 3)})"))
   message(glue("{strrep('=', 70)}\n"))
 
   output

@@ -42,7 +42,9 @@
 #       R/30 to anchor QB1 to team passing offense.
 #
 #   RB: target_share + rush_share volumes from R/31, converted to PPG using
-#       RB-specific efficiency (catch rate 0.78, ypc 4.3, td/carry 0.031).
+#       RB-specific efficiency (catch rate 0.78, ypc 4.3, td/carry derived
+#       empirically from SEASONS_FOR_TD_PRIOR at script load; see constant
+#       EMPIRICAL_RB_TD_PER_CARRY below).
 #
 #   WR: target_share from R/31, converted to PPG using WR efficiency
 #       (catch rate 0.65, ypc 12.5, td/target 0.05).
@@ -85,8 +87,11 @@
 #   r31_true_targets_pg         dbl   After sack adjustment
 #   volume_implied_ppg_v2       dbl   PPG implied by R/31 volume + efficiency
 #                                      (NA for QBs)
+#   blend_weight_r31_static     dbl   Preseason weight by prior_source
+#                                      (before in-season decay; 0 for QBs)
 #   blend_weight_r31            dbl   Weight given to R/31 in the blend
-#                                      (0 for QBs)
+#                                      (= static * compute_prior_weight when
+#                                       as_of_week supplied; 0 for QBs)
 #   r32_posterior_mu            dbl   Final reconciled projection
 #                                      (= r29_posterior_mu for QBs)
 #   r32_delta_from_r29          dbl   r32_posterior_mu - r29_posterior_mu
@@ -111,10 +116,25 @@
 # RUN
 # ---
 #   source(here::here("R", "32_projection_reconciliation.R"))
-#   reconciled <- reconcile_projections()
+#   reconciled <- reconcile_projections()                 # preseason
+#   reconciled <- reconcile_projections(as_of_week = 9)   # in-season
 #
 # Author: Christian K. LeBlanc
-# Version: 1.0
+# Version: 2.0
+#
+# CHANGELOG
+# ---------
+# 2.0  Two v2 fixes. (1) RB td_per_carry prior is now computed empirically at
+#      load time (EMPIRICAL_RB_TD_PER_CARRY) from nflreadr::load_player_stats()
+#      over the 5 most recent completed seasons, replacing a hardcoded literal.
+#      (2) In-season blend-weight decay: new optional as_of_week argument on
+#      reconcile_projections() multiplies every prior_source blend weight by
+#      compute_prior_weight(as_of_week), so the R/31 team-constraint correction
+#      fades as R/29's posterior absorbs observed volume over the season (worst
+#      for rookies at 0.85, exactly where in-season data matters most). Week 1
+#      pw ~= 1.0 preserves current behavior; week 18 pw = 0.05. New audit
+#      column blend_weight_r31_static. Schema tag -> s2_w15_reconciled_v2.
+# 1.0  Initial build.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -127,15 +147,84 @@ library(purrr)
 library(readr)
 library(here)
 library(glue)
+library(nflreadr)
 
 source(here::here("R", "30_team_volume_projections.R"))
 source(here::here("R", "31_player_volume_allocation.R"))
+
+# compute_prior_weight() (R/29) arrives transitively via the sources above,
+# but R/32 now calls it directly for the in-season blend-weight decay, so the
+# dependency is declared explicitly here. Guarded to be a no-op when already
+# loaded; fails loudly rather than drifting if R/29 cannot load.
+if (!exists("compute_prior_weight")) {
+  source(here::here("R", "29_projection_engine.R"))
+}
 
 # ------------------------------------------------------------------------------
 # CONSTANTS
 # ------------------------------------------------------------------------------
 
 SEASON_RECON <- 2026L
+
+# Season window for empirical rushing-TD-per-carry derivation.
+# Defined as the 5 most recently completed seasons relative to SEASON_RECON.
+# Window rolls forward automatically when SEASON_RECON is updated.
+SEASONS_FOR_TD_PRIOR <- (SEASON_RECON - 5L):(SEASON_RECON - 1L)
+
+# Empirical RB rushing TD per carry, computed at script load time from
+# nflreadr::load_player_stats() across SEASONS_FOR_TD_PRIOR regular seasons.
+# Replaces a hardcoded constant. Falls back to 0.031 with a warning if the
+# data call fails so the script does not silently die.
+EMPIRICAL_RB_TD_PER_CARRY <- local({
+
+  message(glue(
+    "  Computing empirical RB td_per_carry from seasons ",
+    "{min(SEASONS_FOR_TD_PRIOR)}-{max(SEASONS_FOR_TD_PRIOR)}"
+  ))
+
+  stats <- tryCatch(
+    nflreadr::load_player_stats(
+      seasons   = SEASONS_FOR_TD_PRIOR,
+      stat_type = "offense"
+    ),
+    error = function(e) {
+      warning(glue(
+        "nflreadr::load_player_stats() failed: {e$message}. ",
+        "Using fallback td_per_carry = 0.031"
+      ))
+      NULL
+    }
+  )
+
+  if (is.null(stats)) return(0.031)
+
+  rb_totals <- stats %>%
+    dplyr::filter(
+      .data$season_type == "REG",
+      .data$position    == "RB",
+      !is.na(.data$carries),
+      .data$carries     > 0L
+    ) %>%
+    dplyr::summarise(
+      total_carries  = sum(.data$carries,     na.rm = TRUE),
+      total_rush_tds = sum(.data$rushing_tds, na.rm = TRUE)
+    )
+
+  if (rb_totals$total_carries == 0L) {
+    warning("No RB carries found in SEASONS_FOR_TD_PRIOR; using fallback 0.031")
+    return(0.031)
+  }
+
+  rate <- rb_totals$total_rush_tds / rb_totals$total_carries
+
+  message(glue(
+    "  Empirical RB td_per_carry: {format(round(rate, 4), nsmall = 4)} ",
+    "({format(rb_totals$total_rush_tds, big.mark = ',')} TDs / ",
+    "{format(rb_totals$total_carries, big.mark = ',')} carries)"
+  ))
+
+  rate
+})
 
 # Position-specific PPR efficiency priors. Used to convert R/31's volume
 # allocations into implied PPG. These are league-average rates -- a future
@@ -161,7 +250,7 @@ POSITION_EFFICIENCY <- list(
     yards_per_catch = 8.0,
     td_per_target   = 0.03,
     yards_per_carry = 4.3,
-    td_per_carry    = 0.031
+    td_per_carry    = EMPIRICAL_RB_TD_PER_CARRY
   )
 )
 
@@ -173,6 +262,16 @@ SACK_ADJUSTMENT <- 0.935
 # Blend weights by R/29 prior_source. Higher = trust R/31 more.
 # Players with no NFL history or translation match get the strongest
 # team-constraint correction; players with rich history get the lightest.
+#
+# IN-SEASON DECAY (v2): these are PRESEASON weights. When reconcile_projections()
+# is called with as_of_week, every weight is multiplied by
+# compute_prior_weight(as_of_week) -- the same decay curve as R/29, R/30 SOS,
+# and R/31. Rationale: R/29's posterior already absorbs observed volume in-season
+# via its own decay, so by late season the static R/31 weight would fight the
+# real signal -- worst for rookies (0.85), exactly where in-season data matters
+# most. At week 1, pw ~= 1.0 so behavior is unchanged; at week 18, pw = 0.05 so
+# R/32 almost entirely defers to R/29's observed-driven posterior. The relative
+# ordering across prior_sources is preserved at every week.
 BLEND_WEIGHTS_BY_PRIOR_SOURCE <- c(
   "blended"                = 0.30,
   "veteran_history_only"   = 0.45,
@@ -204,7 +303,7 @@ OUTPUT_CSV_PATH_RECON <- here::here(
   "data", "season2_cache", "s2_week15_reconciled_projections.csv"
 )
 
-SCHEMA_TAG_RECON <- "s2_w15_reconciled_v1"
+SCHEMA_TAG_RECON <- "s2_w15_reconciled_v2"
 
 # QB depth discount multipliers by depth_position from R/31.
 # Backup QBs inherit starter-level R/29 projections because R/29 uses
@@ -236,7 +335,7 @@ utils::globalVariables(c(
   "r29_projection_lower_95", "r29_projection_upper_95",
   "r31_expected_targets_pg", "r31_expected_carries_pg",
   "r31_true_targets_pg",
-  "volume_implied_ppg_v2", "blend_weight_r31",
+  "volume_implied_ppg_v2", "blend_weight_r31_static", "blend_weight_r31",
   "r32_posterior_mu", "r32_delta_from_r29",
   "r32_projection_lower_80", "r32_projection_upper_80",
   "r32_projection_lower_95", "r32_projection_upper_95",
@@ -385,27 +484,44 @@ utils::globalVariables(c(
 # .determine_blend_weights
 # ------------------------------------------------------------------------------
 
-#' Map R/29 prior_source to R/31 blend weight
+#' Map R/29 prior_source to R/31 blend weight, with optional in-season decay
 #'
 #' Looks up BLEND_WEIGHTS_BY_PRIOR_SOURCE. Unrecognized sources get
 #' DEFAULT_R31_WEIGHT. QBs get weight 0 (pass-through).
 #'
+#' When as_of_week is supplied, every non-QB weight is multiplied by
+#' compute_prior_weight(as_of_week) so the R/31 team-constraint correction
+#' fades as R/29's posterior absorbs observed volume over the season. NULL
+#' (preseason) leaves the static weights unchanged.
+#'
 #' @param r29 Tibble from .load_r29_projections().
-#' @return Tibble: nfl_gsis_id, blend_weight_r31.
+#' @param as_of_week Integer 1-18 or NULL. NULL = preseason (no decay).
+#' @return Tibble: nfl_gsis_id, blend_weight_r31_static, blend_weight_r31.
+#' @seealso compute_prior_weight (R/29)
 #' @keywords internal
-.determine_blend_weights <- function(r29) {
+.determine_blend_weights <- function(r29, as_of_week = NULL) {
+
+  # Decay factor: 1.0 in preseason, compute_prior_weight(week) in-season.
+  decay <- if (is.null(as_of_week)) 1.0 else compute_prior_weight(as_of_week)
+
+  if (!is.null(as_of_week)) {
+    message(glue("    Blend-weight decay at week {as_of_week}: ",
+                 "static weights scaled by ",
+                 "{format(round(decay, 3), nsmall = 3)}"))
+  }
 
   r29 %>%
     dplyr::mutate(
-      blend_weight_r31 = dplyr::case_when(
+      blend_weight_r31_static = dplyr::case_when(
         .data$position == "QB" ~ 0,
         TRUE ~ dplyr::coalesce(
           BLEND_WEIGHTS_BY_PRIOR_SOURCE[.data$prior_source],
           DEFAULT_R31_WEIGHT
         )
-      )
+      ),
+      blend_weight_r31 = .data$blend_weight_r31_static * decay
     ) %>%
-    dplyr::select(nfl_gsis_id, blend_weight_r31)
+    dplyr::select(nfl_gsis_id, blend_weight_r31_static, blend_weight_r31)
 }
 
 # ------------------------------------------------------------------------------
@@ -606,22 +722,34 @@ utils::globalVariables(c(
 #' @param r29_path Character. Path to R/29 projections CSV.
 #' @param r31_path Character. Path to R/31 allocations RDS.
 #' @param r30_path Character. Path to R/30 team volumes RDS (reserved for QB v2).
+#' @param as_of_week Integer 1-18 or NULL. When NULL (default), the R/31 blend
+#'   weights are the static preseason values. When supplied, every blend weight
+#'   is decayed by compute_prior_weight(as_of_week) so R/32 defers more to
+#'   R/29's observed-driven posterior as the season progresses.
 #' @param save_output Logical. Write RDS + CSV outputs.
 #' @return Tibble with all R/29 columns (posterior_mu renamed to
 #'   r29_posterior_mu) plus R/32 reconciled columns.
 #'
-#' @seealso allocate_player_volumes (R/31), project_team_volumes (R/30)
+#' @seealso allocate_player_volumes (R/31), project_team_volumes (R/30),
+#'   compute_prior_weight (R/29)
 #' @export
 reconcile_projections <- function(
     r29_path = R29_PROJECTIONS_CSV_RECON,
     r31_path = R31_ALLOC_RDS_RECON,
     r30_path = R30_TEAM_VOL_RDS_RECON,
+    as_of_week = NULL,
     save_output = TRUE) {
 
   message(glue("\n{strrep('=', 70)}"))
   message(glue("R/32: Reconciling projections for season {SEASON_RECON}"))
   message(glue("Sack adjustment: {SACK_ADJUSTMENT}"))
   message(glue("Reconciled positions: {paste(RECON_POSITIONS, collapse = ', ')}"))
+  if (is.null(as_of_week)) {
+    message("Blend-weight mode: preseason (static weights by prior_source)")
+  } else {
+    message(glue("Blend-weight mode: in-season at week {as_of_week} ",
+                 "(weights decay toward R/29 posterior)"))
+  }
   message(glue("{strrep('=', 70)}"))
 
   # STEP 1: Load R/29 projections
@@ -669,7 +797,8 @@ reconcile_projections <- function(
 
   # STEP 4: Determine per-player blend weights
   message("\nSTEP 4/6: Determining blend weights by prior_source")
-  blend_weights <- .determine_blend_weights(r29 = r29_renamed)
+  blend_weights <- .determine_blend_weights(r29 = r29_renamed,
+                                            as_of_week = as_of_week)
 
   # STEP 5: Merge all sources
   message("\nSTEP 5/6: Merging R/29 + R/31 + volume implications + weights")
@@ -739,6 +868,16 @@ reconcile_projections <- function(
   message(glue("  RB/WR/TE blended:          {n_recon}"))
   message(glue("  QBs passed through:        {n_qb_passthrough}"))
   message(glue("  Players matched to R/31:   {n_with_r31}"))
+
+  if (!is.null(as_of_week)) {
+    eff_max <- max(output$blend_weight_r31, na.rm = TRUE)
+    static_max <- max(output$blend_weight_r31_static, na.rm = TRUE)
+    message(glue(
+      "  Blend-weight decay:        week {as_of_week}, top weight ",
+      "{format(round(static_max, 2), nsmall = 2)} -> ",
+      "{format(round(eff_max, 2), nsmall = 2)} after decay"
+    ))
+  }
 
   n_qb_discounted <- sum(
     !is.na(output$qb_discount_factor) & output$qb_discount_factor < 1.0,

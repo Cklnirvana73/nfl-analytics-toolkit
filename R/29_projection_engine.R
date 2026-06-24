@@ -129,8 +129,8 @@ library(glue)
 library(nflreadr)
 library(ffpros)
 
-# Source dependencies -- R/15, R/16, R/17, R/23 are sourced automatically if
-# not already loaded. Sourcing multiple times is safe; these files are
+# Source dependencies -- R/15, R/16, R/17, R/19, R/23 are sourced automatically
+# if not already loaded. Sourcing multiple times is safe; these files are
 # idempotent.
 if (!exists("load_normalized_season")) {
   source(here::here("R", "15_multi_season_pbp.R"))
@@ -143,6 +143,9 @@ if (!exists("build_player_season_panel")) {
 }
 if (!exists("run_aging_curve_pipeline")) {
   source(here::here("R", "23_aging_curves.R"))
+}
+if (!exists("get_all_sleeper_players")) {
+  source(here::here("R", "19_sleeper_api.R"))
 }
 
 # ==============================================================================
@@ -1705,15 +1708,23 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
   # rush 0.1/6, rec 0.1/6, receptions 1.0 per reception)
   panel_use <- panel_use %>%
     dplyr::mutate(
+      # Coalesce each stat term to 0 before summing. The R/16 panel stores NA
+      # (not 0) for categories a player never accrued -- passing_yards for a TE,
+      # rushing_yards in a season with no carries, etc. Without coalesce, NA
+      # propagates through the sum, panel_fantasy_pts becomes NA, panel_ppg
+      # becomes NA, and the is.finite(panel_ppg) filter below silently drops the
+      # player from the volume signal. NA here means zero activity, so 0 is the
+      # correct substitution. (Diagnosed: 93% of window player-seasons were
+      # being dropped, TEs hit hardest at 209/213.)
       panel_fantasy_pts =
-        passing_yards * 0.04 +
-        pass_tds * 4 -
-        interceptions_thrown * 2 +
-        rushing_yards * 0.1 +
-        rush_tds * 6 +
-        receiving_yards * 0.1 +
-        rec_tds * 6 +
-        receptions * 1,
+        dplyr::coalesce(passing_yards, 0) * 0.04 +
+        dplyr::coalesce(pass_tds, 0) * 4 -
+        dplyr::coalesce(interceptions_thrown, 0) * 2 +
+        dplyr::coalesce(rushing_yards, 0) * 0.1 +
+        dplyr::coalesce(rush_tds, 0) * 6 +
+        dplyr::coalesce(receiving_yards, 0) * 0.1 +
+        dplyr::coalesce(rec_tds, 0) * 6 +
+        dplyr::coalesce(receptions, 0) * 1,
       panel_ppg = panel_fantasy_pts / pmax(games_played, 1),
 
       # Position-specific opportunity rate (touches per game)
@@ -1835,6 +1846,19 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     message("  Loading aging curves from cache...")
     panel  <- readRDS(AGING_PANEL_CACHE_PATH)
     curves <- readRDS(AGING_CURVES_CACHE_PATH)
+
+    # Normalize stale cache layout. Older builds wrapped the position-keyed
+    # curves as list(curves = <position-keyed>, built_for_season = <int>).
+    # .lookup_aging_delta() expects the position-keyed list directly, where
+    # names() are QB/RB/WR/TE. Unwrap so a wrapped cache works without a
+    # rebuild; this is a no-op on a correctly-keyed cache. Without it,
+    # position %in% names(curves) is always FALSE and every aging delta
+    # collapses to 0 (aging applied to 0 players).
+    if (is.list(curves) && "curves" %in% names(curves) &&
+        !any(SUPPORTED_POSITIONS %in% names(curves))) {
+      curves <- curves$curves
+    }
+
     message(glue("    Panel: {nrow(panel)} rows; ",
                  "Curves: {length(curves)} positions"))
     return(list(panel = panel, curves = curves))
