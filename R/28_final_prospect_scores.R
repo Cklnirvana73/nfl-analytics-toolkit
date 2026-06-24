@@ -208,6 +208,48 @@ utils::globalVariables(c(
   }
 
   message("Input validation passed: all source files found.")
+
+  # Guard: confirm the feature matrix contains every column the loaded models
+  # expect. The full CSV (s2_week13_feature_matrix_full.csv) is produced by a
+  # manual export step after run_week13_pipeline() and can become stale when R/27
+  # adds new features. A stale CSV causes a cryptic "undefined columns selected"
+  # error inside .score_all_prospects(); this check surfaces the problem with an
+  # actionable message before any scoring begins.
+  feature_df <- tryCatch(
+    readr::read_csv(PATH_FEATURES, show_col_types = FALSE, n_max = 1L),
+    error = function(e) NULL
+  )
+  models_check <- tryCatch(readRDS(PATH_MODELS), error = function(e) NULL)
+
+  if (!is.null(feature_df) && !is.null(models_check)) {
+    csv_cols <- names(feature_df)
+    missing_by_pos <- purrr::map(POSITIONS, function(pos) {
+      base_cols <- models_check$base_feature_cols[[pos]]
+      enr_cols  <- c(base_cols, ENRICHED_ONLY_COLS)
+      setdiff(enr_cols, csv_cols)
+    })
+    names(missing_by_pos) <- POSITIONS
+    any_missing <- any(purrr::map_lgl(missing_by_pos, ~ length(.x) > 0L))
+
+    if (any_missing) {
+      missing_report <- purrr::imap_chr(missing_by_pos, function(cols, pos) {
+        if (length(cols) == 0L) return(NULL)
+        glue::glue("  {pos}: {paste(cols, collapse = ', ')}")
+      })
+      missing_report <- missing_report[!purrr::map_lgl(missing_report, is.null)]
+      stop(glue::glue(
+        "\nFeature matrix is STALE -- the following columns are expected by the ",
+        "models but missing from:\n  {PATH_FEATURES}\n\n",
+        "Missing columns by position:\n",
+        "{paste(missing_report, collapse = '\n')}\n\n",
+        "Fix: delete the stale CSV and regenerate it with the extended pipeline.\n",
+        "See the R/28 header for the export procedure."
+      ), call. = FALSE)
+    }
+    message(glue::glue(
+      "Feature matrix column check: all model columns present in CSV."
+    ))
+  }
 }
 
 

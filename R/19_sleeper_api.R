@@ -78,8 +78,8 @@ library(here)
 SLEEPER_BASE_URL <- "https://api.sleeper.app/v1"
 
 # Most recently completed NFL regular season.
-# Update to 2026 when the 2026 season completes.
-CURRENT_NFL_SEASON <- 2025L
+# Update to 2027 when the 2027 season completes.
+CURRENT_NFL_SEASON <- 2026L
 
 # Cache directory -- shared with R/15 and R/16 pipeline artifacts
 SLEEPER_CACHE_DIR <- here::here("data", "season2_cache")
@@ -424,6 +424,69 @@ get_sleeper_rosters <- function(league_id) {
   message(glue("  {n_teams} teams | {n_players} total rostered player-slots"))
 
   return(roster_rows)
+}
+
+
+# ==============================================================================
+# SECTION 5B: GET LEAGUE USERS
+# ==============================================================================
+
+#' Fetch the users (teams) in a Sleeper league
+#'
+#' @description
+#' Maps each roster owner to a human-readable team name. Sleeper stores an
+#' optional custom team name in metadata$team_name; when it is absent or empty,
+#' the owner's display_name is used instead. One row per league user.
+#'
+#' @param league_id Character. Sleeper league ID.
+#'
+#' @return A tibble with columns:
+#'   \describe{
+#'     \item{owner_id}{Character. Sleeper user_id of the team owner. Joins to
+#'       the owner_id column of get_sleeper_rosters().}
+#'     \item{team_name}{Character. Custom team name if set, else display_name.}
+#'     \item{display_name}{Character. The owner's Sleeper display name.}
+#'   }
+#'   Returns a zero-row tibble (not NULL) if the request fails or returns
+#'   nothing, so callers can left_join without special-casing NULL.
+#'
+#' @examples
+#' \dontrun{
+#' users   <- get_league_users("YOUR_LEAGUE_ID")
+#' rosters <- get_sleeper_rosters("YOUR_LEAGUE_ID")
+#' # Attach the team name to each rostered player:
+#' dplyr::left_join(rosters, users, by = "owner_id")
+#' }
+#'
+#' @seealso get_sleeper_rosters, connect_sleeper_league
+#' @export
+get_league_users <- function(league_id) {
+
+  league_id <- as.character(league_id)
+
+  raw <- .sleeper_get(glue("/league/{league_id}/users"))
+
+  empty <- tibble::tibble(
+    owner_id     = character(0),
+    team_name    = character(0),
+    display_name = character(0)
+  )
+
+  if (is.null(raw) || length(raw) == 0L) {
+    warning(glue("No users returned for league {league_id}."), call. = FALSE)
+    return(empty)
+  }
+
+  purrr::map_dfr(raw, function(u) {
+    disp  <- u$display_name %||% NA_character_
+    tname <- u$metadata$team_name %||% NA_character_
+    team  <- if (!is.na(tname) && nzchar(tname)) tname else disp
+    tibble::tibble(
+      owner_id     = u$user_id %||% NA_character_,
+      team_name    = team,
+      display_name = disp
+    )
+  })
 }
 
 
@@ -1092,6 +1155,12 @@ map_sleeper_scoring <- function(league_id) {
         team              = p$team        %||% NA_character_,
         age               = as.integer(p$age %||% NA_integer_),
         status            = p$status     %||% NA_character_,
+        # injury_status: consumed by R/35 .resolve_roster_gsis().
+        # depth_chart_order: consumed by R/31 .merge_sleeper_depth_overrides().
+        # Both exist on Sleeper's /players/nfl objects but were dropped when this
+        # fetch was slimmed; NA when Sleeper has no value for the player.
+        injury_status     = p$injury_status %||% NA_character_,
+        depth_chart_order = as.integer(p$depth_chart_order %||% NA_integer_),
         gsis_id           = p$gsis_id    %||% NA_character_,
         years_exp         = as.integer(p$years_exp %||% NA_integer_)
       )
@@ -1109,6 +1178,42 @@ map_sleeper_scoring <- function(league_id) {
   ))
 
   return(player_tbl)
+}
+
+
+#' Fetch All Sleeper NFL Players (consumer-ready)
+#'
+#' @description
+#' Public adapter over [.get_sleeper_players()]. The raw fetch returns Sleeper's
+#' field names (gsis_id, full_name, team, status, ...). Downstream consumers in
+#' R/29, R/31, and R/35 expect a normalized contract: nfl_gsis_id, player_name,
+#' and a logical is_free_agent. This wrapper adds those three columns and leaves
+#' the originals intact.
+#'
+#' is_free_agent is derived as is.na(team): Sleeper assigns no team to free
+#' agents. This matches how .merge_sleeper_roster() treats the flag (a TRUE
+#' is_free_agent maps the player's team to NA).
+#'
+#' Network/endpoint failures propagate from .get_sleeper_players(); callers wrap
+#' this in tryCatch and fall back to the nflreadr roster when it errors.
+#'
+#' @param force_refresh Logical. Force re-download even if cache exists.
+#'   Default FALSE.
+#' @return A tibble with all columns from [.get_sleeper_players()] plus
+#'   nfl_gsis_id, player_name, and is_free_agent.
+#' @seealso [.get_sleeper_players()], match_sleeper_players
+#' @export
+get_all_sleeper_players <- function(force_refresh = FALSE) {
+  players <- .get_sleeper_players(force_refresh = force_refresh)
+
+  # Normalize to the downstream consumer contract. Base assignment (not a
+  # dplyr mutate) so this never depends on dplyr being attached and keeps the
+  # original Sleeper columns available to any other caller.
+  players$nfl_gsis_id   <- players$gsis_id
+  players$player_name   <- players$full_name
+  players$is_free_agent <- is.na(players$team)
+
+  players
 }
 
 
@@ -1458,7 +1563,7 @@ match_sleeper_players <- function(sleeper_player_ids,
 #'
 #' @param username Character. Sleeper username (not display name). The username
 #'   is visible in your Sleeper profile URL: sleeper.app/user/{username}.
-#' @param season Integer. NFL season year. Default: CURRENT_NFL_SEASON (2025).
+#' @param season Integer. NFL season year. Default: CURRENT_NFL_SEASON (2026).
 #'
 #' @return A tibble with one row per league:
 #'   \describe{
@@ -1542,194 +1647,4 @@ get_user_leagues <- function(username, season = CURRENT_NFL_SEASON) {
 
   message(glue("  {nrow(leagues_tbl)} league(s) found for season {season}."))
   return(leagues_tbl)
-}
-
-# ==============================================================================
-# SECTION 10: ALL PLAYERS (FRESH ROSTER REFRESH)
-# ==============================================================================
-#
-# Added Week 15 (Phase 4): provides an authoritative current-team data source
-# for downstream projection pipelines. nflreadr::load_rosters() depends on PFR
-# which lags 1-4 weeks behind actual NFL roster moves during the offseason.
-# Sleeper updates its player database within hours. Use this function as the
-# canonical "who plays for whom right now" lookup.
-#
-# ==============================================================================
-
-#' Pull All NFL Players from Sleeper with Current Team Assignments
-#'
-#' @description
-#' Fetches the complete NFL player database from Sleeper's /players/nfl
-#' endpoint, returning a tidy tibble with current team assignments, depth
-#' chart positions, status flags, and free-agent detection.
-#'
-#' WHY: nflreadr::load_rosters() pulls from PFR which lags 1-4 weeks during
-#' the offseason. Sleeper updates within hours of any trade, signing, or
-#' release. For projection pipelines built during the offseason, Sleeper is
-#' the authoritative current-roster source.
-#'
-#' CACHING: The /players/nfl endpoint returns approximately 10MB of JSON
-#' covering ~10,000 player records. Sleeper documentation recommends calling
-#' it at most once per day. This function caches the result locally and
-#' refreshes only when the cache is older than max_cache_age_hours.
-#'
-#' FREE AGENT DETECTION: Players with team = NA in Sleeper are free agents
-#' (not on any active NFL roster). The is_free_agent column is provided as
-#' a convenience flag for downstream filtering.
-#'
-#' @param cache_path Character. Path to the RDS cache file.
-#'   Default: data/season2_cache/sleeper_players.rds
-#' @param max_cache_age_hours Numeric. Maximum cache age in hours before
-#'   triggering an automatic refresh. Default 24.
-#' @param force_refresh Logical. Force endpoint hit even if cache is fresh.
-#'
-#' @return A tibble with one row per Sleeper player record. Columns:
-#'   \describe{
-#'     \item{sleeper_player_id}{Character. Sleeper's internal player ID.}
-#'     \item{nfl_gsis_id}{Character. nflfastR-compatible GSIS ID. NA when
-#'       Sleeper has no mapping (typically very recent rookies or undrafted
-#'       FAs that haven't been cross-referenced yet).}
-#'     \item{player_name}{Character. Full name.}
-#'     \item{position}{Character. QB/RB/WR/TE/K/DEF/LB/CB/etc.}
-#'     \item{team}{Character. NFL team abbreviation, or NA if free agent.}
-#'     \item{status}{Character. Active / Inactive / Injured Reserve / etc.}
-#'     \item{injury_status}{Character. Injury designation if any.}
-#'     \item{depth_chart_position}{Character. Sleeper's depth-chart position.}
-#'     \item{depth_chart_order}{Integer. 1 = starter, 2 = backup, etc.}
-#'     \item{years_exp}{Integer. NFL experience.}
-#'     \item{age}{Integer. Player age.}
-#'     \item{is_free_agent}{Logical. TRUE if team is NA.}
-#'   }
-#'
-#' @examples
-#' \dontrun{
-#' # Standard call -- uses cache if fresh
-#' players <- get_all_sleeper_players()
-#'
-#' # Force a fresh pull after a big trade
-#' players <- get_all_sleeper_players(force_refresh = TRUE)
-#'
-#' # Find skill-position free agents (Tyreek Hill, etc.)
-#' players %>%
-#'   dplyr::filter(is_free_agent,
-#'                  position %in% c("QB", "RB", "WR", "TE"),
-#'                  status == "Active")
-#'
-#' # Compare Sleeper to nflreadr to find stale team assignments
-#' nflreadr_roster <- nflreadr::load_rosters(seasons = 2026L)
-#' discrepancies <- nflreadr_roster %>%
-#'   dplyr::inner_join(players, by = c("gsis_id" = "nfl_gsis_id")) %>%
-#'   dplyr::filter(team.x != team.y | (is.na(team.y) & !is.na(team.x)))
-#' }
-#'
-#' @seealso match_sleeper_players, connect_sleeper_league
-#' @export
-get_all_sleeper_players <- function(
-    cache_path = here::here("data", "season2_cache", "sleeper_players.rds"),
-    max_cache_age_hours = 24,
-    force_refresh = FALSE) {
-
-  # ---- Cache check ----
-  use_cache <- !isTRUE(force_refresh) && file.exists(cache_path)
-
-  if (use_cache) {
-    cache_age_hours <- as.numeric(
-      difftime(Sys.time(), file.info(cache_path)$mtime, units = "hours")
-    )
-    if (cache_age_hours <= max_cache_age_hours) {
-      message(glue(
-        "  Loading Sleeper players from cache ",
-        "(age: {format(round(cache_age_hours, 1), nsmall = 1)}h, ",
-        "max: {max_cache_age_hours}h)"
-      ))
-      return(readRDS(cache_path))
-    }
-    message(glue(
-      "  Cache is stale ",
-      "(age: {format(round(cache_age_hours, 1), nsmall = 1)}h). ",
-      "Refreshing from Sleeper."
-    ))
-  }
-
-  # ---- Endpoint hit ----
-  message("  Fetching all NFL players from Sleeper (large payload, ~10MB)...")
-  raw <- .sleeper_get("/players/nfl", timeout_sec = 120L)
-
-  if (is.null(raw)) {
-    # Endpoint failed -- fall back to stale cache if available
-    if (file.exists(cache_path)) {
-      warning(glue(
-        "Sleeper /players/nfl endpoint failed. ",
-        "Falling back to stale cache: {cache_path}"
-      ), call. = FALSE)
-      return(readRDS(cache_path))
-    }
-    stop("Sleeper /players/nfl endpoint failed and no cache available.",
-         call. = FALSE)
-  }
-
-  message(glue("  Parsing {format(length(raw), big.mark = ',')} player records..."))
-
-  # ---- Helpers: safe scalar extraction (handles NULL and empty strings) ----
-  .pluck_chr <- function(p, field) {
-    val <- p[[field]]
-    if (is.null(val) || length(val) == 0L) return(NA_character_)
-    val <- as.character(val)[1]
-    if (nchar(trimws(val)) == 0L) return(NA_character_)
-    val
-  }
-
-  .pluck_int <- function(p, field) {
-    val <- p[[field]]
-    if (is.null(val) || length(val) == 0L) return(NA_integer_)
-    suppressWarnings(as.integer(val)[1])
-  }
-
-  # ---- Build tibble column-wise (faster than imap_dfr for ~10K rows) ----
-  players_tbl <- tibble::tibble(
-    sleeper_player_id    = names(raw),
-    nfl_gsis_id          = purrr::map_chr(raw, .pluck_chr, "gsis_id"),
-    player_name          = purrr::map_chr(raw, function(p) {
-      full <- .pluck_chr(p, "full_name")
-      if (!is.na(full)) return(full)
-      first <- .pluck_chr(p, "first_name")
-      last  <- .pluck_chr(p, "last_name")
-      first <- if (is.na(first)) "" else first
-      last  <- if (is.na(last))  "" else last
-      nm <- trimws(paste(first, last))
-      if (nchar(nm) == 0L) NA_character_ else nm
-    }),
-    position             = purrr::map_chr(raw, .pluck_chr, "position"),
-    team                 = purrr::map_chr(raw, .pluck_chr, "team"),
-    status               = purrr::map_chr(raw, .pluck_chr, "status"),
-    injury_status        = purrr::map_chr(raw, .pluck_chr, "injury_status"),
-    depth_chart_position = purrr::map_chr(raw, .pluck_chr, "depth_chart_position"),
-    depth_chart_order    = purrr::map_int(raw, .pluck_int, "depth_chart_order"),
-    years_exp            = purrr::map_int(raw, .pluck_int, "years_exp"),
-    age                  = purrr::map_int(raw, .pluck_int, "age")
-  ) %>%
-    dplyr::mutate(is_free_agent = is.na(.data$team))
-
-  # ---- Save cache ----
-  dir.create(dirname(cache_path), recursive = TRUE, showWarnings = FALSE)
-  saveRDS(players_tbl, cache_path)
-
-  # ---- Summary ----
-  n_total     <- nrow(players_tbl)
-  n_with_gsis <- sum(!is.na(players_tbl$nfl_gsis_id))
-  n_fa        <- sum(players_tbl$is_free_agent, na.rm = TRUE)
-  n_active_skill_fa <- sum(
-    players_tbl$is_free_agent &
-      players_tbl$status == "Active" &
-      players_tbl$position %in% c("QB", "RB", "WR", "TE"),
-    na.rm = TRUE
-  )
-
-  message(glue("  Pulled {format(n_total, big.mark = ',')} player records"))
-  message(glue("  With gsis_id mapping: {format(n_with_gsis, big.mark = ',')}"))
-  message(glue("  Free agents total:    {format(n_fa, big.mark = ',')} ",
-               "({n_active_skill_fa} Active at QB/RB/WR/TE)"))
-  message(glue("  Cached: {cache_path}"))
-
-  players_tbl
 }
