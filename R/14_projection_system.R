@@ -123,20 +123,37 @@ CI_80_Z <- 1.282
 # Positions handled by this system
 SUPPORTED_POSITIONS <- c("QB", "RB", "WR")
 
-# Ensemble model artifact paths (produced by 13_ensemble_pipeline.R)
-ENSEMBLE_PATHS <- list(
-  QB = here::here("output", "week11_ensemble_passer_2025.rds"),
-  RB = here::here("output", "week11_ensemble_rusher_2025.rds"),
-  WR = here::here("output", "week11_ensemble_receiver_2025.rds")
-)
+# Ensemble model artifact paths (produced by 13_ensemble_pipeline.R).
+# Parameterized by season so backtesting season S loads season-S artifacts
+# rather than always loading the 2025 models.
+ensemble_paths <- function(season = 2025L) {
+  list(
+    QB = here::here("output", glue("week11_ensemble_passer_{season}.rds")),
+    RB = here::here("output", glue("week11_ensemble_rusher_{season}.rds")),
+    WR = here::here("output", glue("week11_ensemble_receiver_{season}.rds"))
+  )
+}
 
-BOOM_BUST_PATHS <- list(
-  QB = here::here("output", "week12_boom_bust_passer_2025.rds"),
-  RB = here::here("output", "week12_boom_bust_rusher_2025.rds"),
-  WR = here::here("output", "week12_boom_bust_receiver_2025.rds")
-)
+boom_bust_paths <- function(season = 2025L) {
+  list(
+    QB = here::here("output", glue("week12_boom_bust_passer_{season}.rds")),
+    RB = here::here("output", glue("week12_boom_bust_rusher_{season}.rds")),
+    WR = here::here("output", glue("week12_boom_bust_receiver_{season}.rds"))
+  )
+}
 
-FEATURE_MATRIX_PATH <- here::here("output", "ml_data_2025.rds")
+feature_matrix_path <- function(season = 2025L) {
+  here::here("output", glue("ml_data_{season}.rds"))
+}
+
+# Backward-compatible default-season (2025) path objects
+ENSEMBLE_PATHS      <- ensemble_paths()
+BOOM_BUST_PATHS     <- boom_bust_paths()
+FEATURE_MATRIX_PATH <- feature_matrix_path()
+
+# Per-session cache for nflreadr rosters (one entry per season), used by
+# resolve_player_positions() to avoid repeated roster downloads.
+.roster_cache_env <- new.env(parent = emptyenv())
 
 # ==============================================================================
 # INTERNAL HELPERS (not exported)
@@ -185,25 +202,29 @@ load_artifact <- function(path, label) {
 
 #' Load all ensemble models, with presence check
 #'
+#' @param season Integer. Season whose model artifacts to load. Default 2025.
 #' @return Named list with elements QB, RB, WR.
 #' @keywords internal
-load_ensemble_models <- function() {
+load_ensemble_models <- function(season = 2025L) {
+  paths <- ensemble_paths(season)
   list(
-    QB = load_artifact(ENSEMBLE_PATHS$QB, "QB ensemble (passer)"),
-    RB = load_artifact(ENSEMBLE_PATHS$RB, "RB ensemble (rusher)"),
-    WR = load_artifact(ENSEMBLE_PATHS$WR, "WR ensemble (receiver)")
+    QB = load_artifact(paths$QB, glue("QB ensemble (passer, {season})")),
+    RB = load_artifact(paths$RB, glue("RB ensemble (rusher, {season})")),
+    WR = load_artifact(paths$WR, glue("WR ensemble (receiver, {season})"))
   )
 }
 
 #' Load all boom/bust classification models
 #'
+#' @param season Integer. Season whose model artifacts to load. Default 2025.
 #' @return Named list with elements QB, RB, WR.
 #' @keywords internal
-load_boom_bust_models <- function() {
+load_boom_bust_models <- function(season = 2025L) {
+  paths <- boom_bust_paths(season)
   list(
-    QB = load_artifact(BOOM_BUST_PATHS$QB, "QB boom/bust classifier"),
-    RB = load_artifact(BOOM_BUST_PATHS$RB, "RB boom/bust classifier"),
-    WR = load_artifact(BOOM_BUST_PATHS$WR, "WR boom/bust classifier")
+    QB = load_artifact(paths$QB, glue("QB boom/bust classifier ({season})")),
+    RB = load_artifact(paths$RB, glue("RB boom/bust classifier ({season})")),
+    WR = load_artifact(paths$WR, glue("WR boom/bust classifier ({season})"))
   )
 }
 
@@ -435,9 +456,10 @@ derive_opponent_difficulty <- function(feature_matrix,
 #' WRs/TEs with rush attempts land in "rusher". Users need the real NFL
 #' position for filtering (e.g. TE-premium leagues, flex decisions).
 #'
-#' This function loads the nflreadr roster once per call and caches the result
-#' in the calling environment. Network cost: one HTTP request to nflreadr's
-#' GitHub-hosted roster CSV per unique season requested.
+#' This function caches the nflreadr roster per season in a file-local
+#' environment (.roster_cache_env), so repeated calls within a session make
+#' at most one HTTP request to nflreadr's GitHub-hosted roster CSV per
+#' unique season requested.
 #'
 #' @param player_ids Character vector. GSIS player IDs to resolve.
 #' @param season Integer. NFL season year. Default 2025.
@@ -459,21 +481,29 @@ resolve_player_positions <- function(player_ids, season = 2025L) {
     ))
   }
 
-  # Load roster -- single network call per invocation
-  cat(glue(
-    "[resolve_player_positions] Loading {season} roster from nflreadr...\n\n"
-  ))
-
-  roster <- tryCatch(
-    nflreadr::load_rosters(seasons = season),
-    error = function(e) {
-      warning(glue(
-        "resolve_player_positions: failed to load roster for season {season}: ",
-        "{conditionMessage(e)}. Returning NA positions."
-      ))
-      NULL
+  # Load roster -- served from the per-session cache when available, so the
+  # network call happens at most once per season per session.
+  cache_key <- as.character(season)
+  if (exists(cache_key, envir = .roster_cache_env, inherits = FALSE)) {
+    roster <- get(cache_key, envir = .roster_cache_env)
+  } else {
+    cat(glue(
+      "[resolve_player_positions] Loading {season} roster from nflreadr...\n\n"
+    ))
+    roster <- tryCatch(
+      nflreadr::load_rosters(seasons = season),
+      error = function(e) {
+        warning(glue(
+          "resolve_player_positions: failed to load roster for season {season}: ",
+          "{conditionMessage(e)}. Returning NA positions."
+        ))
+        NULL
+      }
+    )
+    if (!is.null(roster)) {
+      assign(cache_key, roster, envir = .roster_cache_env)
     }
-  )
+  }
 
   if (is.null(roster)) {
     return(tibble::tibble(
@@ -483,17 +513,18 @@ resolve_player_positions <- function(player_ids, season = 2025L) {
   }
 
   # nflreadr roster uses gsis_id as the player identifier and position for
-
   # the canonical NFL position (QB, RB, WR, TE, etc.)
-  # Deduplicate: a player can appear on multiple roster snapshots within a
-  # season (e.g. traded mid-season). Take the most recent entry.
+  # Deduplicate: a player can appear on multiple roster rows (e.g. traded
+  # mid-season). load_rosters() has no week column (that is
+  # load_rosters_weekly()), so order by season descending to keep the most
+  # recent entry before distinct().
   roster_lookup <- roster %>%
     dplyr::filter(
       !is.na(gsis_id),
       !is.na(position),
       position %in% c("QB", "RB", "WR", "TE")
     ) %>%
-    dplyr::arrange(gsis_id, dplyr::desc(week)) %>%
+    dplyr::arrange(gsis_id, dplyr::desc(season)) %>%
     dplyr::distinct(gsis_id, .keep_all = TRUE) %>%
     dplyr::select(player_id = gsis_id, player_position = position)
 
@@ -823,7 +854,10 @@ generate_preseason_projections <- function(prior_season_stats,
 #'   - projected_ppr_upper_95 (dbl)
 #'   - projected_ppr_lower_80 (dbl)
 #'   - projected_ppr_upper_80 (dbl)
-#'   - projected_ppr_sd (dbl)
+#'   - projected_ppr_sd (dbl): Recomputed each week from
+#'     projected_ppr_sd_base with the current week's factor (not compounded)
+#'   - projected_ppr_sd_base (dbl): Original SD captured at first update;
+#'     carried forward unchanged
 #'   - ensemble_prediction (dbl): Raw ensemble point estimate this week
 #'   - prior_weight (dbl): Weight applied to prior this week
 #'   - observed_weight (dbl): Weight applied to ensemble (1 - prior_weight)
@@ -1014,6 +1048,14 @@ update_weekly_projections <- function(prior_projections,
       dplyr::mutate(ensemble_prediction = NA_real_)
   }
 
+  # Base SD: captured once (first update call) from the incoming projection SD
+  # and carried forward unchanged. The weekly uncertainty factor is applied to
+  # this base, never to the prior week's already-scaled SD.
+  if (!"projected_ppr_sd_base" %in% names(updated)) {
+    updated <- updated %>%
+      dplyr::mutate(projected_ppr_sd_base = projected_ppr_sd)
+  }
+
   updated <- updated %>%
     dplyr::mutate(
       week       = as.integer(current_week),
@@ -1034,11 +1076,14 @@ update_weekly_projections <- function(prior_projections,
         pw * projected_ppr_per_game + ow * ensemble_prediction
       ),
 
-      # Uncertainty: narrows as observed weight increases, widens slightly for byes
+      # Uncertainty: narrows as observed weight increases, widens slightly for
+      # byes. Recomputed each week from the base SD with the CURRENT week's
+      # factor applied once -- multiplying the prior week's already-scaled SD
+      # compounded the shrink (~0.85^18 of the base by week 18).
       projected_ppr_sd = dplyr::if_else(
         is_bye_week,
-        projected_ppr_sd * 1.10,
-        projected_ppr_sd * (pw + ow * 0.85)
+        projected_ppr_sd_base * 1.10,
+        projected_ppr_sd_base * (pw + ow * 0.85)
       ),
 
       projected_ppr_lower_95 = pmax(
@@ -1073,6 +1118,7 @@ update_weekly_projections <- function(prior_projections,
       projected_ppr_lower_80,
       projected_ppr_upper_80,
       projected_ppr_sd,
+      projected_ppr_sd_base,
       ensemble_prediction,
       prior_weight,
       observed_weight,
@@ -1631,10 +1677,14 @@ create_projection_report <- function(weekly_projections,
 #'   playoff games and will be filtered out.
 #' @param preseason_stats Tibble. Prior-season player statistics for building
 #'   the initial prior. Passed to generate_preseason_projections().
-#' @param ensemble_models Named list. Output of load_ensemble_models().
-#' @param boom_bust_models Named list. Output of load_boom_bust_models().
+#' @param ensemble_models Named list. Output of load_ensemble_models(season).
+#'   Default NULL: loads the artifacts for backtest_season, so backtesting
+#'   2024 uses 2024 models rather than silently loading 2025 models.
+#' @param boom_bust_models Named list. Output of load_boom_bust_models(season).
+#'   Default NULL: loads the artifacts for backtest_season.
 #' @param backtest_season Integer. Season year being backtested. Used for
-#'   labelling and loading the correct bye week schedule.
+#'   labelling, loading the correct bye week schedule, and (when the model
+#'   arguments are NULL) selecting season-matched model artifacts.
 #' @param bye_week_schedule Named integer vector. Player bye weeks.
 #'   Names = player_id, values = bye week number. Default NULL.
 #' @param positions Character vector. Positions to evaluate. Default
@@ -1682,8 +1732,8 @@ create_projection_report <- function(weekly_projections,
 #' @export
 backtest_projections <- function(feature_matrix,
                                  preseason_stats,
-                                 ensemble_models,
-                                 boom_bust_models,
+                                 ensemble_models  = NULL,
+                                 boom_bust_models = NULL,
                                  backtest_season,
                                  bye_week_schedule   = NULL,
                                  positions           = SUPPORTED_POSITIONS,
@@ -1693,9 +1743,18 @@ backtest_projections <- function(feature_matrix,
   stopifnot(
     is.data.frame(feature_matrix),
     is.data.frame(preseason_stats),
-    is.list(ensemble_models),
     is.numeric(backtest_season)
   )
+
+  # Load season-matched model artifacts when not supplied: backtesting 2024
+  # must use 2024-trained models, not the default 2025 artifacts.
+  if (is.null(ensemble_models)) {
+    ensemble_models <- load_ensemble_models(backtest_season)
+  }
+  if (is.null(boom_bust_models)) {
+    boom_bust_models <- load_boom_bust_models(backtest_season)
+  }
+  stopifnot(is.list(ensemble_models))
 
   required_fm_cols <- c("player_id", "week")
   missing_fm <- setdiff(required_fm_cols, names(feature_matrix))
@@ -1788,32 +1847,9 @@ backtest_projections <- function(feature_matrix,
       bye_this_week <- character(0)
     }
 
-    # Last-week baseline: actual score from previous week
-    if (i > 1) {
-      last_wk_actual <- feature_matrix %>%
-        dplyr::filter(week == available_weeks[i - 1]) %>%
-        dplyr::distinct(player_id, .keep_all = TRUE) %>%
-        dplyr::select(player_id, last_week_actual = ppr_points_actual)
-    } else {
-      last_wk_actual <- feature_matrix %>%
-        dplyr::filter(week == wk) %>%
-        dplyr::distinct(player_id, .keep_all = TRUE) %>%
-        dplyr::select(player_id) %>%
-        dplyr::mutate(last_week_actual = NA_real_)
-    }
-
-    # Season-to-date average baseline (expanding window, no leakage)
-    # Uses weeks BEFORE current week only
-    season_avg_baseline <- feature_matrix %>%
-      dplyr::filter(week < wk) %>%
-      dplyr::distinct(player_id, week, .keep_all = TRUE) %>%
-      dplyr::group_by(player_id) %>%
-      dplyr::summarise(
-        season_avg_to_date = mean(ppr_points_actual, na.rm = TRUE),
-        .groups = "drop"
-      )
-
-    # Update projections for this week
+    # Update projections for this week. The ensemble models predict NEXT
+    # week's PPR from week-wk features, so current_projections after this
+    # call is a forecast for week wk + 1.
     current_projections <- tryCatch(
       update_weekly_projections(
         prior_projections = current_projections,
@@ -1832,18 +1868,47 @@ backtest_projections <- function(feature_matrix,
       }
     )
 
-    # Observed outcomes this week
-    observed_wk <- feat_wk %>%
+    # TARGET-WEEK ALIGNMENT: predictions built from week-wk features forecast
+    # week wk + 1, so they are scored against week wk + 1 actuals. Scoring
+    # them against week-wk actuals (the prior behaviour) compared forecasts
+    # to outcomes the features already contained.
+    target_wk <- wk + 1L
+    if (!target_wk %in% available_weeks) {
+      # Final observed week: its forecast targets a week with no data.
+      next
+    }
+
+    # Observed outcomes in the target week
+    observed_target <- feature_matrix %>%
+      dplyr::filter(week == target_wk) %>%
       dplyr::select(player_id, position, ppr_points_actual) %>%
       dplyr::filter(!is.na(ppr_points_actual)) %>%
       dplyr::distinct(player_id, position, .keep_all = TRUE)
 
-    # Join projections to observed
+    # Persistence baseline for a week-(wk+1) target: week-wk actual score
+    last_wk_actual <- feat_wk %>%
+      dplyr::distinct(player_id, .keep_all = TRUE) %>%
+      dplyr::select(player_id, last_week_actual = ppr_points_actual)
+
+    # Season-to-date average baseline (expanding window, no leakage):
+    # uses weeks up to and including wk -- all strictly before the target week
+    season_avg_baseline <- feature_matrix %>%
+      dplyr::filter(week <= wk) %>%
+      dplyr::distinct(player_id, week, .keep_all = TRUE) %>%
+      dplyr::group_by(player_id) %>%
+      dplyr::summarise(
+        season_avg_to_date = mean(ppr_points_actual, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    # Join projections to target-week observed outcomes
     eval_wk <- current_projections %>%
-      dplyr::inner_join(observed_wk, by = c("player_id", "position")) %>%
+      dplyr::inner_join(observed_target, by = c("player_id", "position")) %>%
       dplyr::left_join(last_wk_actual,     by = "player_id") %>%
       dplyr::left_join(season_avg_baseline, by = "player_id") %>%
       dplyr::mutate(
+        # Label rows by the week being scored (the target week)
+        week              = as.integer(target_wk),
         error_ensemble    = projected_ppr_per_game - ppr_points_actual,
         error_last_week   = last_week_actual - ppr_points_actual,
         error_season_avg  = dplyr::coalesce(season_avg_to_date, projected_ppr_per_game) -
@@ -1923,9 +1988,13 @@ backtest_projections <- function(feature_matrix,
     cat(glue(
       "  FINDING: Ensemble does not beat both baselines in late season.\n",
       "  This is a documented result, not a failure to hide.\n",
-      "  Possible causes: feature leakage audit incomplete (Week 10 deferred),\n",
-      "  role_stability_flag not applied to training rows (Issue 6 in audit),\n",
-      "  or many-to-many join producing duplicate training rows.\n\n"
+      "  NOTE: results produced before the target-week alignment fix scored\n",
+      "  week-wk-feature predictions (forecasts of week wk+1) against week-wk\n",
+      "  actuals -- a misalignment that understated the ensemble and made\n",
+      "  baseline comparisons incoherent. Re-run before drawing conclusions.\n",
+      "  Other possible causes: feature leakage audit incomplete (Week 10\n",
+      "  deferred), role_stability_flag not applied to training rows (Issue 6\n",
+      "  in audit), or many-to-many join producing duplicate training rows.\n\n"
     ))
   }
 

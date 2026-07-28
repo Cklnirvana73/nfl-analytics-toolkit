@@ -25,22 +25,31 @@
 #
 # REDRAFT VS DYNASTY: HARD BRANCH (not a blend)
 # ---------------------------------------------
-# A league with Sleeper taxi_slots > 0 is dynasty; otherwise redraft. The
-# branch sets the aging horizon (1 season redraft, 3 seasons dynasty) and the
-# rookie discount (steeper for redraft, since an unproven rookie has fewer
-# games to return value in a one-season window).
+# Sleeper settings$type is authoritative (0 = redraft, 1 = keeper, 2 =
+# dynasty; keeper and dynasty both carry forward value), with taxi_slots > 0
+# as a fallback only when type is missing -- the same detection logic as
+# R/35's build_league_source. The branch sets the aging horizon (1 season
+# redraft, 3 seasons dynasty) and the rookie discount (steeper for redraft,
+# since an unproven rookie has fewer games to return value in a one-season
+# window).
 #
-# THE AGING MULTIPLIER (the one piece of real math here)
+# THE AGING ADJUSTMENT (the one piece of real math here)
 # ------------------------------------------------------
 # R/23 curves are CUMULATIVE fantasy-points-per-game deltas anchored at age
 # 23 = 0. They are additive, can be negative, and cross zero, so a ratio of
-# curve values is unstable. Instead the expected fppg change over the horizon
-# is divided by the player's own absolute projection (r32_posterior_mu) to get
-# the fraction of production retained or gained:
+# curve values is unstable. The expected fppg change over the horizon is
+# applied ADDITIVELY to the value basis -- VORP is denominated in PPG over
+# replacement, so an absolute PPG delta adds directly:
 #
 #   curve_delta_s    = curve(age + s) - curve(age)        for s in 1..horizon
 #   mean_delta       = mean(curve_delta_s)                 (average over horizon)
-#   aging_multiplier = 1 + mean_delta / r32_posterior_mu   (clipped)
+#   adjusted_value   = max(0, max(0, adjusted_vorp) + mean_delta)
+#   aging_multiplier = adjusted_value / max(0, adjusted_vorp)  (clipped)
+#   trade_value      = max(0, adjusted_vorp) * aging_multiplier
+#
+# (An earlier formulation formed 1 + mean_delta / r32_posterior_mu, a ratio to
+# the player's own projection; that made an identical absolute PPG decline hit
+# low producers hardest, which is backwards, and was replaced.)
 #
 # A 22-year-old still climbing gets a multiplier above 1.0 (dynasty rewards
 # this). A 31-year-old RB on the decline gets a multiplier well below 1.0.
@@ -152,13 +161,27 @@ AGING_MULTIPLIER_DYNASTY_CEILING <- 1.35
 ROOKIE_DISCOUNT_REDRAFT <- 0.60
 ROOKIE_DISCOUNT_DYNASTY <- 0.85
 
-# Each additional point of 80% interval width shaves this fraction off a
-# rookie's value (uncertainty discount). Floored so it never zeroes out.
-INTERVAL_WIDTH_SCALE        <- 0.10
+# Rookie uncertainty discount: unc = pmax(floor, 1 - cv), where cv is the
+# projection coefficient of variation (sigma / mu, sigma recovered from the
+# 80% interval width as width / (2 * 1.282)). Floored so it never zeroes out.
+# RATIONALE: the previous basis (1 - width * 0.10) used the raw PPG interval
+# width, which exceeds ~5 PPG for virtually every rookie, so the discount sat
+# pinned at the 0.50 floor -- a dead knob. CV normalizes spread by the
+# projection level and actually discriminates between rookies.
 UNCERTAINTY_DISCOUNT_FLOOR  <- 0.50
+
+# z-value bracketing the central 80% of a normal (P10/P90); width = 2 * z * sigma.
+Z_80_INTERVAL <- 1.282
 
 # Verdict band for evaluate_trade, in trade-value points (tunable on first run).
 TRADE_VERDICT_BAND <- 0.5
+
+# Redraft in-season decay: an 18-week NFL schedule yields 17 games per team
+# (one bye). With as_of_week = most recent completed week, the remaining
+# season fraction is (18 - as_of_week) / 18, applied to redraft trade values
+# only (a redraft asset can only return value in the games still left).
+REDRAFT_TOTAL_WEEKS <- 18L
+REDRAFT_TOTAL_GAMES <- 17L
 
 # Five-tier labels assigned by within-league trade_value quantile.
 TV_TIER_BREAKS <- c(0, 0.20, 0.40, 0.65, 0.85, 1.0)
@@ -306,11 +329,13 @@ utils::globalVariables(c(
 
 #' Detect whether a Sleeper league is dynasty (vs redraft)
 #'
-#' Sleeper exposes no explicit dynasty flag. The reliable signal is a taxi
-#' squad: dynasty leagues set taxi_slots > 0. connect_sleeper_league() (R/19)
-#' returns settings as a named list; taxi_slots lives there. If the field is
-#' absent or the API call fails, the league is treated as redraft with a
-#' warning, so the function never blocks an offline run.
+#' Same logic as R/35's build_league_source: Sleeper's settings$type is
+#' authoritative (0 = redraft, 1 = keeper, 2 = dynasty; keeper and dynasty
+#' both carry forward value, so both take the dynasty path). Taxi presence
+#' (taxi_slots > 0 or a TAXI roster slot) is only a fallback for the rare
+#' case where type is missing, because plenty of dynasty leagues run without
+#' a taxi squad. If the API call fails, the league is treated as redraft with
+#' a warning, so the function never blocks an offline run.
 #'
 #' @param league_id Character. Sleeper league ID.
 #' @return Single logical. TRUE if dynasty.
@@ -323,14 +348,24 @@ utils::globalVariables(c(
                  "treating as redraft."), call. = FALSE)
     return(FALSE)
   }
-  taxi <- meta$settings$taxi_slots %||% NA
-  taxi <- suppressWarnings(as.integer(taxi))
-  if (is.na(taxi)) {
-    warning(glue("League {league_id} has no taxi_slots field; ",
-                 "treating as redraft."), call. = FALSE)
-    return(FALSE)
+
+  league_type <- suppressWarnings(as.integer(meta$settings$type %||% NA))
+  if (!is.na(league_type)) {
+    return(league_type != 0L)
   }
-  taxi > 0L
+
+  # Fallbacks when type is missing: taxi squad signals dynasty/keeper.
+  taxi <- suppressWarnings(as.integer(meta$settings$taxi_slots %||% NA))
+  if (!is.na(taxi)) {
+    return(taxi > 0L)
+  }
+  if ("TAXI" %in% (meta$roster_positions %||% character(0))) {
+    return(TRUE)
+  }
+
+  warning(glue("League {league_id} has neither settings$type nor a taxi ",
+               "signal; treating as redraft."), call. = FALSE)
+  FALSE
 }
 
 # ==============================================================================
@@ -374,49 +409,41 @@ utils::globalVariables(c(
 }
 
 # ------------------------------------------------------------------------------
-# .project_aging_multiplier
+# .project_aging_delta
 # ------------------------------------------------------------------------------
 
-#' Fraction of current production an asset retains over a horizon
+#' Expected absolute fppg change over a horizon (aging delta, in PPG)
 #'
-#' Averages the expected fppg change across each season in the horizon, then
-#' expresses it as a multiplier on the player's own absolute projection. See
-#' the file header for the full derivation. Returns 1.0 (age-neutral) when age,
-#' projection, or curve data are unavailable, rather than dropping the player.
+#' Averages the expected fppg change across each season in the horizon and
+#' returns it in absolute PPG. compute_player_trade_values() applies it
+#' ADDITIVELY to the value basis (VORP, itself in PPG over replacement) and
+#' reports the implied, clipped ratio as aging_multiplier. The previous
+#' formulation converted the delta to a multiplier on the player's own
+#' posterior_mu (1 + delta/mu), which made an identical absolute decline hit
+#' low producers hardest -- backwards -- and was replaced. Returns 0
+#' (age-neutral) when age or curve data are unavailable, rather than dropping
+#' the player.
 #'
 #' @param player_age Integer. Age as of Sept 1 of SEASON.
 #' @param position Character. QB/RB/WR/TE.
 #' @param curves Named list. curves_boxscore from R/23.
 #' @param n_seasons Integer. Horizon (1 redraft, 3 dynasty).
-#' @param posterior_mu Numeric. r32_posterior_mu, the absolute projection.
-#' @param is_dynasty Logical. Selects the ceiling clip.
-#' @return Numeric scalar multiplier, clipped to [floor, ceiling].
+#' @return Numeric scalar: expected mean fppg delta over the horizon (PPG).
 #' @keywords internal
-.project_aging_multiplier <- function(player_age, position, curves,
-                                      n_seasons, posterior_mu, is_dynasty) {
-  if (is.na(player_age) || is.na(posterior_mu) || posterior_mu <= 0) {
-    return(1.0)
-  }
-  if (!position %in% names(curves)) return(1.0)
+.project_aging_delta <- function(player_age, position, curves, n_seasons) {
+  if (is.na(player_age)) return(0)
+  if (!position %in% names(curves)) return(0)
   cd <- curves[[position]]$curve_data
   v_now <- .curve_value_at_age(cd, player_age)
-  if (is.na(v_now)) return(1.0)
+  if (is.na(v_now)) return(0)
 
   deltas <- vapply(seq_len(n_seasons), function(s) {
     v_s <- .curve_value_at_age(cd, player_age + s)
     if (is.na(v_s)) NA_real_ else v_s - v_now
   }, numeric(1))
 
-  if (all(is.na(deltas))) return(1.0)
-  mean_delta <- mean(deltas, na.rm = TRUE)
-  mult <- 1 + mean_delta / posterior_mu
-
-  ceiling_clip <- if (isTRUE(is_dynasty)) {
-    AGING_MULTIPLIER_DYNASTY_CEILING
-  } else {
-    AGING_MULTIPLIER_REDRAFT_CEILING
-  }
-  max(AGING_MULTIPLIER_FLOOR, min(ceiling_clip, mult))
+  if (all(is.na(deltas))) return(0)
+  mean(deltas, na.rm = TRUE)
 }
 
 # ==============================================================================
@@ -542,7 +569,8 @@ utils::globalVariables(c(
 #'   Must contain nfl_gsis_id, player_name, team, position, adjusted_vorp,
 #'   r32_posterior_mu, age_at_season_start.
 #' @param rookies Tibble. R/28 prediction-cohort players: nfl_gsis_id,
-#'   player_name, position, score_final, interval_width.
+#'   player_name, position, score_final, interval_width, and (optionally)
+#'   r32_mu (the rookie's own R/32 posterior mean, for the CV discount).
 #' @param curves Named list. curves_boxscore from R/23.
 #' @param league_is_dynasty Logical.
 #' @return Tibble: all veterans and rookies for the league with trade_value and
@@ -563,29 +591,46 @@ compute_player_trade_values <- function(vorp_one_league, rookies, curves,
   }
 
   # ---- Veteran path ----------------------------------------------------------
-  # Compute the multiplier as an explicit vector against the column vectors,
+  # Compute the aging delta as an explicit vector against the column vectors,
   # rather than referencing the .data pronoun inside a nested vapply (which is
   # fragile inside mutate). Then attach the derived columns.
   vets <- vorp_one_league
-  vets$aging_multiplier <- vapply(
+  aging_delta_ppg <- vapply(
     seq_len(nrow(vets)),
-    function(i) .project_aging_multiplier(
-      player_age   = vets$age_at_season_start[i],
-      position     = vets$position[i],
-      curves       = curves,
-      n_seasons    = n_seasons,
-      posterior_mu = vets$r32_posterior_mu[i],
-      is_dynasty   = league_is_dynasty
+    function(i) .project_aging_delta(
+      player_age = vets$age_at_season_start[i],
+      position   = vets$position[i],
+      curves     = curves,
+      n_seasons  = n_seasons
     ),
     numeric(1)
   )
   vets$rookie_flag          <- FALSE
   vets$prospect_score_final <- NA_real_
   # pmax(0, ...) floors below-replacement players at zero trade value before
-  # applying the aging multiplier. Without this, a youth multiplier > 1 on a
-  # negative adjusted_vorp makes the player look worse in dynasty than redraft,
+  # the aging adjustment. Without this, a youth boost on a negative
+  # adjusted_vorp makes the player look worse in dynasty than redraft,
   # which is the opposite of the intended behavior.
-  vets$trade_value          <- pmax(0, vets$adjusted_vorp) * vets$aging_multiplier
+  #
+  # The aging delta is applied ADDITIVELY in PPG to the value basis (VORP is
+  # PPG over replacement, so the units line up); aging_multiplier is retained
+  # as the implied ratio (adjusted / base), clipped to the existing
+  # floor/ceiling so downstream consumers keep the same column semantics.
+  # Zero-base players (already floored to 0) report a neutral multiplier.
+  ceiling_clip <- if (isTRUE(league_is_dynasty)) {
+    AGING_MULTIPLIER_DYNASTY_CEILING
+  } else {
+    AGING_MULTIPLIER_REDRAFT_CEILING
+  }
+  value_base <- pmax(0, vets$adjusted_vorp)
+  implied_mult <- ifelse(
+    value_base > 0,
+    pmax(0, value_base + aging_delta_ppg) / value_base,
+    1
+  )
+  vets$aging_multiplier <- pmin(pmax(implied_mult, AGING_MULTIPLIER_FLOOR),
+                                ceiling_clip)
+  vets$trade_value      <- value_base * vets$aging_multiplier
 
   # ---- Rookie path -----------------------------------------------------------
   # Exclude rookies that already appear as veterans (a rookie who logged enough
@@ -595,26 +640,40 @@ compute_player_trade_values <- function(vorp_one_league, rookies, curves,
                   !is.na(.data$score_final))
 
   if (nrow(rookies) > 0L) {
-    # Median interval width per position, from veterans, to fill rookies that
-    # have no R/32 row of their own.
-    pos_median_width <- vorp_one_league %>%
-      dplyr::mutate(interval_width = .data$r32_projection_upper_80 -
+    # Median FULL 80% interval width (2x the upper half-width) and posterior mu
+    # per position, from veterans, to fill rookies with no R/32 row of their own.
+    pos_medians <- vorp_one_league %>%
+      dplyr::mutate(half_width = .data$r32_projection_upper_80 -
                       .data$r32_posterior_mu) %>%
       dplyr::group_by(.data$position) %>%
-      dplyr::summarise(med_width = stats::median(.data$interval_width,
-                                                 na.rm = TRUE),
-                       .groups = "drop")
+      dplyr::summarise(
+        med_width = 2 * stats::median(.data$half_width, na.rm = TRUE),
+        med_mu    = stats::median(.data$r32_posterior_mu, na.rm = TRUE),
+        .groups = "drop"
+      )
 
     rookie_rows <- purrr::map_dfr(CURVE_POSITIONS_TV, function(pos) {
       pos_rookies <- dplyr::filter(rookies, .data$position == pos)
       if (nrow(pos_rookies) == 0L) return(NULL)
 
       scaled <- .scale_prospect_to_vorp_units(pos_rookies, pos, vorp_one_league)
-      med_w  <- pos_median_width$med_width[pos_median_width$position == pos]
+      med_w  <- pos_medians$med_width[pos_medians$position == pos]
       med_w  <- if (length(med_w) == 0L || is.na(med_w)) 0 else med_w
+      med_mu <- pos_medians$med_mu[pos_medians$position == pos]
+      med_mu <- if (length(med_mu) == 0L || is.na(med_mu)) 1 else med_mu
 
-      iw  <- dplyr::coalesce(pos_rookies$interval_width, med_w)
-      unc <- pmax(UNCERTAINTY_DISCOUNT_FLOOR, 1 - iw * INTERVAL_WIDTH_SCALE)
+      # Coefficient-of-variation uncertainty discount (see constants block):
+      # sigma from the full 80% width, mu from the rookie's own R/32 row when
+      # present, else the veteran position median.
+      iw <- dplyr::coalesce(pos_rookies$interval_width, med_w)
+      sigma_rk <- iw / (2 * Z_80_INTERVAL)
+      mu_rk <- if ("r32_mu" %in% names(pos_rookies)) {
+        dplyr::coalesce(pos_rookies$r32_mu, med_mu)
+      } else {
+        rep(med_mu, nrow(pos_rookies))
+      }
+      cv  <- sigma_rk / pmax(mu_rk, 1)
+      unc <- pmax(UNCERTAINTY_DISCOUNT_FLOOR, 1 - cv)
       tv  <- scaled * rookie_discount * unc
 
       tibble::tibble(
@@ -800,6 +859,12 @@ compute_player_trade_values <- function(vorp_one_league, rookies, curves,
 #' @param username Character. Sleeper username (used to enumerate leagues and
 #'   detect dynasty status). The user never supplies a league_id.
 #' @param season Integer. Season for league lookup. Default SEASON.
+#' @param as_of_week Integer 1-18 or NULL. Most recent completed week. NULL
+#'   (default) = preseason; behavior unchanged. When supplied, REDRAFT league
+#'   trade values are scaled by the remaining-season fraction
+#'   (games_remaining / total games on the 18-week/17-game schedule), since a
+#'   redraft asset can only return value in the games still left. Dynasty
+#'   leagues are never scaled (their value horizon extends beyond this season).
 #' @param force_refit Logical. Force an aging-curve refit. Default FALSE.
 #' @param save_output Logical. Write RDS and CSV. Default TRUE.
 #' @param cache_dir Character. Cache directory. Default CACHE_DIR_DEFAULT.
@@ -810,10 +875,20 @@ compute_player_trade_values <- function(vorp_one_league, rookies, curves,
 #' @export
 build_trade_value_table <- function(username,
                                     season      = SEASON,
+                                    as_of_week  = NULL,
                                     force_refit = FALSE,
                                     save_output = TRUE,
                                     cache_dir   = CACHE_DIR_DEFAULT,
                                     verbose     = TRUE) {
+
+  if (!is.null(as_of_week)) {
+    as_of_week <- as.integer(as_of_week)
+    if (is.na(as_of_week) || as_of_week < 1L ||
+        as_of_week > REDRAFT_TOTAL_WEEKS) {
+      stop(glue("as_of_week must be an integer in 1-{REDRAFT_TOTAL_WEEKS} ",
+                "or NULL."), call. = FALSE)
+    }
+  }
 
   if (verbose) message(glue("Building trade values (schema {SCHEMA_TAG_TV})..."))
 
@@ -870,12 +945,14 @@ build_trade_value_table <- function(username,
       dplyr::transmute(
         nfl_gsis_id,
         interval_width = .data$r32_projection_upper_80 -
-          .data$r32_projection_lower_80
+          .data$r32_projection_lower_80,
+        r32_mu = .data$r32_posterior_mu
       )
     rookies <- rookies %>%
       dplyr::left_join(rk_width, by = "nfl_gsis_id")
   } else {
     rookies$interval_width <- NA_real_
+    rookies$r32_mu         <- NA_real_
   }
 
   # ---- Attach veteran ages once ----------------------------------------------
@@ -899,6 +976,16 @@ build_trade_value_table <- function(username,
       curves            = curves,
       league_is_dynasty = lg_dynasty
     )
+
+    # In-season redraft decay: scale by the remaining-season fraction. A
+    # uniform within-league scaling, so tiers and ranks are unaffected.
+    # Dynasty branch unchanged.
+    if (!is.null(as_of_week) && !isTRUE(lg_dynasty)) {
+      remaining_frac <- (REDRAFT_TOTAL_WEEKS - as_of_week) /
+        REDRAFT_TOTAL_WEEKS
+      league_tv$trade_value <- league_tv$trade_value * remaining_frac
+    }
+
     league_tv <- .assign_tiers_and_ranks(league_tv)
     league_tv$is_dynasty <- lg_dynasty
     league_tv

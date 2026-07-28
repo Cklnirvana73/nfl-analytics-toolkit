@@ -77,7 +77,8 @@
 # RUSH SHARE PRIORS (historical league averages)
 # ----------------------------------------------
 #   RB1 = 0.650, RB2 = 0.250, RB3 = 0.080
-#   QB1 = 0.015 (scramble baseline; mobile QBs adjusted via talent mult.)
+#   QB1 = 0.015 (v3_4: inert legacy for rushing; QB carries now come from a
+#         pooled per-QB rush rate, not this share. See .compute_qb_rush_rate.)
 #   WR/TE end-arounds: minimal, not modeled
 #   Total = 0.995 (small remainder for incidental carries)
 #
@@ -162,10 +163,40 @@
 #   )
 #
 # Author: Christian K. LeBlanc
-# Version: 3.2
+# Version: 3.5
 #
 # CHANGELOG
 # ---------
+# 3.5  Rookie-QB1 rush fallback: no-history QB1s (e.g., rookies entering as
+#      starters) now get a college-tier rate instead of the v3.4 provisional
+#      median. Pool the QB's college rush/game (game-weighted, R/21 CFB panel,
+#      name-normalized via .qb_name_key to collapse split spellings), rank him
+#      against the college QB starter distribution, and map his tier
+#      (mobile/balanced/pocket) to the NFL QB1 pooled rate at the matching
+#      quantile (Q75/median/Q25). The college rate assigns a tier only; it is
+#      not translated directly (scales are uncalibrated). No college match falls
+#      back to the NFL QB1 median. New qb_rush_rate_source values: college_mobile
+#      / college_balanced / college_pocket / prior_median_fallback. Schema tag ->
+#      s2_w15_player_alloc_v3_5.
+# 3.4  QB rushing volume no longer routes through team-carry share. QB
+#      expected_carries_pg now derives from a pooled, game-weighted per-QB rush
+#      rate (sum rush_attempts / sum games_played over QB_RUSH_RATE_SEASONS,
+#      2023-2025), a player trait that TRANSFERS across team moves. RBs on a
+#      team split the residual team rush after the QB1 rate is removed
+#      (subtract-first, rate space at STEP 7), so the RB soft constraint runs
+#      untouched. The old share/carryover path is defective for QBs (a share of
+#      team carries self-deflates mobile QBs and drops movers to the 0.015
+#      floor); its QB rush-share and carryover audit fields are blanked for QB
+#      rows since they no longer feed output. No-history QB1s take a provisional
+#      NFL QB1 median rate (qb_rush_rate_source = "prior_median_provisional")
+#      pending the college-tier fallback. New QB columns: qb_rush_pooled_pg,
+#      qb_rush_seasons_pooled, qb_rush_rate_source. RB/WR/TE, all target logic,
+#      and the soft constraint are unchanged. Schema tag ->
+#      s2_w15_player_alloc_v3_4.
+# 3.3  Preseason share carryover: for returning, non-mover, above-floor players,
+#      the primary share is blended toward last season's realized share at
+#      fitted per-position weights before the in-season blend. Schema tag ->
+#      s2_w15_player_alloc_v3_3.
 # 3.2  Veteran volume floors recalibrated from the observed 2023-2025 qualifier
 #      distribution: RB 100 -> 200 rush attempts, WR 50 -> 150 targets (QB
 #      unchanged at 200 dropbacks). With shrinkage in place the remaining
@@ -253,6 +284,17 @@ ALLOC_POSITIONS <- c("QB", "RB", "WR", "TE")
 # rescale to 1.0. Inside this range, preserve modeled differences as signal.
 CONSTRAINT_LOWER <- 0.95
 CONSTRAINT_UPPER <- 1.05
+
+# [2026-07-13] Rescale-up floor. The rescale factor is 1 / team_sum; for a sparse
+# team pool (many players missing from the depth data) team_sum can be far below
+# 1, and an uncapped 1/team_sum inflates the listed players' shares to impossible
+# levels (a traded/thin-depth RB1 was pushed to a ~0.70 target share). Flooring
+# the denominator caps the up-rescale at 1/RESCALE_SUM_FLOOR: a near-complete
+# pool still normalizes toward 1, but a materially incomplete pool rescales only
+# partway and leaves the missing volume unallocated, which is correct because that
+# volume belongs to players not in the pool, not to the ones who are. Down-rescale
+# (team_sum > 1.05) is unaffected since the sum already exceeds the floor.
+RESCALE_SUM_FLOOR <- 0.80  # max up-rescale = 1/0.80 = 1.25x; lower = more inflation
 
 # ------------------------------------------------------------------------------
 # IN-SEASON SHARE BLEND (v2)
@@ -366,6 +408,54 @@ ROOKIE_CAPITAL_MULTIPLIERS <- c(
 # Position-specific max depth rank to keep (deeper players get folded into max)
 MAX_DEPTH_RANK <- c("QB" = 3L, "RB" = 4L, "WR" = 5L, "TE" = 3L)
 
+# ------------------------------------------------------------------------------
+# PRESEASON SHARE CARRYOVER (v3_3)
+# ------------------------------------------------------------------------------
+# A returning player's realized prior-season usage share is a far stronger
+# preseason signal than the flat depth-position prior. Each eligible player's
+# primary share (target share for WR/TE, rush share for RB/QB) is blended:
+#
+#   adjusted = w_pos * prior_season_share + (1 - w_pos) * positional_base
+#
+# w_pos was fitted out-of-sample (2011-2025, returning non-mover players at or
+# above the volume floors below, anchor = week-1 depth-chart slot). Every
+# position's blend beat the positional-prior-only baseline with the bootstrap
+# 95% CI on the MAE improvement clearing 0. Weights are the per-position
+# interior MAE minima on the corrected sample (BLT/CLV/HST/SL codes mapped):
+#   QB 0.85  RB 0.80  WR 0.95  TE 0.70
+# QB is secondary: the R/16 panel's rush_attempts excludes scrambles, so QB
+# rush share is undercounted; the weight is retained but treated as provisional.
+#
+# ELIGIBILITY (all must hold; anyone failing keeps the positional prior path):
+#   - not a rookie
+#   - has a prior-season (CARRYOVER_PRIOR_SEASON) usage row
+#   - non-mover: 2026 team == prior-season team (a share earned against a
+#     different offense's target competition does not transfer, so movers fall
+#     back to the positional prior, matching how the weight was fitted)
+#   - prior-season primary volume >= the position floor below (a thin prior
+#     season is too noisy to carry at full weight; below-floor returners fall
+#     back to the positional prior)
+#
+# The blend uses the positional BASE (pre rookie/talent multiplier), so for an
+# eligible player the validated carryover SUPERSEDES the talent nudge rather
+# than stacking on it. Eligible players are non-rookies whose veteran talent
+# multiplier is 1.0 (neutralized) in nearly all cases; the only players this
+# changes are year 2-3 returners still carrying a nonzero R/28 prospect
+# talent_z, for whom a realized NFL usage season is the stronger signal.
+#
+# Deferred (their own future items, not in this weight set): RB receiving-share
+# carryover; a mover-specific weight; and empirical-Bayes volume-continuous
+# shrinkage to replace the hard floor and flat weight. Toggle with the
+# preseason_carryover argument to allocate_player_volumes().
+PRESEASON_CARRYOVER_WEIGHTS <- c(QB = 0.85, RB = 0.80, WR = 0.95, TE = 0.70)
+
+# Prior-season primary volume floors for carryover eligibility, matching the
+# floors the weights were fitted under (QB dropbacks, RB carries, WR/TE targets).
+CARRYOVER_FLOOR <- c(QB = 100L, RB = 50L, WR = 50L, TE = 50L)
+
+# Prior season whose realized shares are carried into the preseason baseline.
+CARRYOVER_PRIOR_SEASON <- SEASON_ALLOC - 1L
+
 # Paths
 TEAM_VOLUMES_RDS  <- here::here("data", "season2_cache",
                                  "s2_week15_team_volumes.rds")
@@ -381,7 +471,44 @@ OUTPUT_CSV_PATH_ALLOC <- here::here("data", "season2_cache",
 PANEL_CACHE_PATH_ALLOC <- here::here("data", "season2_cache",
                                       "s2_week15_player_season_panel_cache.rds")
 
-SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v3_2"
+SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v3_5"
+
+# QB rushing volume window (v3_4). QB expected carries derive from a pooled,
+# game-weighted per-QB rush rate over these seasons (a player trait that
+# transfers across team moves), NOT a share of team rush volume. Pooled rate =
+# sum(rush_attempts) / sum(games_played). The panel's rush_attempts is verified
+# to include scrambles (97-100% of true pbp QB rush volume) with kneels already
+# excluded, so the rate is the QB's real per-game rushing workload.
+QB_RUSH_RATE_SEASONS <- (SEASON_ALLOC - 3L):(SEASON_ALLOC - 1L)
+
+# Committee QB config (uncertain rooms), season-guarded. Mirrors R/30's loader
+# so R/31 does not depend on R/30 being sourced.
+QB_COMMITTEES_PATH_ALLOC <- here::here("data", "ref", "qb_committees_2026.csv")
+
+.load_qb_committees_alloc <- function(path = QB_COMMITTEES_PATH_ALLOC,
+                                      season = SEASON_ALLOC) {
+  empty <- tibble::tibble(team = character(), qb_id = character(),
+                          committee_group = character())
+  if (!file.exists(path)) return(empty)
+  raw <- tryCatch(readr::read_csv(path, show_col_types = FALSE),
+                  error = function(e) NULL)
+  if (is.null(raw) || nrow(raw) == 0L) return(empty)
+  if (length(setdiff(c("season", "team", "qb_id", "committee_group"),
+                     names(raw))) > 0L) return(empty)
+  raw %>%
+    dplyr::mutate(.season = suppressWarnings(as.integer(.data$season))) %>%
+    dplyr::filter(.data$.season == as.integer(season)) %>%
+    dplyr::transmute(team = as.character(.data$team),
+                     qb_id = as.character(.data$qb_id),
+                     committee_group = as.character(.data$committee_group)) %>%
+    dplyr::filter(!is.na(.data$qb_id)) %>%
+    dplyr::distinct(.data$team, .data$qb_id, .keep_all = TRUE)
+}
+
+# College QB starter threshold (v3_5) for the rookie-QB1 college-tier fallback
+# reference distribution. College QBs with fewer games are excluded from the
+# tier-cutoff quantiles so the reference reflects starters, not deep backups.
+CFB_QB_REF_MIN_GAMES <- 6L
 
 # ------------------------------------------------------------------------------
 # NSE DECLARATIONS
@@ -411,7 +538,18 @@ utils::globalVariables(c(
   "targets", "rec_epa_per_target", "window_volume", "n_window_seasons",
   "n_window_targets", "vet_composite", "comp_a", "comp_b", "cpoe_w", "epa_w",
   "rsr_w", "reptt_w", "level_w", "slope_w", "cpoe_s", "epa_s", "rsr_s",
-  "reptt_s", "level_s", "slope_s", "inv_n"
+  "reptt_s", "level_s", "slope_s", "inv_n",
+  "carryover_applied", "carryover_prior_share", "carryover_weight",
+  "qb_rush_pooled_pg", "qb_rush_seasons_pooled", "qb_rush_rate_source",
+  "games_played", "qb_carries_tmp", "rush_residual_tmp",
+  "team_qb1_carries", "team_nonqb_rush_share",
+  "name_key", "rookie_rate", "rookie_source", "cfb_rush_pg", "position_group",
+  "prior_team", "prior_position", "prior_target_share", "prior_rush_share",
+  "prior_vol_targets", "prior_vol_rush", "prior_vol_dropbacks",
+  "team_targets", "team_carries", "posteam", "receiver_player_id",
+  "pass_attempt", "two_point_attempt", "rush_attempt", "qb_kneel",
+  "w_pos", "floor_pos", "prior_primary_share", "prior_primary_vol",
+  "primary_base", "eligible", "blend_primary"
 ))
 
 # ==============================================================================
@@ -1183,20 +1321,28 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 # .compute_veteran_talent_z
 # ------------------------------------------------------------------------------
 
-#' Compute the NFL-efficiency veteran talent_z per position
+#' Veteran talent_z, NEUTRALIZED (retired on out-of-sample evidence)
 #'
-#' Restricts the R/16 panel to the trailing window and to veterans
-#' (years_exp >= VETERAN_MIN_EXP), aggregates a per-position efficiency
-#' composite, applies the per-position volume floor, and re-standardizes the
-#' composite to unit z within position. Only QB, RB, and WR are scored; veteran
-#' TEs are intentionally excluded (no clean efficiency separator in the R/28
-#' residual analysis) and fall back to the prospect talent_z downstream.
+#' An out-of-sample MAE backtest over outcome seasons 2013 to 2025 showed that
+#' every veteran talent signal buildable from the R/16 panel increased
+#' projection error versus no adjustment, at every position. The efficiency
+#' composite was worst (QB +0.48 MAE vs neutral). The opportunity-scoring gap
+#' only appeared to help against a one-year prior-PPG baseline (regression to
+#' the mean) and hurt against the stabler 3-season window-mean baseline.
+#' Decision: apply no veteran talent nudge. This function returns a neutral
+#' veteran_talent_z of 0 for every veteran clearing the per-position
+#' window-volume floor, yielding talent_multiplier = 1.0 downstream. Veterans
+#' are valued by depth slot and team volume. Prospects are untouched and keep
+#' their R/28 college talent_z via .compute_talent_multipliers. Gating and the
+#' window_volume / n_window_seasons diagnostics are preserved; TE is now
+#' included in the gate so veteran TEs are neutralized, not left on a stale
+#' college score.
 #'
 #' @param panel Tibble from .load_player_season_panel().
 #' @param roster_exp Tibble from .load_roster_experience().
 #' @param season Integer. Target season (default SEASON_ALLOC).
-#' @return Tibble: nfl_gsis_id, position, veteran_talent_z, window_volume,
-#'   n_window_seasons. Empty if no veteran clears its floor.
+#' @return Tibble: nfl_gsis_id, position, veteran_talent_z (all 0),
+#'   window_volume, n_window_seasons. Empty if no veteran clears its floor.
 #' @keywords internal
 .compute_veteran_talent_z <- function(panel, roster_exp,
                                        season = SEASON_ALLOC) {
@@ -1217,98 +1363,40 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
     dplyr::filter(.data$years_exp >= VETERAN_MIN_EXP) %>%
     dplyr::select(nfl_gsis_id)
 
+  # Per-position window-volume floor on primary usage. TE reuses the WR target
+  # floor. Gating is retained so the veteran population and the diagnostic
+  # columns match the prior version; only the returned z changed (now 0).
+  floors <- c(QB = VETERAN_MIN_QB_DROPBACKS,
+              RB = VETERAN_MIN_RB_ATTEMPTS,
+              WR = VETERAN_MIN_WR_TARGETS,
+              TE = VETERAN_MIN_WR_TARGETS)
+
   vets <- panel %>%
     dplyr::filter(.data$season %in% window_seasons,
-                  .data$position %in% c("QB", "RB", "WR")) %>%
-    dplyr::inner_join(veteran_ids, by = "nfl_gsis_id")
+                  .data$position %in% c("QB", "RB", "WR", "TE")) %>%
+    dplyr::inner_join(veteran_ids, by = "nfl_gsis_id") %>%
+    dplyr::group_by(.data$nfl_gsis_id, .data$position) %>%
+    dplyr::summarise(
+      w_dropbacks      = sum(.data$qb_dropbacks,  na.rm = TRUE),
+      w_rush_att       = sum(.data$rush_attempts, na.rm = TRUE),
+      w_targets        = sum(.data$targets,       na.rm = TRUE),
+      n_window_seasons = dplyr::n_distinct(.data$season),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      window_volume = dplyr::case_when(
+        .data$position == "QB" ~ .data$w_dropbacks,
+        .data$position == "RB" ~ .data$w_rush_att,
+        TRUE                   ~ .data$w_targets
+      )
+    ) %>%
+    dplyr::filter(.data$window_volume >= floors[.data$position])
 
   if (nrow(vets) == 0L) return(empty)
 
-  # QB: dropback-weighted CPOE and EPA/dropback over the window (R/30 construct).
-  # Both components share the dropback sample size, so shrink each by dropbacks.
-  qb <- vets %>%
-    dplyr::filter(.data$position == "QB") %>%
-    dplyr::group_by(.data$nfl_gsis_id) %>%
-    dplyr::summarise(
-      position         = "QB",
-      window_volume    = sum(.data$qb_dropbacks, na.rm = TRUE),
-      n_window_seasons = dplyr::n_distinct(.data$season),
-      cpoe_w           = .wmean(.data$mean_cpoe, .data$qb_dropbacks),
-      epa_w            = .wmean(.data$pass_epa_per_dropback,
-                                .data$qb_dropbacks),
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(.data$window_volume >= VETERAN_MIN_QB_DROPBACKS) %>%
-    dplyr::mutate(
-      comp_a        = .eb_shrink(.data$cpoe_w, .data$window_volume, "QB cpoe"),
-      comp_b        = .eb_shrink(.data$epa_w, .data$window_volume, "QB epa/db"),
-      vet_composite = 0.5 * .data$comp_a + 0.5 * .data$comp_b
-    )
-
-  # RB: attempt-weighted rush success rate + target-weighted rec EPA/target.
-  # The two components have different sample sizes (carries vs targets), so each
-  # is shrunk by its own volume. The volume floor is on rush attempts.
-  rb <- vets %>%
-    dplyr::filter(.data$position == "RB") %>%
-    dplyr::group_by(.data$nfl_gsis_id) %>%
-    dplyr::summarise(
-      position         = "RB",
-      window_volume    = sum(.data$rush_attempts, na.rm = TRUE),
-      n_window_targets = sum(.data$targets, na.rm = TRUE),
-      n_window_seasons = dplyr::n_distinct(.data$season),
-      rsr_w            = .wmean(.data$rush_success_rate, .data$rush_attempts),
-      reptt_w          = .wmean(.data$rec_epa_per_target, .data$targets),
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(.data$window_volume >= VETERAN_MIN_RB_ATTEMPTS) %>%
-    dplyr::mutate(
-      comp_a        = .eb_shrink(.data$rsr_w, .data$window_volume, "RB rush SR"),
-      comp_b        = .eb_shrink(.data$reptt_w, .data$n_window_targets,
-                                 "RB rec EPA/tgt"),
-      vet_composite = 0.5 * .data$comp_a + 0.5 * .data$comp_b
-    )
-
-  # WR: target-weighted rec EPA/target level + trajectory (slope across window).
-  # Both the level and the slope precision scale with targets, so shrink each
-  # by the target sample.
-  wr <- vets %>%
-    dplyr::filter(.data$position == "WR") %>%
-    dplyr::group_by(.data$nfl_gsis_id) %>%
-    dplyr::summarise(
-      position         = "WR",
-      window_volume    = sum(.data$targets, na.rm = TRUE),
-      n_window_seasons = dplyr::n_distinct(.data$season),
-      level_w          = .wmean(.data$rec_epa_per_target, .data$targets),
-      slope_w          = .slope(.data$season, .data$rec_epa_per_target),
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(.data$window_volume >= VETERAN_MIN_WR_TARGETS) %>%
-    dplyr::mutate(
-      comp_a        = .eb_shrink(.data$level_w, .data$window_volume,
-                                 "WR rec EPA/tgt level"),
-      comp_b        = .eb_shrink(.data$slope_w, .data$window_volume,
-                                 "WR EPA/tgt slope"),
-      vet_composite = (1 - VETERAN_WR_SLOPE_WEIGHT) * .data$comp_a +
-                       VETERAN_WR_SLOPE_WEIGHT * .data$comp_b
-    )
-
-  combined <- dplyr::bind_rows(
-    qb %>% dplyr::select(nfl_gsis_id, position, window_volume,
-                          n_window_seasons, vet_composite),
-    rb %>% dplyr::select(nfl_gsis_id, position, window_volume,
-                          n_window_seasons, vet_composite),
-    wr %>% dplyr::select(nfl_gsis_id, position, window_volume,
-                          n_window_seasons, vet_composite)
-  )
-
-  if (nrow(combined) == 0L) return(empty)
-
-  # Re-standardize the composite to unit z within position so the veteran z
-  # matches the prospect talent_z scale.
-  combined %>%
-    dplyr::group_by(.data$position) %>%
-    dplyr::mutate(veteran_talent_z = .zscore(.data$vet_composite)) %>%
-    dplyr::ungroup() %>%
+  # NEUTRAL: no player-level talent nudge for veterans (see header note).
+  vets %>%
+    dplyr::mutate(veteran_talent_z = 0) %>%
     dplyr::select(nfl_gsis_id, position, veteran_talent_z,
                   window_volume, n_window_seasons)
 }
@@ -1520,6 +1608,261 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 }
 
 # ------------------------------------------------------------------------------
+# .compute_prior_season_shares
+# ------------------------------------------------------------------------------
+
+#' Build each player's realized prior-season usage share (carryover source)
+#'
+#' Reads the prior-season (CARRYOVER_PRIOR_SEASON) normalized pbp once to build
+#' clean team target and carry denominators using the exact definitions the
+#' carryover weights were validated against: a target is a receiver-charged
+#' pass attempt (receiver_player_id present, pass_attempt == 1, not a two-point
+#' try); a carry is a designed rush attempt (rush_attempt == 1, not a kneel or
+#' two-point try). Player numerators (targets, rush_attempts, qb_dropbacks) come
+#' from the R/16 panel's prior-season row. Team codes on both sides are put
+#' through the same normalizers .load_2026_depth_charts() uses so the join is
+#' consistent.
+#'
+#' Degrades gracefully: if the prior-season pbp or panel is unavailable, or the
+#' expected columns are absent, returns an empty tibble and carryover applies to
+#' no one (every player keeps the positional prior path).
+#'
+#' @param panel_path Character. Path to the cached R/16 panel RDS.
+#' @param prior_season Integer. Season whose shares are carried over.
+#' @return Tibble keyed by nfl_gsis_id: prior_team, prior_position,
+#'   prior_target_share, prior_rush_share, prior_vol_targets, prior_vol_rush,
+#'   prior_vol_dropbacks. Empty tibble on any failure.
+#' @keywords internal
+.compute_prior_season_shares <- function(panel_path   = PANEL_CACHE_PATH_ALLOC,
+                                         prior_season = CARRYOVER_PRIOR_SEASON) {
+
+  empty <- tibble::tibble(
+    nfl_gsis_id         = character(),
+    prior_team          = character(),
+    prior_position      = character(),
+    prior_target_share  = numeric(),
+    prior_rush_share    = numeric(),
+    prior_vol_targets   = numeric(),
+    prior_vol_rush      = numeric(),
+    prior_vol_dropbacks = numeric()
+  )
+
+  # Prior-season pbp for clean team denominators (load_normalized_season is
+  # reachable via R/15, sourced transitively through R/30). Read from the same
+  # cache dir the panel lives in so the path is explicit, not R/15's default.
+  cache_dir <- dirname(panel_path)
+  pbp <- tryCatch(
+    load_normalized_season(prior_season, cache_dir = cache_dir),
+    error = function(e) {
+      message(glue("    Carryover: prior-season {prior_season} pbp ",
+                   "unavailable ({e$message}) -- carryover skipped"))
+      NULL
+    }
+  )
+  if (is.null(pbp) || nrow(pbp) == 0L) return(empty)
+
+  needed_pbp <- c("season_type", "posteam", "receiver_player_id",
+                  "pass_attempt", "two_point_attempt", "rush_attempt",
+                  "qb_kneel")
+  if (length(setdiff(needed_pbp, names(pbp))) > 0L) {
+    message("    Carryover: prior-season pbp missing required columns -- ",
+            "carryover skipped")
+    return(empty)
+  }
+
+  reg <- pbp %>% dplyr::filter(.data$season_type == "REG")
+  team_targets <- reg %>%
+    dplyr::filter(!is.na(.data$receiver_player_id),
+                  .data$pass_attempt == 1L,
+                  dplyr::coalesce(.data$two_point_attempt, 0L) != 1L) %>%
+    dplyr::group_by(.data$posteam) %>%
+    dplyr::summarise(team_targets = dplyr::n(), .groups = "drop")
+  team_carries <- reg %>%
+    dplyr::filter(.data$rush_attempt == 1L,
+                  dplyr::coalesce(.data$qb_kneel, 0L) != 1L,
+                  dplyr::coalesce(.data$two_point_attempt, 0L) != 1L) %>%
+    dplyr::group_by(.data$posteam) %>%
+    dplyr::summarise(team_carries = dplyr::n(), .groups = "drop")
+
+  team_totals <- dplyr::full_join(team_targets, team_carries, by = "posteam") %>%
+    dplyr::mutate(
+      team = .normalize_sleeper_team_codes_r31(
+               .normalize_team_codes(.data$posteam)),
+      team_targets = dplyr::coalesce(.data$team_targets, 0),
+      team_carries = dplyr::coalesce(.data$team_carries, 0)
+    ) %>%
+    dplyr::group_by(.data$team) %>%
+    dplyr::summarise(team_targets = sum(.data$team_targets),
+                     team_carries = sum(.data$team_carries),
+                     .groups = "drop")
+
+  rm(pbp, reg); invisible(gc(verbose = FALSE))
+
+  # Player numerators from the raw R/16 panel. Read the RDS directly rather than
+  # via .load_player_season_panel(), which transmutes away the team column that
+  # the share denominator join needs.
+  panel_raw <- tryCatch(readRDS(panel_path), error = function(e) NULL)
+  if (is.null(panel_raw) || nrow(panel_raw) == 0L) {
+    message("    Carryover: panel unavailable -- carryover skipped")
+    return(empty)
+  }
+  needed_panel <- c("player_id", "season", "team", "position",
+                    "targets", "rush_attempts", "qb_dropbacks")
+  if (length(setdiff(needed_panel, names(panel_raw))) > 0L) {
+    message("    Carryover: panel missing required columns -- carryover skipped")
+    return(empty)
+  }
+
+  n_unmatched <- 0L
+  result <- panel_raw %>%
+    dplyr::filter(as.integer(.data$season) == prior_season,
+                  .data$position %in% ALLOC_POSITIONS) %>%
+    dplyr::transmute(
+      nfl_gsis_id         = as.character(.data$player_id),
+      prior_team          = .normalize_sleeper_team_codes_r31(
+                              .normalize_team_codes(as.character(.data$team))),
+      prior_position      = .data$position,
+      prior_vol_targets   = .data$targets,
+      prior_vol_rush      = .data$rush_attempts,
+      prior_vol_dropbacks = .data$qb_dropbacks
+    ) %>%
+    dplyr::left_join(team_totals, by = c("prior_team" = "team")) %>%
+    dplyr::mutate(
+      prior_target_share = dplyr::if_else(
+        !is.na(.data$team_targets) & .data$team_targets > 0,
+        .data$prior_vol_targets / .data$team_targets, NA_real_),
+      prior_rush_share = dplyr::if_else(
+        !is.na(.data$team_carries) & .data$team_carries > 0,
+        .data$prior_vol_rush / .data$team_carries, NA_real_)
+    )
+
+  # Surface (do not silently drop) any player whose prior team failed to match a
+  # team total, so an unmapped code is visible the way BLT/CLV/HST/SL were.
+  n_unmatched <- sum(is.na(result$team_targets))
+  if (n_unmatched > 0L) {
+    bad <- result %>% dplyr::filter(is.na(.data$team_targets)) %>%
+      dplyr::distinct(.data$prior_team) %>% dplyr::pull(.data$prior_team)
+    message(glue("    Carryover: {n_unmatched} prior-season rows unmatched to a ",
+                 "team total (codes: {paste(bad, collapse = ', ')})"))
+  }
+
+  result %>%
+    dplyr::select(nfl_gsis_id, prior_team, prior_position,
+                  prior_target_share, prior_rush_share,
+                  prior_vol_targets, prior_vol_rush, prior_vol_dropbacks) %>%
+    dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# .apply_preseason_carryover
+# ------------------------------------------------------------------------------
+
+#' Blend eligible returning players' primary share toward their prior-season
+#' realized share (preseason analogue of .blend_observed_shares)
+#'
+#' For each eligible player, overwrites the PRIMARY adjusted share
+#' (target_share_adjusted for WR/TE, rush_share_adjusted for RB/QB) with
+#'   w_pos * prior_season_share + (1 - w_pos) * positional_base
+#' using the position weight in PRESEASON_CARRYOVER_WEIGHTS and the positional
+#' BASE, so the validated carryover supersedes the rookie/talent multiplier.
+#' Ineligible players (rookies, movers, below-floor, no prior row) are left on
+#' the positional prior path untouched. Runs AFTER .compute_initial_shares and
+#' BEFORE .blend_observed_shares, so in-season observed data tapers from the
+#' carryover baseline rather than from the flat prior.
+#'
+#' Adds audit columns (present in both on/off modes for schema stability):
+#'   carryover_applied     lgl
+#'   carryover_prior_share dbl  (prior primary share used; NA if not applied)
+#'   carryover_weight      dbl  (w_pos used; NA if not applied)
+#'
+#' @param alloc_table Tibble from .compute_initial_shares(): needs nfl_gsis_id,
+#'   position, team, is_rookie, target_share_base, rush_share_base,
+#'   target_share_adjusted, rush_share_adjusted.
+#' @param prior_shares Tibble from .compute_prior_season_shares(), or NULL.
+#' @param enabled Logical. FALSE returns alloc_table with neutral audit columns
+#'   and no share change.
+#' @return alloc_table with primary shares blended for eligible players plus the
+#'   three audit columns.
+#' @keywords internal
+.apply_preseason_carryover <- function(alloc_table, prior_shares = NULL,
+                                       enabled = TRUE) {
+
+  neutral <- alloc_table %>%
+    dplyr::mutate(
+      carryover_applied     = FALSE,
+      carryover_prior_share = NA_real_,
+      carryover_weight      = NA_real_
+    )
+
+  if (!enabled) return(neutral)
+  if (is.null(prior_shares) || nrow(prior_shares) == 0L) {
+    message("    Preseason carryover: no prior-season shares -- ",
+            "positional priors retained for all players")
+    return(neutral)
+  }
+
+  joined <- neutral %>%
+    dplyr::left_join(
+      prior_shares %>%
+        dplyr::select(nfl_gsis_id, prior_team, prior_target_share,
+                      prior_rush_share, prior_vol_targets, prior_vol_rush,
+                      prior_vol_dropbacks),
+      by = "nfl_gsis_id"
+    ) %>%
+    dplyr::mutate(
+      w_pos     = PRESEASON_CARRYOVER_WEIGHTS[.data$position],
+      floor_pos = CARRYOVER_FLOOR[.data$position],
+      prior_primary_share = dplyr::if_else(
+        .data$position %in% c("WR", "TE"),
+        .data$prior_target_share, .data$prior_rush_share),
+      prior_primary_vol = dplyr::case_when(
+        .data$position == "QB" ~ .data$prior_vol_dropbacks,
+        .data$position == "RB" ~ .data$prior_vol_rush,
+        .data$position %in% c("WR", "TE") ~ .data$prior_vol_targets,
+        TRUE ~ NA_real_),
+      primary_base = dplyr::if_else(
+        .data$position %in% c("WR", "TE"),
+        .data$target_share_base, .data$rush_share_base),
+      eligible = !.data$is_rookie &
+                 !is.na(.data$prior_primary_share) &
+                 !is.na(.data$prior_team) &
+                 .data$team == .data$prior_team &
+                 !is.na(.data$prior_primary_vol) &
+                 .data$prior_primary_vol >= .data$floor_pos
+    )
+
+  blended <- joined %>%
+    dplyr::mutate(
+      carryover_applied     = dplyr::coalesce(.data$eligible, FALSE),
+      carryover_prior_share = dplyr::if_else(.data$carryover_applied,
+                                             .data$prior_primary_share, NA_real_),
+      carryover_weight      = dplyr::if_else(.data$carryover_applied,
+                                             .data$w_pos, NA_real_),
+      blend_primary = dplyr::if_else(
+        .data$carryover_applied,
+        .data$w_pos * .data$prior_primary_share +
+          (1 - .data$w_pos) * .data$primary_base,
+        NA_real_),
+      target_share_adjusted = dplyr::if_else(
+        .data$carryover_applied & .data$position %in% c("WR", "TE"),
+        .data$blend_primary, .data$target_share_adjusted),
+      rush_share_adjusted = dplyr::if_else(
+        .data$carryover_applied & .data$position %in% c("RB", "QB"),
+        .data$blend_primary, .data$rush_share_adjusted)
+    ) %>%
+    dplyr::select(-w_pos, -floor_pos, -prior_primary_share, -prior_primary_vol,
+                  -primary_base, -eligible, -blend_primary,
+                  -prior_team, -prior_target_share, -prior_rush_share,
+                  -prior_vol_targets, -prior_vol_rush, -prior_vol_dropbacks)
+
+  n_applied <- sum(blended$carryover_applied, na.rm = TRUE)
+  message(glue("    Preseason carryover: applied to {n_applied} of ",
+               "{nrow(blended)} players (returning, non-mover, above floor)"))
+
+  blended
+}
+
+# ------------------------------------------------------------------------------
 # .blend_observed_shares
 # ------------------------------------------------------------------------------
 
@@ -1656,13 +1999,13 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
       team_target_rescale = dplyr::case_when(
         .data$team_target_sum < CONSTRAINT_LOWER |
           .data$team_target_sum > CONSTRAINT_UPPER ~
-          1.0 / .data$team_target_sum,
+          1.0 / pmax(.data$team_target_sum, RESCALE_SUM_FLOOR),
         TRUE ~ 1.0
       ),
       team_rush_rescale = dplyr::case_when(
         .data$team_rush_sum < CONSTRAINT_LOWER |
           .data$team_rush_sum > CONSTRAINT_UPPER ~
-          1.0 / .data$team_rush_sum,
+          1.0 / pmax(.data$team_rush_sum, RESCALE_SUM_FLOOR),
         TRUE ~ 1.0
       )
     )
@@ -1678,22 +2021,239 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 }
 
 # ------------------------------------------------------------------------------
+# .qb_name_key
+# ------------------------------------------------------------------------------
+
+#' Normalize a player name to a first-initial + last-name key for college joins
+#'
+#' College play-by-play names appear both fully ("Fernando Mendoza") and
+#' abbreviated ("F.Mendoza"), and the NFL side may carry suffixes. This collapses
+#' all forms to "<first_initial>_<last>" so a rookie's split college rows pool to
+#' one player. Vectorized. Periods are treated as separators (handles F.Mendoza),
+#' generational suffixes dropped, non-letters removed.
+#'
+#' @param name Character vector of player names.
+#' @return Character vector of normalized keys (NA for empty/unparseable).
+#' @keywords internal
+.qb_name_key <- function(name) {
+  vapply(name, function(x) {
+    if (is.na(x)) return(NA_character_)
+    n <- tolower(x)
+    n <- gsub("\\.", " ", n)                       # period -> space (F.Mendoza)
+    n <- gsub("[^a-z ]", " ", n)                   # other punctuation -> space
+    n <- gsub("\\b(jr|sr|ii|iii|iv|v)\\b", " ", n) # drop generational suffixes
+    n <- trimws(gsub("\\s+", " ", n))
+    parts <- strsplit(n, " ", fixed = TRUE)[[1]]
+    parts <- parts[nzchar(parts)]
+    if (length(parts) == 0L) return(NA_character_)
+    paste0(substr(parts[1], 1, 1), "_", parts[length(parts)])
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# ------------------------------------------------------------------------------
+# .compute_rookie_qb_rush_rate
+# ------------------------------------------------------------------------------
+
+#' College-tier rush-rate fallback for no-history (rookie) QB1s (v3_5)
+#'
+#' A rookie QB1 has no NFL rush history, so his expected carries come from a
+#' three-tier step function: pool his college rush/game (game-weighted, from the
+#' R/21 CFB panel, name-normalized to collapse split spellings), rank him against
+#' the college QB starter distribution (games_played >= CFB_QB_REF_MIN_GAMES),
+#' and map his tier to the NFL QB1 pooled rate at the matching quantile:
+#'   college >= college-Q75 -> mobile   -> NFL QB1 Q75 rate
+#'   college >= college-Q50 -> balanced -> NFL QB1 median rate
+#'   college <  college-Q50 -> pocket   -> NFL QB1 Q25 rate
+#' The college rate assigns a TIER ONLY; it is not translated to an NFL rate
+#' (the two scales are not calibrated). Rookies with no college match are omitted
+#' (the caller then uses the NFL QB1 median fallback). R/21 is sourced lazily so
+#' the CFB build only runs when a rookie QB1 actually exists.
+#'
+#' @param rookie_names Character vector of no-history QB1 player names.
+#' @param nfl_qb1_quantiles Named numeric from quantile(., c(.25,.5,.75)) of the
+#'   NFL QB1 pooled rush rates.
+#' @param seasons Integer vector of college seasons to pool.
+#' @param min_games College QB starter threshold for the reference distribution.
+#' @return Tibble: name_key, rookie_rate, rookie_source. Empty on any failure.
+#' @keywords internal
+.compute_rookie_qb_rush_rate <- function(rookie_names,
+                                         nfl_qb1_quantiles,
+                                         seasons   = QB_RUSH_RATE_SEASONS,
+                                         min_games = CFB_QB_REF_MIN_GAMES) {
+  empty <- tibble::tibble(name_key = character(),
+                          rookie_rate = numeric(),
+                          rookie_source = character())
+  if (length(rookie_names) == 0L) return(empty)
+
+  cfb <- tryCatch({
+    if (!exists("build_cfb_player_season_panel", mode = "function")) {
+      source(here::here("R", "21_cfb_player_season_panel.R"))
+    }
+    build_cfb_player_season_panel(seasons = seasons)
+  }, error = function(e) {
+    message(glue("    Rookie QB rush: CFB panel unavailable ({e$message}) -- ",
+                 "median fallback"))
+    NULL
+  })
+  if (is.null(cfb) || nrow(cfb) == 0L) return(empty)
+  needed <- c("player_name", "position_group", "rush_attempts", "games_played")
+  if (length(setdiff(needed, names(cfb))) > 0L) {
+    message("    Rookie QB rush: CFB panel missing columns -- median fallback")
+    return(empty)
+  }
+
+  cfb_qb <- cfb %>%
+    dplyr::filter(grepl("QB", toupper(.data$position_group)),
+                  !is.na(.data$games_played), .data$games_played > 0) %>%
+    dplyr::mutate(name_key = .qb_name_key(.data$player_name),
+                  cfb_rush_pg = .data$rush_attempts / .data$games_played)
+
+  # College QB starter reference distribution -> tier cutoffs.
+  ref <- cfb_qb %>% dplyr::filter(.data$games_played >= min_games)
+  if (nrow(ref) < 20L) {
+    message("    Rookie QB rush: thin college reference -- median fallback")
+    return(empty)
+  }
+  col_q   <- stats::quantile(ref$cfb_rush_pg, c(0.50, 0.75), na.rm = TRUE)
+  col_med <- col_q[[1]]
+  col_p75 <- col_q[[2]]
+
+  q25 <- nfl_qb1_quantiles[["25%"]]
+  q50 <- nfl_qb1_quantiles[["50%"]]
+  q75 <- nfl_qb1_quantiles[["75%"]]
+
+  rk_keys <- unique(.qb_name_key(rookie_names))
+
+  cfb_qb %>%
+    dplyr::filter(.data$name_key %in% rk_keys) %>%
+    dplyr::group_by(.data$name_key) %>%
+    dplyr::summarise(
+      cfb_rush_pg = sum(.data$rush_attempts, na.rm = TRUE) /
+                    sum(.data$games_played, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      rookie_source = dplyr::case_when(
+        .data$cfb_rush_pg >= col_p75 ~ "college_mobile",
+        .data$cfb_rush_pg >= col_med ~ "college_balanced",
+        TRUE                         ~ "college_pocket"
+      ),
+      rookie_rate = dplyr::case_when(
+        .data$rookie_source == "college_mobile"   ~ q75,
+        .data$rookie_source == "college_balanced" ~ q50,
+        TRUE                                      ~ q25
+      )
+    ) %>%
+    dplyr::select(name_key, rookie_rate, rookie_source)
+}
+
+# ------------------------------------------------------------------------------
+# .compute_qb_rush_rate
+# ------------------------------------------------------------------------------
+
+#' Pooled game-weighted per-QB rush rate (v3_4)
+#'
+#' QB rushing is a player trait, not a share of the team's carry pool, so it is
+#' modeled as the QB's own carries per game and transfers across team moves.
+#' Reads the R/16 panel directly (its rush_attempts is verified to include
+#' scrambles at 97-100% of true pbp QB rush volume, kneels already excluded) and
+#' pools OPPORTUNITY-WEIGHTED over `seasons`: sum(rush_attempts)/sum(games),
+#' NOT a mean of per-season rates, so injury-shortened seasons contribute in
+#' proportion to real exposure. Same weighting principle as the R/32 efficiency
+#' table.
+#'
+#' On any failure returns an empty tibble; the caller then falls the affected
+#' QB1s back to a provisional NFL QB1 median rate.
+#'
+#' @param panel_path Path to the R/16 player-season panel RDS.
+#' @param seasons Integer vector of seasons to pool (default QB_RUSH_RATE_SEASONS).
+#' @return Tibble: nfl_gsis_id, qb_rush_pooled_pg, qb_rush_seasons_pooled.
+#' @keywords internal
+.compute_qb_rush_rate <- function(panel_path = PANEL_CACHE_PATH_ALLOC,
+                                  seasons    = QB_RUSH_RATE_SEASONS) {
+  empty <- tibble::tibble(
+    nfl_gsis_id            = character(),
+    qb_rush_pooled_pg      = numeric(),
+    qb_rush_seasons_pooled = integer()
+  )
+
+  panel <- tryCatch(readRDS(panel_path), error = function(e) NULL)
+  if (is.null(panel) || nrow(panel) == 0L) {
+    message("    QB rush rate: panel unavailable -- QB carries use median fallback")
+    return(empty)
+  }
+  needed <- c("player_id", "season", "position", "rush_attempts", "games_played")
+  if (length(setdiff(needed, names(panel))) > 0L) {
+    message("    QB rush rate: panel missing required columns -- median fallback")
+    return(empty)
+  }
+
+  rate <- panel %>%
+    dplyr::filter(as.integer(.data$season) %in% seasons,
+                  .data$position == "QB",
+                  !is.na(.data$games_played), .data$games_played > 0) %>%
+    dplyr::group_by(nfl_gsis_id = as.character(.data$player_id)) %>%
+    dplyr::summarise(
+      qb_rush_seasons_pooled = dplyr::n(),
+      tot_att = sum(.data$rush_attempts, na.rm = TRUE),
+      tot_g   = sum(.data$games_played,  na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(.data$tot_g > 0) %>%
+    dplyr::mutate(qb_rush_pooled_pg = .data$tot_att / .data$tot_g) %>%
+    dplyr::select(nfl_gsis_id, qb_rush_pooled_pg, qb_rush_seasons_pooled)
+
+  message(glue(
+    "    QB rush rate: pooled {nrow(rate)} QBs over ",
+    "{min(seasons)}-{max(seasons)} (game-weighted, scrambles included)"
+  ))
+  rate
+}
+
+# ------------------------------------------------------------------------------
 # .apply_team_volume
 # ------------------------------------------------------------------------------
 
 #' Multiply per-player shares by R/30 team volumes to get expected PPG inputs
 #'
-#' Joins R/30 output by team. expected_targets_pg = target_share * pass_pg,
-#' expected_carries_pg = rush_share * rush_pg.
+#' Targets: expected_targets_pg = target_share * pass_pg (unchanged).
+#'
+#' Rushing (v3_4): QBs no longer route through team-carry share. Each QB1 is
+#' assigned its pooled per-QB rush rate (or a provisional NFL QB1 median for
+#' no-history QB1s); QB2/QB3 get 0. The QB1 rate is SUBTRACTED from the team
+#' rush pool first, and the RBs (and any non-QB rusher) split the residual by
+#' their existing rush_share renormalized among themselves. This keeps the RB
+#' soft constraint untouched and makes the QB carries a true player trait rather
+#' than a self-deflating share. The now-vestigial QB rush-share and carryover
+#' audit fields are blanked to NA for QB rows.
 #'
 #' @param alloc_table Tibble with target_share and rush_share columns.
 #' @param team_volumes Tibble from R/30 project_team_volumes().
-#' @return Same tibble with expected_targets_pg and expected_carries_pg
-#'   columns added.
+#' @param qb_rush_rates Tibble from .compute_qb_rush_rate() (or NULL).
+#' @param rookie_qb_rates Tibble from .compute_rookie_qb_rush_rate() keyed by
+#'   name_key (or NULL): the college-tier fallback for no-history QB1s.
+#' @return Same tibble with expected_targets_pg, expected_carries_pg, and the
+#'   qb_rush_pooled_pg / qb_rush_seasons_pooled / qb_rush_rate_source columns.
 #' @keywords internal
-.apply_team_volume <- function(alloc_table, team_volumes) {
+.apply_team_volume <- function(alloc_table, team_volumes,
+                               qb_rush_rates = NULL, rookie_qb_rates = NULL) {
 
-  alloc_table %>%
+  if (is.null(qb_rush_rates)) {
+    qb_rush_rates <- tibble::tibble(
+      nfl_gsis_id            = character(),
+      qb_rush_pooled_pg      = numeric(),
+      qb_rush_seasons_pooled = integer()
+    )
+  }
+  if (is.null(rookie_qb_rates)) {
+    rookie_qb_rates <- tibble::tibble(
+      name_key      = character(),
+      rookie_rate   = numeric(),
+      rookie_source = character()
+    )
+  }
+
+  joined <- alloc_table %>%
     dplyr::left_join(
       team_volumes %>%
         dplyr::select(team, projected_pass_pg, projected_rush_pg) %>%
@@ -1703,16 +2263,92 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
         ),
       by = "team"
     ) %>%
+    dplyr::left_join(qb_rush_rates, by = "nfl_gsis_id") %>%
+    dplyr::mutate(name_key = dplyr::if_else(
+      .data$position == "QB", .qb_name_key(.data$player_name), NA_character_)) %>%
+    dplyr::left_join(rookie_qb_rates, by = "name_key")
+
+  # Last-resort fallback for a no-history QB1 with no college match either:
+  # median pooled rate among the QB1s that DO have NFL history.
+  qb1_hist <- joined %>%
+    dplyr::filter(.data$position == "QB",
+                  .data$depth_position == "QB1",
+                  !is.na(.data$qb_rush_pooled_pg)) %>%
+    dplyr::pull(.data$qb_rush_pooled_pg)
+  fallback_rate <- if (length(qb1_hist) > 0L) stats::median(qb1_hist) else 0
+
+  joined <- joined %>%
     dplyr::mutate(
-      expected_targets_pg = .data$target_share *
-                              dplyr::coalesce(
-                                .data$projected_team_pass_pg, 0
-                              ),
-      expected_carries_pg = .data$rush_share *
-                              dplyr::coalesce(
-                                .data$projected_team_rush_pg, 0
-                              )
+      # Priority: NFL history pool > college-tier rookie fallback > median.
+      qb_rush_rate_source = dplyr::case_when(
+        .data$position != "QB"          ~ NA_character_,
+        .data$depth_position != "QB1"   ~ "backup_zero",
+        !is.na(.data$qb_rush_pooled_pg) ~ "history_pool",
+        !is.na(.data$rookie_source)     ~ .data$rookie_source,
+        TRUE                            ~ "prior_median_fallback"
+      ),
+      qb_carries_tmp = dplyr::case_when(
+        .data$position == "QB" & .data$depth_position == "QB1" ~
+          dplyr::coalesce(.data$qb_rush_pooled_pg, .data$rookie_rate,
+                          fallback_rate),
+        .data$position == "QB"                                 ~ 0,
+        TRUE                                                   ~ NA_real_
+      )
     )
+
+  # Per-team: QB1 carries to subtract, and non-QB rush-share sum to renormalize
+  # (computed on the pre-blank shares).
+  team_adj <- joined %>%
+    dplyr::group_by(.data$team) %>%
+    dplyr::summarise(
+      team_qb1_carries = sum(
+        .data$qb_carries_tmp[.data$position == "QB" &
+                               .data$depth_position == "QB1"],
+        na.rm = TRUE),
+      team_nonqb_rush_share = sum(
+        .data$rush_share[.data$position != "QB"], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  joined %>%
+    dplyr::left_join(team_adj, by = "team") %>%
+    dplyr::mutate(
+      rush_residual_tmp = pmax(
+        dplyr::coalesce(.data$projected_team_rush_pg, 0) -
+          dplyr::coalesce(.data$team_qb1_carries, 0), 0),
+      expected_targets_pg = .data$target_share *
+                              dplyr::coalesce(.data$projected_team_pass_pg, 0),
+      expected_carries_pg = dplyr::case_when(
+        .data$position == "QB" & .data$depth_position == "QB1" ~
+          .data$qb_carries_tmp,
+        .data$position == "QB" ~ 0,
+        .data$team_nonqb_rush_share > 0 ~
+          (.data$rush_share / .data$team_nonqb_rush_share) *
+            .data$rush_residual_tmp,
+        TRUE ~ 0
+      ),
+      qb_rush_pooled_pg = dplyr::if_else(
+        .data$position == "QB", .data$qb_rush_pooled_pg, NA_real_),
+      qb_rush_seasons_pooled = dplyr::if_else(
+        .data$position == "QB", .data$qb_rush_seasons_pooled, NA_integer_),
+      # Blank vestigial QB rush-share + carryover audit fields (they no longer
+      # feed QB output; keeping them would misleadingly imply a share basis).
+      rush_share_base = dplyr::if_else(
+        .data$position == "QB", NA_real_, .data$rush_share_base),
+      rush_share_adjusted = dplyr::if_else(
+        .data$position == "QB", NA_real_, .data$rush_share_adjusted),
+      rush_share = dplyr::if_else(
+        .data$position == "QB", NA_real_, .data$rush_share),
+      carryover_applied = dplyr::if_else(
+        .data$position == "QB", FALSE, .data$carryover_applied),
+      carryover_prior_share = dplyr::if_else(
+        .data$position == "QB", NA_real_, .data$carryover_prior_share),
+      carryover_weight = dplyr::if_else(
+        .data$position == "QB", NA_real_, .data$carryover_weight)
+    ) %>%
+    dplyr::select(-qb_carries_tmp, -rush_residual_tmp,
+                  -team_qb1_carries, -team_nonqb_rush_share,
+                  -name_key, -rookie_rate, -rookie_source)
 }
 
 # ==============================================================================
@@ -1837,6 +2473,7 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
                                       season             = SEASON_ALLOC,
                                       as_of_week         = NULL,
                                       current_season_volume = NULL,
+                                      preseason_carryover = TRUE,
                                       save_output        = TRUE) {
 
   message(glue("\n{strrep('=', 70)}"))
@@ -1844,7 +2481,8 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   message(glue("Soft constraint bounds: [{CONSTRAINT_LOWER}, ",
                "{CONSTRAINT_UPPER}]"))
   if (is.null(as_of_week)) {
-    message("Allocation mode: preseason (depth chart + capital + talent)")
+    message(glue("Allocation mode: preseason (depth chart + capital + talent",
+                 "{if (preseason_carryover) ' + prior-season share carryover' else ''})"))
   } else {
     message(glue("Allocation mode: in-season at week {as_of_week} ",
                  "(preseason shares taper toward observed)"))
@@ -1859,6 +2497,19 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   }
   team_volumes <- readRDS(team_volumes_path)
   message(glue("  Loaded {nrow(team_volumes)} team volume projections"))
+
+  # Committee teams carry >1 R/30 row (one per candidate QB). R/31 uses only
+  # team-level pass/rush volume here, near-identical across candidates, so
+  # collapse to one representative row per team (highest QB quality). Prevents
+  # fanning every player on a committee team. Non-committee teams unaffected.
+  if ("committee_group" %in% names(team_volumes)) {
+    .qcol <- if ("qb_quality_score" %in% names(team_volumes))
+      team_volumes$qb_quality_score else rep(0, nrow(team_volumes))
+    team_volumes <- team_volumes[order(team_volumes$team, -.qcol), , drop = FALSE]
+    team_volumes <- team_volumes[!duplicated(team_volumes$team), , drop = FALSE]
+    message(glue("  Committee collapse: {nrow(team_volumes)} team rows after ",
+                 "one-per-team"))
+  }
 
   # STEP 2: Load 2026 depth charts
   message("\nSTEP 2/7: Loading depth charts")
@@ -1898,6 +2549,18 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   message("\nSTEP 6/7: Computing shares and enforcing soft constraints")
   alloc_with_shares <- .compute_initial_shares(alloc_table)
 
+  # STEP 6.25: Preseason share carryover (v3_3). For returning, non-mover,
+  # above-floor players, blend the primary share toward last season's realized
+  # share at the fitted per-position weight. Runs BEFORE the in-season blend so
+  # observed data tapers from the carryover baseline. No-op when disabled or
+  # when prior-season shares are unavailable.
+  prior_shares <- if (preseason_carryover) .compute_prior_season_shares() else NULL
+  alloc_with_shares <- .apply_preseason_carryover(
+    alloc_table  = alloc_with_shares,
+    prior_shares = prior_shares,
+    enabled      = preseason_carryover
+  )
+
   # STEP 6.5: In-season blend (no-op in preseason mode). Runs BEFORE the
   # constraint so the constraint operates once on the blended shares.
   alloc_blended <- .blend_observed_shares(
@@ -1910,9 +2573,36 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
 
   # STEP 7: Apply team volume to get expected volumes per player
   message("\nSTEP 7/7: Applying team volumes to get expected per-player volumes")
+  # v3_4: pooled per-QB rush trait rate (player trait, transfers across moves).
+  qb_rush_rates <- .compute_qb_rush_rate()
+
+  # v3_5: college-tier fallback for no-history (rookie) QB1s. The CFB panel is
+  # built (via lazy-sourced R/21) only when a QB1 actually lacks NFL rush history.
+  qb1_now       <- dplyr::filter(alloc_constrained,
+                                 .data$position == "QB",
+                                 .data$depth_position == "QB1")
+  qb1_hist_rate <- dplyr::semi_join(qb_rush_rates, qb1_now, by = "nfl_gsis_id")
+  no_hist_qb1   <- dplyr::anti_join(qb1_now, qb_rush_rates, by = "nfl_gsis_id")
+  rookie_qb_rates <- NULL
+  if (nrow(no_hist_qb1) > 0L && nrow(qb1_hist_rate) > 0L) {
+    nfl_qb1_q <- stats::quantile(qb1_hist_rate$qb_rush_pooled_pg,
+                                 c(0.25, 0.50, 0.75), na.rm = TRUE)
+    rookie_qb_rates <- .compute_rookie_qb_rush_rate(
+      rookie_names      = no_hist_qb1$player_name,
+      nfl_qb1_quantiles = nfl_qb1_q
+    )
+    n_tiered <- if (!is.null(rookie_qb_rates)) nrow(rookie_qb_rates) else 0L
+    message(glue(
+      "    Rookie QB1 fallback (F2): {nrow(no_hist_qb1)} no-history QB1(s), ",
+      "{n_tiered} tiered via college, rest use NFL QB1 median"
+    ))
+  }
+
   alloc_final <- .apply_team_volume(
-    alloc_table   = alloc_constrained,
-    team_volumes  = team_volumes
+    alloc_table     = alloc_constrained,
+    team_volumes    = team_volumes,
+    qb_rush_rates   = qb_rush_rates,
+    rookie_qb_rates = rookie_qb_rates
   )
 
   # Final output schema
@@ -1926,11 +2616,27 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
       target_share_base, target_share_adjusted, target_share,
       rush_share_base, rush_share_adjusted, rush_share,
       observed_target_share, observed_rush_share, share_blend_weight,
+      carryover_applied, carryover_prior_share, carryover_weight,
+      qb_rush_pooled_pg, qb_rush_seasons_pooled, qb_rush_rate_source,
       projected_team_pass_pg, projected_team_rush_pg,
       expected_targets_pg, expected_carries_pg,
       schema_tag
     ) %>%
     dplyr::arrange(team, position, depth_rank)
+
+  # Committee QB rooms (own-rate): tag each listed candidate and give the
+  # non-QB1 candidate his own pooled rush rate, so R/32 anchors both as full
+  # starters. RB allocation above is unchanged (it used the depth-QB1 subtract).
+  output <- output %>%
+    dplyr::left_join(.load_qb_committees_alloc(season = season),
+                     by = c("team", "nfl_gsis_id" = "qb_id")) %>%
+    dplyr::mutate(
+      expected_carries_pg = dplyr::if_else(
+        !is.na(.data$committee_group) & .data$position == "QB",
+        dplyr::coalesce(.data$qb_rush_pooled_pg, .data$expected_carries_pg),
+        .data$expected_carries_pg
+      )
+    )
 
   # Save outputs
   if (save_output) {
@@ -1993,6 +2699,9 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   message(glue("  Talent source - neutral:  {n_neutral} (no signal)"))
   message(glue("  Teams rescaled (targets): {n_target_rescaled} of {n_teams}"))
   message(glue("  Teams rescaled (rushes):  {n_rush_rescaled} of {n_teams}"))
+  n_carryover <- sum(output$carryover_applied, na.rm = TRUE)
+  message(glue("  Preseason carryover:      {n_carryover} players ",
+               "(returning, non-mover, above floor)"))
   if (!is.null(as_of_week)) {
     n_blended <- sum(!is.na(output$observed_target_share) |
                        !is.na(output$observed_rush_share), na.rm = TRUE)

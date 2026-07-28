@@ -111,11 +111,29 @@ PRIOR_SEASONS <- (SEASON - HISTORICAL_WINDOW):(SEASON - 1L)
 # least. Re-run the assumptions script if the prior window or scoring changes.
 REGRESSION_STRENGTH <- 0.50
 
+# Sleeper yards-allowed tier keys. Sleeper standard scoring does not award
+# yardage-tier points (all zero), but leagues can configure them, so the keys
+# are carried in the scoring config and parsed from league settings the same
+# way as the pts_allow tiers. Boundaries follow Sleeper's key names:
+# <100, 100-199, 200-299, 300-349, 350-399, 400-449, 450-499, 500-549, 550+.
+DEF_YDS_ALLOW_TIERS_DEFAULT <- c(
+  yds_allow_0_100   = 0,
+  yds_allow_100_199 = 0,
+  yds_allow_200_299 = 0,
+  yds_allow_300_349 = 0,
+  yds_allow_350_399 = 0,
+  yds_allow_400_449 = 0,
+  yds_allow_450_499 = 0,
+  yds_allow_500_549 = 0,
+  yds_allow_550p    = 0
+)
+
 # Default DEF/ST scoring (Sleeper standard), sourced from R/29's constants so
 # there is a single source of truth for the default values. Shape: a list with
-# a named pts_allow tier vector and a named events vector.
+# named pts_allow and yds_allow tier vectors and a named events vector.
 DEF_SCORING_DEFAULT <- list(
   pts_allow = unlist(DEF_PTS_ALLOW_TIERS),
+  yds_allow = DEF_YDS_ALLOW_TIERS_DEFAULT,
   events    = unlist(DEF_EVENT_POINTS)
 )
 
@@ -148,16 +166,21 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
 
 #' Build a DEF scoring config from raw Sleeper scoring_settings
 #'
-#' Reads the points-allowed tiers and event point values from a league's raw
-#' Sleeper scoring_settings, falling back to the supplied default for any key
-#' not present. Event categories tolerate multiple Sleeper key spellings via
-#' SLEEPER_DEF_EVENT_KEYS (first present wins).
+#' Reads the points-allowed tiers, yards-allowed tiers, and event point values
+#' from a league's raw Sleeper scoring_settings, falling back to the supplied
+#' default for any key not present. Event categories tolerate multiple Sleeper
+#' key spellings via SLEEPER_DEF_EVENT_KEYS (first present wins).
 #'
 #' @param scoring_settings Named list. Raw Sleeper scoring_settings, or NULL.
-#' @param default List. Fallback config, shape list(pts_allow, events).
-#' @return List with named numeric vectors pts_allow and events.
+#' @param default List. Fallback config, shape list(pts_allow, yds_allow,
+#'   events).
+#' @return List with named numeric vectors pts_allow, yds_allow, and events.
 #' @keywords internal
 .parse_def_scoring <- function(scoring_settings, default = DEF_SCORING_DEFAULT) {
+  # Tolerate a default built before yds_allow existed (e.g. a test fixture).
+  if (is.null(default$yds_allow)) {
+    default$yds_allow <- DEF_YDS_ALLOW_TIERS_DEFAULT
+  }
   if (is.null(scoring_settings) || length(scoring_settings) == 0L) {
     return(default)
   }
@@ -166,6 +189,13 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
   for (k in names(pa)) {
     if (!is.null(scoring_settings[[k]])) {
       pa[[k]] <- as.numeric(scoring_settings[[k]])
+    }
+  }
+
+  ya <- default$yds_allow
+  for (k in names(ya)) {
+    if (!is.null(scoring_settings[[k]])) {
+      ya[[k]] <- as.numeric(scoring_settings[[k]])
     }
   }
 
@@ -178,7 +208,7 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
     }
   }
 
-  list(pts_allow = pa, events = ev)
+  list(pts_allow = pa, yds_allow = ya, events = ev)
 }
 
 # ------------------------------------------------------------------------------
@@ -208,6 +238,35 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
 }
 
 # ------------------------------------------------------------------------------
+# .def_yds_allowed_to_points
+# ------------------------------------------------------------------------------
+
+#' Map total yards allowed to tier points under a supplied tier vector
+#'
+#' Vectorized, mirroring .def_pts_allowed_to_points for the yds_allow_* family.
+#' Tier boundaries follow Sleeper's key names (yds_allow_0_100 = under 100,
+#' ..., yds_allow_550p = 550 or more).
+#'
+#' @param yds_allowed Numeric vector of total yards allowed.
+#' @param tiers Named numeric vector with the nine yds_allow_* keys.
+#' @return Numeric vector of tier points (NA where yds_allowed is NA).
+#' @keywords internal
+.def_yds_allowed_to_points <- function(yds_allowed, tiers) {
+  dplyr::case_when(
+    is.na(yds_allowed)  ~ NA_real_,
+    yds_allowed < 100   ~ tiers[["yds_allow_0_100"]],
+    yds_allowed < 200   ~ tiers[["yds_allow_100_199"]],
+    yds_allowed < 300   ~ tiers[["yds_allow_200_299"]],
+    yds_allowed < 350   ~ tiers[["yds_allow_300_349"]],
+    yds_allowed < 400   ~ tiers[["yds_allow_350_399"]],
+    yds_allowed < 450   ~ tiers[["yds_allow_400_449"]],
+    yds_allowed < 500   ~ tiers[["yds_allow_450_499"]],
+    yds_allowed < 550   ~ tiers[["yds_allow_500_549"]],
+    TRUE                ~ tiers[["yds_allow_550p"]]
+  )
+}
+
+# ------------------------------------------------------------------------------
 # .score_def_games
 # ------------------------------------------------------------------------------
 
@@ -219,18 +278,40 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
 #'
 #' @param counts Tibble from calculate_def_st_points() with columns
 #'   opponent_pts_allowed, sacks, def_ints, fum_recs, def_tds, safeties,
-#'   blocked_kicks (plus identifiers).
-#' @param scoring List config, shape list(pts_allow, events).
-#' @return The input tibble with pts_allow_points, def_event_points, and
-#'   def_st_points recomputed under the supplied scoring.
+#'   blocked_kicks (plus identifiers), optionally augmented with
+#'   opponent_yds_allowed (see .compute_yds_allowed).
+#' @param scoring List config, shape list(pts_allow, yds_allow, events).
+#' @return The input tibble with pts_allow_points, yds_allow_points,
+#'   def_event_points, and def_st_points recomputed under the supplied
+#'   scoring.
 #' @keywords internal
 .score_def_games <- function(counts, scoring) {
   ev <- scoring$events
+  ya <- scoring$yds_allow %||% DEF_YDS_ALLOW_TIERS_DEFAULT
+  has_yds_tiers <- any(ya != 0)
+  has_yds_data  <- "opponent_yds_allowed" %in% names(counts)
+
+  if (has_yds_tiers && !has_yds_data) {
+    warning(
+      "DEF scoring has non-zero yds_allow_* tiers but the per-game counts ",
+      "carry no opponent_yds_allowed column -- yardage-tier points are NOT ",
+      "applied.",
+      call. = FALSE
+    )
+  }
+
   counts %>%
     dplyr::mutate(
       pts_allow_points = .def_pts_allowed_to_points(
         .data$opponent_pts_allowed, scoring$pts_allow
       ),
+      yds_allow_points = if (has_yds_tiers && has_yds_data) {
+        dplyr::coalesce(
+          .def_yds_allowed_to_points(.data$opponent_yds_allowed, ya), 0
+        )
+      } else {
+        0
+      },
       def_event_points =
         .data$sacks         * ev[["sack"]] +
         .data$def_ints      * ev[["def_int"]] +
@@ -238,7 +319,8 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
         .data$def_tds       * ev[["def_td"]] +
         .data$safeties      * ev[["safety"]] +
         .data$blocked_kicks * ev[["blk_kick"]],
-      def_st_points = .data$pts_allow_points + .data$def_event_points
+      def_st_points = .data$pts_allow_points + .data$yds_allow_points +
+        .data$def_event_points
     )
 }
 
@@ -319,6 +401,51 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
 }
 
 # ------------------------------------------------------------------------------
+# .compute_yds_allowed
+# ------------------------------------------------------------------------------
+
+#' Per-team total yards allowed per game, computed from pbp
+#'
+#' calculate_def_st_points() (R/29) does not tally yards allowed, so R/34
+#' derives it here from the same pbp used for points allowed: total yards
+#' gained by the opposing offense on rush/pass plays (sacks count as negative
+#' passing yards, matching official team-total-yards convention). Returns NULL
+#' when the pbp lacks the needed columns, in which case .score_def_games()
+#' warns if the league actually scores yardage tiers.
+#'
+#' @param pbp Play-by-play tibble (one season or season-to-date).
+#' @return Tibble: season, week, game_id, team, opponent_yds_allowed; or NULL.
+#' @keywords internal
+.compute_yds_allowed <- function(pbp) {
+  needed <- c("season_type", "season", "week", "game_id", "defteam",
+              "posteam", "yards_gained")
+  if (!all(needed %in% names(pbp))) return(NULL)
+
+  pbp_use <- pbp %>%
+    dplyr::filter(.data$season_type == "REG",
+                   !is.na(.data$defteam), !is.na(.data$posteam))
+
+  if (all(c("rush", "pass") %in% names(pbp_use))) {
+    pbp_use <- dplyr::filter(
+      pbp_use,
+      dplyr::coalesce(.data$rush, 0L) == 1L |
+        dplyr::coalesce(.data$pass, 0L) == 1L
+    )
+  } else if ("play_type" %in% names(pbp_use)) {
+    pbp_use <- dplyr::filter(pbp_use,
+                              .data$play_type %in% c("run", "pass"))
+  }
+
+  pbp_use %>%
+    dplyr::group_by(.data$season, .data$week, .data$game_id, .data$defteam) %>%
+    dplyr::summarise(
+      opponent_yds_allowed = sum(.data$yards_gained, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::rename(team = defteam)
+}
+
+# ------------------------------------------------------------------------------
 # .compute_team_def_ppg
 # ------------------------------------------------------------------------------
 
@@ -334,6 +461,14 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
     return(tibble::tibble(team = character(), def_ppg = numeric(),
                           n_games = integer()))
   }
+
+  # Attach yards allowed so leagues with yds_allow_* tiers score correctly.
+  yds <- .compute_yds_allowed(pbp)
+  if (!is.null(yds)) {
+    games <- dplyr::left_join(games, yds,
+                              by = c("season", "week", "game_id", "team"))
+  }
+
   .score_def_games(games, scoring) %>%
     dplyr::group_by(team) %>%
     dplyr::summarise(

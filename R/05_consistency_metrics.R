@@ -83,7 +83,16 @@
 #' Additional penalty when a QB's interception is returned for a touchdown.
 #' Standard interception penalty PLUS pick-6 penalty = total deduction.
 #' Example: pass_int = -2, pick6_penalty = -4 → Pick-6 costs -6 total
-#' 
+#'
+#' **Two-Point Conversions:**
+#'
+#' 2-pt conversion attempts are excluded from yardage/TD stats (conversion
+#' yardage does not count toward statistics). Successful conversions award +2
+#' points to each credited player (passer, rusher, or receiver), reported in
+#' the two_point_conversions column and included in total_fantasy_points.
+#' Requires the two_point_attempt and two_point_conv_result columns; if
+#' absent, conversions are neither excluded nor scored.
+#'
 #' **Quick League Setup Examples:**
 #' 
 #' ```r
@@ -180,7 +189,7 @@ calculate_fantasy_points <- function(pbp_data,
                      "passing_yards", "rushing_yards", "receiving_yards",
                      "pass_touchdown", "rush_touchdown", "touchdown",
                      "interception", "fumble_lost", "complete_pass",
-                     "fumbled_1_player_id", "posteam")
+                     "fumbled_1_player_id", "fumbled_2_player_id", "posteam")
   
   missing_cols <- setdiff(required_cols, names(pbp_data))
   if (length(missing_cols) > 0) {
@@ -235,7 +244,23 @@ calculate_fantasy_points <- function(pbp_data,
       !is.na(play_type),
       play_type %in% c("pass", "run")
     )
-  
+
+  # CRITICAL FIX: 2-pt conversion attempts also carry play_type "pass"/"run"
+  # in nflfastR. Exclude them from the yardage/TD aggregation (conversion
+  # yardage does not count toward stats) and score successful conversions
+  # separately below (+2 points). Guarded for column existence.
+  has_two_point <- all(c("two_point_attempt", "two_point_conv_result") %in% names(pbp_filtered))
+
+  if (has_two_point) {
+    two_point_plays <- pbp_filtered %>%
+      filter(two_point_attempt == 1)
+
+    pbp_filtered <- pbp_filtered %>%
+      filter(two_point_attempt == 0 | is.na(two_point_attempt))
+  } else {
+    two_point_plays <- pbp_filtered[0, ]
+  }
+
   if (nrow(pbp_filtered) == 0) {
     warning("No offensive plays found with given filters")
     return(tibble())
@@ -288,7 +313,12 @@ calculate_fantasy_points <- function(pbp_data,
         pass_tds = sum(pass_touchdown == 1, na.rm = TRUE),
         pass_ints = sum(interception == 1, na.rm = TRUE),
         pick6 = sum(interception == 1 & touchdown == 1, na.rm = TRUE),
-        pass_fumbles_lost = sum(fumble_lost == 1 & passer_player_id == fumbled_1_player_id, na.rm = TRUE),
+        pass_fumbles_lost = sum(
+          fumble_lost == 1 &
+            (passer_player_id == fumbled_1_player_id |
+               passer_player_id == fumbled_2_player_id),
+          na.rm = TRUE
+        ),
         
         # Calculate fantasy points
         pass_fantasy_points = 
@@ -357,7 +387,12 @@ calculate_fantasy_points <- function(pbp_data,
         rush_yards = sum(rushing_yards, na.rm = TRUE),
         rush_tds = sum(rush_touchdown == 1, na.rm = TRUE),
         rush_attempts = if (has_rush_attempt) sum(rush_attempt == 1, na.rm = TRUE) else n(),
-        rush_fumbles_lost = sum(fumble_lost == 1 & rusher_player_id == fumbled_1_player_id, na.rm = TRUE),
+        rush_fumbles_lost = sum(
+          fumble_lost == 1 &
+            (rusher_player_id == fumbled_1_player_id |
+               rusher_player_id == fumbled_2_player_id),
+          na.rm = TRUE
+        ),
         
         # Calculate fantasy points (including rush attempt bonus)
         rush_fantasy_points = 
@@ -437,7 +472,12 @@ calculate_fantasy_points <- function(pbp_data,
         receptions = sum(complete_pass == 1, na.rm = TRUE),
         rec_yards = sum(receiving_yards, na.rm = TRUE),
         rec_tds = sum(touchdown == 1 & pass_touchdown == 1, na.rm = TRUE),
-        rec_fumbles_lost = sum(fumble_lost == 1 & receiver_player_id == fumbled_1_player_id, na.rm = TRUE),
+        rec_fumbles_lost = sum(
+          fumble_lost == 1 &
+            (receiver_player_id == fumbled_1_player_id |
+               receiver_player_id == fumbled_2_player_id),
+          na.rm = TRUE
+        ),
         tiered_pts = if (use_tiered_ppr) sum(tiered_ppr_pts, na.rm = TRUE) else 0,
         
         .groups = "drop"
@@ -538,10 +578,49 @@ calculate_fantasy_points <- function(pbp_data,
       rush_attempts = sum(rush_attempts, na.rm = TRUE),
       
       .groups = "drop"
+    )
+
+  # ============================================================================
+  # ADD 2-PT CONVERSION POINTS (scored separately from yardage stats)
+  # ============================================================================
+
+  # Each player credited on a successful conversion (passer, rusher, or
+  # receiver) earns +2 points. NOTE: a player whose only involvement in a week
+  # is a 2-pt conversion will not appear in all_fantasy and is not added.
+  two_point_success <- two_point_plays %>%
+    filter(two_point_conv_result == "success")
+
+  if (nrow(two_point_success) > 0) {
+    two_point_fantasy <- bind_rows(
+      two_point_success %>%
+        filter(!is.na(passer_player_id)) %>%
+        select(season, week, game_id, player_id = passer_player_id),
+      two_point_success %>%
+        filter(!is.na(rusher_player_id)) %>%
+        select(season, week, game_id, player_id = rusher_player_id),
+      two_point_success %>%
+        filter(!is.na(receiver_player_id)) %>%
+        select(season, week, game_id, player_id = receiver_player_id)
     ) %>%
+      group_by(season, week, game_id, player_id) %>%
+      summarise(two_point_conversions = n(), .groups = "drop")
+
+    all_fantasy <- all_fantasy %>%
+      left_join(two_point_fantasy,
+                by = c("season", "week", "game_id", "player_id")) %>%
+      mutate(
+        two_point_conversions = coalesce(two_point_conversions, 0L),
+        total_fantasy_points = total_fantasy_points + 2 * two_point_conversions
+      )
+  } else {
+    all_fantasy <- all_fantasy %>%
+      mutate(two_point_conversions = 0L)
+  }
+
+  all_fantasy <- all_fantasy %>%
     # Sort by total fantasy points (descending)
     arrange(season, week, desc(total_fantasy_points))
-  
+
   message(glue("✓ Calculated fantasy points for {n_distinct(all_fantasy$player_id)} players"))
   message(glue("✓ Total player-weeks: {nrow(all_fantasy)}"))
   
@@ -573,11 +652,11 @@ calculate_fantasy_points <- function(pbp_data,
 #' For each player, statistics are averaged over the specified number of PREVIOUS games.
 #' The current game is NOT included in the rolling average to avoid feature leakage.
 #' 
-#' Example: Player has games in weeks 1, 2, 3, 5 (bye in week 4)
-#' - Week 1: No rolling avg (insufficient history)
-#' - Week 2: roll3 = avg(week 1 only), roll6 = avg(week 1 only)
+#' Example: Player has games in weeks 1, 2, 3, 5 (bye in week 4), min_games = 2
+#' - Week 1: NA (0 previous games)
+#' - Week 2: NA (1 previous game, need min_games = 2)
 #' - Week 3: roll3 = avg(weeks 1-2), roll6 = avg(weeks 1-2)
-#' - Week 5: roll3 = avg(weeks 2-3), roll6 = avg(weeks 1-3) - bye doesn't break streak
+#' - Week 5: roll3 = avg(weeks 1-3), roll6 = avg(weeks 1-3) - bye doesn't break streak
 #' 
 #' **Edge Cases Handled:**
 #' - Bye weeks: Skipped automatically (only actual games counted)
@@ -586,16 +665,18 @@ calculate_fantasy_points <- function(pbp_data,
 #' - Multiple stats: Each stat gets its own rolling columns
 #'
 #' **Partial Windows:**
-#' 
-#' The function uses partial = FALSE, meaning it requires EXACTLY 'window' games
-#' before calculating rolling average. With 3-game window:
+#'
+#' The function uses partial = TRUE, so windows shorter than 'window' games
+#' are evaluated and min_games is the only gate. With a 3-game window and the
+#' default min_games = 2:
 #' - Week 1: NA (0 previous games)
-#' - Week 2: NA (1 previous game, need 3)
-#' - Week 3: NA (2 previous games, need 3)
-#' - Week 4: avg(weeks 1-3) - FIRST valid rolling average
-#' 
-#' If you want averages with fewer games (e.g., 2-game average until 3 available),
-#' set min_games = 2. The function checks non-NA count and returns NA if < min_games.
+#' - Week 2: NA (1 previous game, need min_games = 2)
+#' - Week 3: avg(weeks 1-2) - FIRST valid rolling average
+#' - Week 4: avg(weeks 1-3) - full window from here on
+#'
+#' Increase min_games (up to 'window') to require more history before a
+#' rolling average is produced; non-NA games are counted, so bye weeks and
+#' missed games do not satisfy the requirement.
 #'
 #' **Dependencies:**
 #' This function requires the 'zoo' package for rolling calculations.

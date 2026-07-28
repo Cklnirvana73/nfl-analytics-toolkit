@@ -48,8 +48,9 @@
 #   - AFC West vs NFC South can differ by 0.05+ EPA/play in average opponent quality
 #   - Individual matchup history is too sparse (1-2 games vs each team per season)
 #     Use defensive archetype clusters, not specific team-matchup history
-#   - Opponent adjustment formula (additive):
-#       opp_adjusted_epa = player_epa - (opponent_avg_epa_allowed - league_avg_epa_allowed)
+#   - Opponent adjustment formula (additive, dampened by OPP_ADJ_SLOPE):
+#       opp_adjusted_epa = player_epa -
+#         OPP_ADJ_SLOPE * (opponent_avg_epa_allowed - league_avg_epa_allowed)
 #     Positive adjustment: player faced a better-than-average defense (rewarded)
 #     Negative adjustment: player faced a worse-than-average defense (penalized)
 #
@@ -76,6 +77,14 @@ library(tidyr)
 library(zoo)
 library(here)
 
+# Dampening slope applied to the opponent adjustment. A slope of 1.0 assumes
+# opponent quality transfers 1:1 into player EPA; empirically the transfer is
+# well under 0.5 (opponent EPA allowed is a noisy estimate of true defensive
+# quality, so full-strength adjustment over-corrects). TODO: estimate this
+# slope from data (regress player weekly EPA on opponent EPA allowed) rather
+# than assuming a constant.
+OPP_ADJ_SLOPE <- 0.5
+
 
 # ==============================================================================
 # SECTION 1: OPPONENT ADJUSTMENTS
@@ -89,8 +98,11 @@ library(here)
 #' defenses are rewarded (adjusted number rises); players who feasted on
 #' weak defenses are penalized (adjusted number falls).
 #'
-#' Adjustment formula (applied separately for pass and rush):
-#'   opp_adjusted_epa = raw_epa - (opponent_avg_epa_allowed - league_avg_epa_allowed)
+#' Adjustment formula (applied separately for pass and rush; the adjustment is
+#' dampened by the file-level constant OPP_ADJ_SLOPE because opponent quality
+#' does not transfer 1:1 into player EPA):
+#'   opp_adjusted_epa = raw_epa -
+#'     OPP_ADJ_SLOPE * (opponent_avg_epa_allowed - league_avg_epa_allowed)
 #'
 #' Opponent EPA allowed is computed as the mean EPA per play allowed by each
 #' team across the season (excluding the player's own team as opponent, which
@@ -136,8 +148,8 @@ library(here)
 #'     \item{opp_adjustment}{avg_opponent_epa_allowed minus league_avg_epa_allowed.
 #'       Positive = faced tougher-than-average defenses (player rewarded).
 #'       Negative = faced easier-than-average defenses (player penalized). (dbl)}
-#'     \item{opp_adjusted_epa}{raw_epa_per_play minus opp_adjustment (dbl).
-#'       This is the primary output metric.}
+#'     \item{opp_adjusted_epa}{raw_epa_per_play minus OPP_ADJ_SLOPE *
+#'       opp_adjustment (dbl). This is the primary output metric.}
 #'     \item{games_played}{Number of distinct games with qualifying plays (int)}
 #'     \item{schedule_difficulty_rank}{Rank among players in same position_group
 #'       by avg_opponent_epa_allowed (1 = hardest schedule). (int)}
@@ -272,14 +284,28 @@ calculate_opponent_adjustments <- function(pbp_data,
   # --- Step 1: Compute defensive EPA allowed per team-season ---
   # How many EPA/play does each defense allow?
   # Must compute BEFORE constructing player-level stats (no circularity).
+  # Totals (not just means) are kept so Step 3 can apply a leave-one-offense-out
+  # correction: when adjusting players on offense O vs defense D, D's EPA
+  # allowed is recomputed excluding plays where posteam == O.
   def_quality <- pbp_clean %>%
     group_by(season, defteam) %>%
     summarise(
       def_plays        = n(),
-      def_epa_allowed  = mean(epa, na.rm = TRUE),
+      def_epa_total    = sum(epa, na.rm = TRUE),
       .groups = "drop"
     ) %>%
+    mutate(def_epa_allowed = def_epa_total / def_plays) %>%
     filter(def_plays >= min_def_plays)
+
+  # Per (defense, offense) component used to subtract the player's own team's
+  # plays from the defense's EPA allowed (leave-one-offense-out).
+  def_vs_offense <- pbp_clean %>%
+    group_by(season, defteam, posteam) %>%
+    summarise(
+      vs_plays     = n(),
+      vs_epa_total = sum(epa, na.rm = TRUE),
+      .groups = "drop"
+    )
 
   # League average EPA allowed (grand mean across qualifying defenses)
   league_avg <- mean(def_quality$def_epa_allowed, na.rm = TRUE)
@@ -333,21 +359,41 @@ calculate_opponent_adjustments <- function(pbp_data,
   }
 
   # --- Step 3: Join defense quality to player plays ---
-  # Play-count weighted average opponent EPA allowed per player-season
+  # Play-count weighted average opponent EPA allowed per player-season.
+  # Leave-one-offense-out: a defense's EPA allowed is recomputed for each
+  # offense it faced by removing that offense's own plays from the aggregate
+  # (total_epa / n minus the offense-vs-defense component). This prevents a
+  # player's own production from inflating/deflating his opponent quality.
   player_with_def <- all_plays %>%
     left_join(
-      def_quality %>% select(season, defteam, def_epa_allowed),
+      def_quality %>% select(season, defteam, def_plays, def_epa_total),
       by = c("season", "defteam")
     ) %>%
-    # For plays where defense doesn't meet min_def_plays, use league average
+    left_join(def_vs_offense, by = c("season", "defteam", "posteam")) %>%
     mutate(
-      def_epa_allowed = ifelse(is.na(def_epa_allowed), league_avg, def_epa_allowed)
-    )
+      .loo_plays = def_plays - coalesce(vs_plays, 0L),
+      def_epa_allowed = case_when(
+        # Defense below min_def_plays threshold: use league average
+        is.na(def_plays)  ~ league_avg,
+        # Leave-one-offense-out mean of the defense's remaining plays
+        .loo_plays > 0    ~ (def_epa_total - coalesce(vs_epa_total, 0)) / .loo_plays,
+        # Degenerate case: defense only faced this offense -- league average
+        TRUE              ~ league_avg
+      )
+    ) %>%
+    select(-.loo_plays, -def_plays, -def_epa_total, -vs_plays, -vs_epa_total)
 
   # --- Step 4: Aggregate per player-position_group-season ---
+  # player_name is NOT a grouping key: pbp name-spelling variants would split
+  # one player_id into multiple rows and fan out every downstream join.
+  # The most frequent spelling is resolved inside summarise instead.
   player_stats <- player_with_def %>%
-    group_by(season, player_id, player_name, position_group) %>%
+    group_by(season, player_id, position_group) %>%
     summarise(
+      player_name       = {
+        nm <- player_name[!is.na(player_name)]
+        if (length(nm) > 0) names(which.max(table(nm))) else NA_character_
+      },
       team              = names(which.max(table(posteam))),
       total_plays       = n(),
       games_played      = n_distinct(game_id),
@@ -373,17 +419,19 @@ calculate_opponent_adjustments <- function(pbp_data,
 
   # --- Step 5: Apply opponent adjustment ---
   # opp_adjustment = avg_opponent_epa_allowed - league_avg_epa_allowed
-  # opp_adjusted_epa = raw_epa - opp_adjustment
-  # (subtract the "difficulty bonus/penalty" from raw performance)
+  # opp_adjusted_epa = raw_epa - OPP_ADJ_SLOPE * opp_adjustment
+  # (subtract the dampened "difficulty bonus/penalty" from raw performance;
+  #  opp_adjustment itself is left raw/unscaled for transparency)
   result <- player_stats %>%
     mutate(
       league_avg_epa_allowed   = league_avg,
       opp_adjustment           = avg_opponent_epa_allowed - league_avg_epa_allowed,
-      opp_adjusted_epa         = raw_epa_per_play - opp_adjustment
+      opp_adjusted_epa         = raw_epa_per_play - OPP_ADJ_SLOPE * opp_adjustment
     ) %>%
     group_by(season, position_group) %>%
     mutate(
-      schedule_difficulty_rank = rank(-avg_opponent_epa_allowed, ties.method = "min")
+      # Lowest avg EPA allowed = best defenses faced = hardest schedule = rank 1
+      schedule_difficulty_rank = rank(avg_opponent_epa_allowed, ties.method = "min")
     ) %>%
     ungroup() %>%
     select(
@@ -987,6 +1035,25 @@ calculate_matchup_history <- function(pbp_data,
 #'       more contamination from future games in this classification. (chr)}
 #'     \item{opponent_tier}{Defensive tier of this week's opponent using
 #'       full-season classification. NA if def_styles not provided. (chr)}
+#'     \item{next_opponent}{Opponent this player's team faces NEXT week
+#'       (week + 1), mapped from nflreadr::load_schedules(). NA on byes,
+#'       season end, or if the schedule download fails. Downstream models
+#'       predict next week's production, so this is the opponent for the
+#'       target week. (chr)}
+#'     \item{next_opp_def_epa_allowed}{EPA per play allowed by next week's
+#'       opponent, computed as an EXPANDING season-to-date mean from pbp
+#'       through the current week (leakage-safe; independent of def_styles).
+#'       NA if next_opponent is NA or the defense has no plays yet. (dbl)}
+#'     \item{next_opp_tier}{Defensive tier of next week's opponent
+#'       (full-season classification). NA if next_opponent is NA or
+#'       def_styles not provided. (chr)}
+#'     \item{next_team_spread}{This team's expected margin (Vegas closing
+#'       spread, team perspective) in next week's game. Positive = favored.
+#'       NA on byes or if schedules unavailable. (dbl)}
+#'     \item{next_game_total}{Vegas over/under total for next week's game. (dbl)}
+#'     \item{next_implied_total}{Implied team total for next week:
+#'       total/2 + spread/2. The strongest public single predictor of a
+#'       team's fantasy scoring environment. (dbl)}
 #'     \item{weeks_played}{Cumulative weeks played by this player in this season
 #'       up to and including this week (int)}
 #'   }
@@ -1129,9 +1196,15 @@ compile_feature_matrix <- function(pbp_data,
   }
 
   # --- Aggregate to player-position_group-week level ---
+  # player_name resolved in summarise, never used as a grouping key (name
+  # spelling variants across games would duplicate player-week rows).
   weekly_base <- all_plays %>%
-    group_by(season, week, player_id, player_name, position_group) %>%
+    group_by(season, week, player_id, position_group) %>%
     summarise(
+      player_name        = {
+        nm <- player_name[!is.na(player_name)]
+        if (length(nm) > 0) names(which.max(table(nm))) else NA_character_
+      },
       team               = names(which.max(table(posteam))),
       opponent           = names(which.max(table(opponent))),
       plays_this_week    = n(),
@@ -1439,6 +1512,111 @@ compile_feature_matrix <- function(pbp_data,
       )
   }
 
+  # --- NEXT-WEEK opponent features ---
+  # The downstream models (R/11+) predict NEXT week's production
+  # (target = lead(ppr_points_this_week)), but the opponent columns above
+  # describe the CURRENT week's defteam. Join the league schedule to map
+  # (season, team, week) -> opponent in week + 1 so models can condition on
+  # the opponent actually faced in the target week. NA on byes / season end.
+  # Existing current-week columns are kept for backward compatibility.
+  message("  Adding next-week opponent features from nflreadr::load_schedules()...")
+
+  next_opp_map <- tryCatch({
+    sched <- nflreadr::load_schedules(seasons = season)
+    # Vegas game environment travels with the opponent map: spread_line is the
+    # HOME team's expected margin (positive = home favored), so each team's
+    # expected margin is +spread_line at home and -spread_line away. Implied
+    # team total = total/2 + margin/2 -- the strongest public predictor of a
+    # team's fantasy scoring environment.
+    bind_rows(
+      sched %>%
+        select(season, week, team = home_team, sched_opponent = away_team,
+               total_line, spread_line) %>%
+        mutate(team_spread = spread_line),
+      sched %>%
+        select(season, week, team = away_team, sched_opponent = home_team,
+               total_line, spread_line) %>%
+        mutate(team_spread = -spread_line)
+    ) %>%
+      select(-spread_line) %>%
+      distinct()
+  }, error = function(e) {
+    warning(glue(
+      "compile_feature_matrix: could not load schedules for next-week opponent ",
+      "features ({conditionMessage(e)}). next_opponent columns will be NA."
+    ))
+    NULL
+  })
+
+  if (!is.null(next_opp_map) && nrow(next_opp_map) > 0) {
+    weekly_with_rolling <- weekly_with_rolling %>%
+      left_join(
+        # Shift schedule back one week: a row at week w gets the opponent
+        # scheduled for week w + 1.
+        next_opp_map %>%
+          mutate(week = week - 1L) %>%
+          select(season, week, team, next_opponent = sched_opponent,
+                 next_game_total = total_line, next_team_spread = team_spread),
+        by = c("season", "team", "week")
+      ) %>%
+      mutate(
+        next_implied_total = .data$next_game_total / 2 + .data$next_team_spread / 2
+      )
+  } else {
+    weekly_with_rolling <- weekly_with_rolling %>%
+      mutate(next_opponent      = NA_character_,
+             next_game_total    = NA_real_,
+             next_team_spread   = NA_real_,
+             next_implied_total = NA_real_)
+  }
+
+  # Next-week opponent defensive quality: EXPANDING season-to-date EPA per
+  # play allowed, computed directly from pbp. def_styles is deliberately NOT
+  # used for this number -- its full-season classification leaks future games
+  # (Week 11 leakage audit), which is why run_full_pipeline() passes
+  # def_styles = NULL and this column used to come back all-NA. A row at
+  # week w gets the defense's EPA allowed through week w: exactly the
+  # information available before the week w+1 matchup.
+  def_ytd <- pbp_data %>%
+    filter(
+      season == !!season,
+      play_type %in% c("pass", "run"),
+      !is.na(epa), !is.na(defteam)
+    ) %>%
+    group_by(defteam, week) %>%
+    summarise(.epa_sum = sum(epa), .n_plays = n(), .groups = "drop") %>%
+    tidyr::complete(defteam,
+                    week = sort(unique(weekly_with_rolling$week)),
+                    fill = list(.epa_sum = 0, .n_plays = 0L)) %>%
+    arrange(defteam, week) %>%
+    group_by(defteam) %>%
+    mutate(
+      .cum_n = cumsum(.n_plays),
+      next_opp_def_epa_allowed = ifelse(.cum_n > 0,
+                                        cumsum(.epa_sum) / .cum_n,
+                                        NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(next_opponent = defteam, week, next_opp_def_epa_allowed)
+
+  weekly_with_rolling <- weekly_with_rolling %>%
+    left_join(def_ytd, by = c("next_opponent", "week"))
+
+  # Tier label for next week's opponent still comes from def_styles when the
+  # caller supplies it (context only; NA otherwise).
+  if (!is.null(def_styles)) {
+    weekly_with_rolling <- weekly_with_rolling %>%
+      left_join(
+        def_styles %>%
+          filter(season == !!season) %>%
+          select(next_opponent = team, next_opp_tier = overall_tier),
+        by = "next_opponent"
+      )
+  } else {
+    weekly_with_rolling <- weekly_with_rolling %>%
+      mutate(next_opp_tier = NA_character_)
+  }
+
   # --- Final column ordering ---
   result <- weekly_with_rolling %>%
     select(
@@ -1448,6 +1626,8 @@ compile_feature_matrix <- function(pbp_data,
       neutral_epa_season, leading_share_season, trailing_share_season,
       opp_adjusted_epa_prior, schedule_difficulty_rank, opp_adj_games_prior,
       opponent_style, opponent_tier,
+      next_opponent, next_opp_def_epa_allowed, next_opp_tier,
+      next_team_spread, next_game_total, next_implied_total,
       weeks_played, weeks_since_role_change, role_stability_flag
     ) %>%
     arrange(player_id, position_group, week)

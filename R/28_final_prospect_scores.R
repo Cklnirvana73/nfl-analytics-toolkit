@@ -64,24 +64,18 @@ MIN_BIN_SIZE   <- 5L
 
 # Enriched model adds these two columns on top of base features (matches R/24)
 ENRICHED_ONLY_COLS <- c("draft_round", "draft_pick")
-MIN_NFL_GAMES        <- 4L      # Min qualifying games per NFL season (matches R/24)
 
-# Hit thresholds per position (updated from user session 2026-05-18)
-HIT_THRESHOLDS <- list(QB = 12L, RB = 24L, WR = 36L, TE = 12L)
+# NOTE: R/28 does NOT define its own hit label. is_hit arrives precomputed in
+# the predictions RDS / feature matrix from R/24's .compute_nfl_outcomes(),
+# which is the single source of truth for HIT_THRESHOLDS, PPR scoring
+# constants, and the min-games gate. Local copies of those constants were
+# removed: R/28's HIT_THRESHOLDS had drifted (RB = 24 vs R/24's RB = 36) and
+# the PPR_* / MIN_NFL_GAMES values were dead code. See R/24 lines ~150-200.
 
 POSITIONS <- c("QB", "RB", "WR", "TE")
 
-# PPR scoring constants -- match R/24 exactly
-PPR_PASS_YD   <-  0.04
-PPR_PASS_TD   <-  4.00
-PPR_INT       <- -2.00
-PPR_RUSH_YD   <-  0.10
-PPR_RUSH_TD   <-  6.00
-PPR_RECEPTION <-  1.00
-PPR_REC_YD    <-  0.10
-PPR_REC_TD    <-  6.00
-
-# Tier labels (Tier 1 = highest empirical hit rate)
+# Tier labels. Tiers are METRIC-ORDERED (Tier 1 = highest metric-value bin),
+# not hit-rate-ordered; see .derive_empirical_tiers().
 TIER_LABELS <- c(
   "1" = "Elite Signal",
   "2" = "Strong Signal",
@@ -95,7 +89,11 @@ NON_METRIC_COLS <- c(
   "player_name", "pfr_player_name", "cfb_player_name",
   "position", "draft_position", "draft_year", "draft_round", "draft_pick",
   "draft_age", "nfl_gsis_id", "gsis_id", "cfb_primary_team",
-  "draft_class_type", "match_method", "match_confidence"
+  "draft_class_type", "match_method", "match_confidence",
+  # NFL career-peak descriptors: outcome-side, not pre-draft signal. Tiering
+  # them against is_hit is circular (both are NFL outcomes), so exclude. The
+  # pre-draft analogue cfb_peak_ppr_per_game is the legitimate marker.
+  "peak_ppr_per_game", "peak_career_year"
 )
 
 # Paths -- v3 inputs (from R/27)
@@ -127,9 +125,10 @@ utils::globalVariables(c(
   "qualifying_seasons", "pred_base", "pred_enriched",
   "score_base", "score_enriched", "score_final",
   "enriched_improvement_pct", "sos_imputed", "is_training_player",
-  "hit_rate", "n_in_bin", "break_lower", "break_upper",
+  "hit_rate", "hit_rate_ci_lower", "hit_rate_ci_upper",
+  "n_in_bin", "break_lower", "break_upper",
   "tier", "tier_label", "stable", "metric_name", ".bin",
-  "n_hits", "ever_top_n", "score_v1"
+  "n_hits", "ever_top_n", "score_v1", "score_basis"
 ))
 
 
@@ -256,18 +255,25 @@ utils::globalVariables(c(
 # ------------------------------------------------------------------------------
 # .impute_with_medians
 # Apply stored training medians to NA values. Matches R/24 .impute_features().
-# Columns missing from df are added as 0 (safe fallback matching R/24 behavior).
+# Columns expected by the model but absent from df are an ERROR: silently
+# creating them as 0 (the old behavior) fabricates feature values and corrupts
+# every downstream score without any signal that it happened.
 # ------------------------------------------------------------------------------
 .impute_with_medians <- function(df, medians) {
+  missing_cols <- setdiff(names(medians), names(df))
+  if (length(missing_cols) > 0L) {
+    stop(glue::glue(
+      ".impute_with_medians(): columns expected by the model are absent from ",
+      "the data: {paste(missing_cols, collapse = ', ')}.\n",
+      "The feature matrix is stale or mis-exported -- regenerate it rather ",
+      "than scoring with fabricated zeros."
+    ), call. = FALSE)
+  }
   for (col in names(medians)) {
-    if (!col %in% names(df)) {
-      df[[col]] <- 0
-    } else {
-      na_idx <- is.na(df[[col]])
-      if (any(na_idx)) {
-        fill_val <- if (is.na(medians[[col]])) 0 else medians[[col]]
-        df[[col]][na_idx] <- fill_val
-      }
+    na_idx <- is.na(df[[col]])
+    if (any(na_idx)) {
+      fill_val <- if (is.na(medians[[col]])) 0 else medians[[col]]
+      df[[col]][na_idx] <- fill_val
     }
   }
   df
@@ -286,6 +292,10 @@ utils::globalVariables(c(
 #
 # Enriched feature set = base_feature_cols + ENRICHED_ONLY_COLS (draft_round, draft_pick).
 # Scaling uses training player LOCO prediction bounds from the predictions RDS.
+#
+# Training rows are scored from the honest LOCO predictions in the predictions
+# RDS (not the final models, which saw those rows); prediction rows use the
+# final models. The score_basis column ("loco" / "final_model") records which.
 # ------------------------------------------------------------------------------
 .score_all_prospects <- function(marker_df, models, training_preds) {
 
@@ -334,15 +344,59 @@ utils::globalVariables(c(
       stop(glue::glue("No training predictions found for {pos} in predictions RDS."))
     }
 
+    # HONEST SCORES FOR TRAINING ROWS: the final models were fit on the
+    # training rows, so scoring those rows with them is in-sample and
+    # optimistic. The predictions RDS already carries honest LOCO
+    # (leave-one-class-out) predictions for every training player -- use
+    # those for training rows; prediction-class rows keep final-model
+    # predictions. score_basis records which basis produced each row.
+    # Matching is by nfl_gsis_id; training rows without a usable match
+    # (e.g. NA gsis_id) fall back to final-model scores.
+    score_basis <- rep("final_model", nrow(pos_data))
+    if ("nfl_gsis_id" %in% names(pos_data) &&
+        "nfl_gsis_id" %in% names(train_pos) &&
+        "is_training_player" %in% names(pos_data)) {
+      loco_lookup <- train_pos |>
+        dplyr::filter(!is.na(nfl_gsis_id)) |>
+        dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
+      m_idx <- match(pos_data$nfl_gsis_id, loco_lookup$nfl_gsis_id)
+      use_loco <- which(
+        pos_data$is_training_player %in% TRUE &
+          !is.na(m_idx) &
+          !is.na(loco_lookup$pred_base[m_idx]) &
+          !is.na(loco_lookup$pred_enriched[m_idx])
+      )
+      if (length(use_loco) > 0L) {
+        raw_base[use_loco]     <- loco_lookup$pred_base[m_idx[use_loco]]
+        raw_enriched[use_loco] <- loco_lookup$pred_enriched[m_idx[use_loco]]
+        score_basis[use_loco]  <- "loco"
+      }
+      message(glue::glue(
+        "  [{pos}] {length(use_loco)} training row(s) scored from LOCO ",
+        "predictions; {nrow(pos_data) - length(use_loco)} from final models."
+      ))
+    }
+
     scale_0_100 <- function(x, mn, mx) {
       if (abs(mx - mn) < 1e-10) return(rep(50, length(x)))
       pmax(0, pmin(100, (x - mn) / (mx - mn) * 100))
     }
 
-    score_base_clamped     <- scale_0_100(raw_base,     min(train_pos$pred_base,     na.rm = TRUE), max(train_pos$pred_base,     na.rm = TRUE))
-    score_enriched_clamped <- scale_0_100(raw_enriched, min(train_pos$pred_enriched, na.rm = TRUE), max(train_pos$pred_enriched, na.rm = TRUE))
+    # 0-100 rescaling stays anchored on the LOCO training distribution.
+    mn_b <- min(train_pos$pred_base,     na.rm = TRUE)
+    mx_b <- max(train_pos$pred_base,     na.rm = TRUE)
+    mn_e <- min(train_pos$pred_enriched, na.rm = TRUE)
+    mx_e <- max(train_pos$pred_enriched, na.rm = TRUE)
 
-    n_oob <- sum(scale_0_100(raw_enriched, min(train_pos$pred_enriched, na.rm = TRUE), max(train_pos$pred_enriched, na.rm = TRUE)) != score_enriched_clamped)
+    score_base_clamped     <- scale_0_100(raw_base,     mn_b, mx_b)
+    score_enriched_clamped <- scale_0_100(raw_enriched, mn_e, mx_e)
+
+    # Count values genuinely outside [0, 100] BEFORE clamping. (The previous
+    # counter compared the clamped vector to itself and was always 0.)
+    n_oob <- if (abs(mx_e - mn_e) < 1e-10) 0L else {
+      unclamped <- (raw_enriched - mn_e) / (mx_e - mn_e) * 100
+      sum(unclamped < 0 | unclamped > 100, na.rm = TRUE)
+    }
     if (n_oob > 0L) message(glue::glue("  [{pos}] {n_oob} prospect(s) outside training score range -- clamped."))
 
     pos_data <- pos_data |>
@@ -350,6 +404,7 @@ utils::globalVariables(c(
         score_base             = score_base_clamped,
         score_enriched         = score_enriched_clamped,
         score_final            = score_enriched_clamped,
+        score_basis            = score_basis,
         enriched_improvement_pct = dplyr::if_else(
           score_base > 0,
           (score_enriched - score_base) / score_base * 100,
@@ -365,15 +420,42 @@ utils::globalVariables(c(
 
 
 # ------------------------------------------------------------------------------
+# .wilson_ci
+#
+# Wilson score interval for a binomial proportion (vectorized). Local
+# reimplementation -- R/40 has an equivalent helper but cross-sourcing between
+# pipeline files is deliberately avoided.
+# ------------------------------------------------------------------------------
+.wilson_ci <- function(n_hits, n, conf = 0.95) {
+  z <- stats::qnorm(1 - (1 - conf) / 2)
+  p <- n_hits / n
+  denom  <- 1 + z^2 / n
+  center <- (p + z^2 / (2 * n)) / denom
+  half   <- (z / denom) * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))
+  list(
+    lower = pmax(0, center - half),
+    upper = pmin(1, center + half)
+  )
+}
+
+
+# ------------------------------------------------------------------------------
 # .derive_empirical_tiers
 #
 # For a single metric column within a position's training players, partitions
-# values into N_TIERS quantile bins, computes the empirical hit rate per bin,
-# and re-ranks bins so Tier 1 = highest hit rate.
+# values into N_TIERS quantile bins and computes the empirical hit rate per
+# bin with a Wilson 95% CI.
+#
+# Tiers are METRIC-ORDERED: Tier 1 = highest metric-value bin, Tier N =
+# lowest. Bins are NOT re-sorted by observed hit rate -- at ~MIN_BIN_SIZE
+# players per bin, re-ranking on hit rate would guarantee a spuriously
+# monotone tier table (any noise ordering becomes "signal"). The reported
+# hit_rate + Wilson CI let the reader judge whether a gradient is real.
 #
 # Returns a list:
 #   $tier_ref : tibble with bin, tier, tier_label, break_lower, break_upper,
-#               hit_rate, n_in_bin, stable, metric_name
+#               hit_rate, hit_rate_ci_lower, hit_rate_ci_upper, n_in_bin,
+#               stable, metric_name
 #   $breaks   : numeric vector of bin boundaries (for applying to new players)
 #
 # Returns NULL if insufficient complete cases.
@@ -434,12 +516,20 @@ utils::globalVariables(c(
       break_upper = breaks[.bin + 1L]
     )
 
-  # Assign tier: Tier 1 = highest hit rate, ties broken by higher metric value
+  # Assign tier by METRIC VALUE: Tier 1 = highest metric-value bin. Do NOT
+  # re-sort by observed hit rate (see header comment) -- hit_rate and its
+  # Wilson 95% CI are reported per bin instead.
   bin_stats <- bin_stats |>
-    dplyr::arrange(dplyr::desc(hit_rate), dplyr::desc(break_lower)) |>
+    dplyr::arrange(dplyr::desc(break_lower))
+
+  ci <- .wilson_ci(bin_stats$n_hits, bin_stats$n_in_bin)
+
+  bin_stats <- bin_stats |>
     dplyr::mutate(
       tier       = dplyr::row_number(),
       tier_label = TIER_LABELS[as.character(tier)],
+      hit_rate_ci_lower = ci$lower,
+      hit_rate_ci_upper = ci$upper,
       stable     = n_in_bin >= MIN_BIN_SIZE,
       metric_name = metric
     )
@@ -751,10 +841,13 @@ run_week14_scoring <- function() {
     tier_reference <- dplyr::bind_rows(tier_ref_rows) |>
       dplyr::select(
         position, metric_name, tier, tier_label,
-        break_lower, break_upper, hit_rate, n_in_bin, stable
+        break_lower, break_upper, hit_rate,
+        hit_rate_ci_lower, hit_rate_ci_upper, n_in_bin, stable
       ) |>
       dplyr::mutate(
         hit_rate   = round(hit_rate, 4),
+        hit_rate_ci_lower = round(hit_rate_ci_lower, 4),
+        hit_rate_ci_upper = round(hit_rate_ci_upper, 4),
         break_lower = round(break_lower, 4),
         break_upper = round(break_upper, 4)
       ) |>
@@ -794,6 +887,13 @@ run_week14_scoring <- function() {
 
   # --------------------------------------------------------------------------
   # STEP 8: Compute per-position metric correlation matrices
+  #
+  # KNOWN LIMITATION: the feature matrix CSV is exported by R/27 AFTER its
+  # Step 8 median imputation of v3 columns, so no pre-imputation frame exists
+  # anywhere in R/28's flow. Correlations involving imputed v3 columns
+  # (combine, recruiting, breakout, dominator) are therefore attenuated
+  # toward zero. pairwise.complete.obs below handles the remaining genuine
+  # NAs; a true fix requires R/27 to export pre-imputation values.
   # --------------------------------------------------------------------------
   message("\nComputing metric correlation matrices ...")
   corr_rows <- list()
@@ -846,7 +946,7 @@ run_week14_scoring <- function() {
     "cfb_player_name", "position", "draft_year", "draft_class_type",
     # Scores
     "score_v1", "score_final", "score_base", "score_enriched",
-    "enriched_improvement_pct",
+    "score_basis", "enriched_improvement_pct",
     # Outcome flags (training players only)
     "is_hit", "ppr_per_game_y13",
     # Flags
@@ -920,4 +1020,10 @@ run_week14_scoring <- function() {
 # EXECUTION
 # ==============================================================================
 
-run_week14_scoring()
+# Run only when executed as a script (Rscript R/28_final_prospect_scores.R).
+# sys.nframe() == 0L is FALSE under source(), so sourcing this file to get the
+# functions no longer triggers a full scoring run (network access + 3 CSV
+# writes). Call run_week14_scoring() explicitly after sourcing if needed.
+if (sys.nframe() == 0L) {
+  run_week14_scoring()
+}

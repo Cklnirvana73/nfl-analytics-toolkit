@@ -477,7 +477,9 @@ calculate_leverage_features <- function(pbp_data,
   result <- bind_rows(passers, receivers, rushers) %>%
     group_by(season, player_id, player_name, position_group) %>%
     summarise(
-      team                 = first(team),
+      # Majority-plays team resolution: bind_rows order is arbitrary, so
+      # first(team) would be arbitrary for traded players
+      team                 = team[which.max(total_plays)],
       total_plays          = sum(total_plays),
       total_wpa            = sum(total_wpa),
       high_leverage_plays  = sum(high_leverage_plays),
@@ -563,6 +565,10 @@ calculate_leverage_features <- function(pbp_data,
 #' team. Negative = possessing team trailing. A deficit of 8 means
 #' score_differential <= -8.
 #'
+#' The overall baseline excludes BOTH garbage-time tails (Q4 WP < 0.10 and
+#' WP > 0.90), consistent with the other functions in this file, so
+#' comeback_vs_overall_epa is not biased by leading garbage time.
+#'
 #' @examples
 #' \dontrun{
 #' pbp <- load_and_validate_pbp(2025)
@@ -611,13 +617,16 @@ get_comeback_profile <- function(pbp_data,
   if (!is.null(season)) pbp_data <- pbp_data %>% filter(season %in% !!season)
   pbp_data <- pbp_data %>% filter(week >= week_min, week <= week_max)
 
-  # Base: all plays (no garbage time by definition -- exclude WP < 0.10 in Q4)
+  # Base: all clean plays with BOTH garbage-time tails removed (trailing
+  # wp < 0.10 AND leading wp > 0.90 in Q4), consistent with the other
+  # functions in this file. Keeping leading garbage time in the baseline but
+  # not the comeback subset would bias comeback_vs_overall_epa.
   pbp_base <- pbp_data %>%
     filter(
       !is.na(posteam), !is.na(epa), !is.na(wp),
       play_type %in% c("pass", "run"),
       qb_kneel == 0, qb_spike == 0,
-      !(qtr == 4 & wp < 0.10)
+      !(qtr == 4 & (wp < 0.10 | wp > 0.90))
     )
 
   # Comeback: trailing by deficit_threshold, but still competitive (wp >= 0.10)
@@ -634,11 +643,16 @@ get_comeback_profile <- function(pbp_data,
   ))
 
   agg_comeback <- function(df_base, df_cmb, id_col, name_col, pos_label) {
+    # Both sides aggregated at (season, player_id) grain so traded players do
+    # not get full-season comeback totals duplicated per team row and then
+    # double-counted. Team is resolved via the majority-plays rule (team with
+    # the most plays), matching the player_team logic used elsewhere in this
+    # file.
     overall <- df_base %>%
       filter(!is.na({{ id_col }}), !is.na({{ name_col }})) %>%
-      group_by(season, player_id = {{ id_col }}, player_name = {{ name_col }},
-               team = posteam) %>%
+      group_by(season, player_id = {{ id_col }}, player_name = {{ name_col }}) %>%
       summarise(
+        team            = names(which.max(table(posteam))),
         overall_plays   = n(),
         overall_sum_epa = sum(epa, na.rm = TRUE),
         .groups = "drop"
@@ -656,7 +670,8 @@ get_comeback_profile <- function(pbp_data,
       )
 
     overall %>%
-      left_join(cmb, by = c("season", "player_id")) %>%
+      left_join(cmb, by = c("season", "player_id"),
+                relationship = "many-to-one") %>%
       mutate(
         comeback_plays   = coalesce(comeback_plays,   0L),
         comeback_sum_epa = coalesce(comeback_sum_epa, 0.0),
@@ -888,13 +903,13 @@ calculate_script_adjusted_epa <- function(pbp_data,
     ungroup() %>%
     select(season, player_id, team)
 
-  # Totals -- include player_name via first() so it survives to the final select.
-  # Without this, player_name is dropped after the group_by aggregation and the
-  # downstream select("player_name", ...) fails with "column doesn't exist".
+  # Totals -- carry player_name through the aggregation so it survives to the
+  # final select. Resolved by majority plays (bind_rows order is arbitrary,
+  # so first() would be arbitrary for traded players / name variants).
   totals <- long_stats %>%
     group_by(season, player_id, position_group) %>%
     summarise(
-      player_name = first(player_name),
+      player_name = player_name[which.max(n_plays)],
       total_plays = sum(n_plays),
       total_epa   = sum(sum_epa),
       .groups     = "drop"

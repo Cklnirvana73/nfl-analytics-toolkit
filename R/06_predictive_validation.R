@@ -7,7 +7,7 @@
 #   2. calculate_predictive_correlations() - Lines 87-210
 #   3. run_regression_analysis() - Lines 212-320
 #   4. calculate_prediction_error() - Lines 322-425
-#   5. test_metric_stability() - Lines 427-550
+#   5. test_metric_stability() - NOT IMPLEMENTED (stops with an error)
 ################################################################################
 
 library(dplyr)
@@ -37,6 +37,8 @@ library(purrr)  # Required for map_dfr() in calculate_predictive_correlations()
 #' Common split point in NFL analytics for within-season prediction studies.
 #' 
 #' Key validations:
+#' - Regular season only: playoff weeks are excluded via season_type == "REG"
+#'   (when the season_type column is present)
 #' - No plays appear in both train and test
 #' - Both periods have data
 #' - Bye weeks handled automatically (players missing games retained)
@@ -54,7 +56,6 @@ library(purrr)  # Required for map_dfr() in calculate_predictive_correlations()
 #'
 #' @seealso 
 #' \code{\link{calculate_predictive_correlations}} for using train/test splits
-#' \code{\link{test_metric_stability}} for alternative stability testing
 #'
 #' @export
 split_season_by_week <- function(pbp_data, split_week = 8) {
@@ -71,7 +72,17 @@ split_season_by_week <- function(pbp_data, split_week = 8) {
   if (!"week" %in% names(pbp_data)) {
     stop("pbp_data must contain a 'week' column")
   }
-  
+
+  # CRITICAL FIX: Restrict to regular season so playoff weeks (19-22) do not
+  # leak into the test split (guarded for column existence)
+  if ("season_type" %in% names(pbp_data)) {
+    pbp_data <- pbp_data %>% filter(season_type == "REG")
+
+    if (nrow(pbp_data) == 0) {
+      stop("No regular-season plays (season_type == 'REG') found in pbp_data")
+    }
+  }
+
   # Check split_week is valid for this data
   max_week <- max(pbp_data$week, na.rm = TRUE)
   if (split_week >= max_week) {
@@ -212,12 +223,23 @@ calculate_predictive_correlations <- function(train_stats, test_stats, metrics, 
               "Available columns: {paste(names(train_stats), collapse=', ')}"))
   }
   
-  # Join train and test stats by player_id (inner join = only players in both periods)
+  # Join train and test stats (inner join = only players in both periods)
+  # CRITICAL FIX: include season in the join keys when present on both sides
+  # so multi-season inputs do not fan out, and enforce a one-to-one
+  # relationship so any remaining duplication errors instead of silently
+  # inflating rows
+  join_keys <- if ("season" %in% names(train_stats) && "season" %in% names(test_stats)) {
+    c("player_id", "season")
+  } else {
+    "player_id"
+  }
+
   combined <- train_stats %>%
-    select(player_id, all_of(metrics)) %>%
+    select(all_of(join_keys), all_of(metrics)) %>%
     inner_join(
-      test_stats %>% select(player_id, outcome_value = !!sym(outcome)),
-      by = "player_id"
+      test_stats %>% select(all_of(join_keys), outcome_value = !!sym(outcome)),
+      by = join_keys,
+      relationship = "one-to-one"
     )
   
   if (nrow(combined) == 0) {
@@ -369,11 +391,20 @@ run_regression_analysis <- function(train_stats, test_stats, predictors, outcome
   }
   
   # Join train predictors with test outcome
+  # CRITICAL FIX: join by season too when present on both sides, and enforce
+  # one-to-one so multi-season fan-out errors instead of duplicating players
+  join_keys <- if ("season" %in% names(train_stats) && "season" %in% names(test_stats)) {
+    c("player_id", "season")
+  } else {
+    "player_id"
+  }
+
   model_data <- train_stats %>%
-    select(player_id, all_of(predictors)) %>%
+    select(all_of(join_keys), all_of(predictors)) %>%
     inner_join(
-      test_stats %>% select(player_id, outcome_value = !!sym(outcome)),
-      by = "player_id"
+      test_stats %>% select(all_of(join_keys), outcome_value = !!sym(outcome)),
+      by = join_keys,
+      relationship = "one-to-one"
     ) %>%
     # Remove any rows with NA in predictors or outcome
     filter(if_all(all_of(c(predictors, "outcome_value")), ~ !is.na(.)))
@@ -447,6 +478,10 @@ run_regression_analysis <- function(train_stats, test_stats, predictors, outcome
 #' @param test_stats Tibble. Player statistics from test period
 #' @param metric Character. Column name in train_stats to use as predictor
 #' @param outcome Character. Column name in test_stats to predict
+#' @param per_game Logical. If TRUE (default), divide metric and outcome by
+#'   games_played (when present in both datasets) so train/test totals over
+#'   different game counts are comparable. Set FALSE for metrics that are
+#'   already rates (e.g., epa_per_play, yards_per_carry).
 #'
 #' @return Tibble with one row containing:
 #'   \describe{
@@ -456,15 +491,25 @@ run_regression_analysis <- function(train_stats, test_stats, predictors, outcome
 #'     \item{rmse}{Root Mean Squared Error (penalizes large errors more)}
 #'     \item{sample_size}{Number of players included}
 #'     \item{correlation}{Pearson r between predicted and actual}
+#'     \item{per_game}{Whether values were normalized to per-game}
+#'     \item{baseline_mae}{MAE of predicting every player at the sample
+#'       (positional) mean of the actual outcome}
+#'     \item{mae_skill}{1 - mae / baseline_mae; positive = beats the baseline}
 #'   }
 #'
 #' @details
 #' NFL Context: Quantifies prediction accuracy in interpretable units (e.g., fantasy points).
-#' "This metric predicts within ±X fantasy points on average."
-#' 
+#' "This metric predicts within ±X fantasy points per game on average."
+#'
 #' Prediction method: Use train metric value as prediction for test outcome
-#' (assumes stability: early-season value = late-season value)
-#' 
+#' (assumes stability: early-season value = late-season value). With
+#' per_game = TRUE, both sides are normalized by games_played first so that
+#' differing game counts between periods do not inflate the error.
+#'
+#' Baseline comparison: baseline_mae is the error from predicting the sample
+#' mean for everyone. Compare mae to baseline_mae (or read mae_skill) to see
+#' whether the metric carries real predictive signal.
+#'
 #' MAE vs RMSE:
 #' - MAE: Average absolute error (more robust to outliers)
 #' - RMSE: Square root of mean squared error (penalizes large errors)
@@ -494,7 +539,8 @@ run_regression_analysis <- function(train_stats, test_stats, predictors, outcome
 #' \code{\link{calculate_predictive_correlations}} for correlation-based prediction assessment
 #'
 #' @export
-calculate_prediction_error <- function(train_stats, test_stats, metric, outcome) {
+calculate_prediction_error <- function(train_stats, test_stats, metric, outcome,
+                                       per_game = TRUE) {
   
   # Input validation
   if (!is.data.frame(train_stats) || !is.data.frame(test_stats)) {
@@ -523,18 +569,54 @@ calculate_prediction_error <- function(train_stats, test_stats, metric, outcome)
   }
   
   # Join train metric with test outcome
-  combined <- train_stats %>%
-    select(player_id, predicted = !!sym(metric)) %>%
-    inner_join(
-      test_stats %>% select(player_id, actual = !!sym(outcome)),
-      by = "player_id"
-    ) %>%
-    filter(!is.na(predicted), !is.na(actual))
-  
+  # CRITICAL FIX: join by season too when present on both sides, and enforce
+  # one-to-one so multi-season fan-out errors instead of duplicating players
+  join_keys <- if ("season" %in% names(train_stats) && "season" %in% names(test_stats)) {
+    c("player_id", "season")
+  } else {
+    "player_id"
+  }
+
+  # CRITICAL FIX: train and test periods cover different numbers of games, so
+  # comparing raw totals conflates volume with accuracy. Normalize both sides
+  # to per-game values when games_played is available in both datasets.
+  has_games <- per_game &&
+    "games_played" %in% names(train_stats) &&
+    "games_played" %in% names(test_stats)
+
+  if (per_game && !has_games) {
+    warning("per_game = TRUE but 'games_played' not found in both datasets - using raw values")
+  }
+
+  if (has_games) {
+    combined <- train_stats %>%
+      select(all_of(join_keys), predicted = !!sym(metric), train_games = games_played) %>%
+      inner_join(
+        test_stats %>%
+          select(all_of(join_keys), actual = !!sym(outcome), test_games = games_played),
+        by = join_keys,
+        relationship = "one-to-one"
+      ) %>%
+      filter(!is.na(predicted), !is.na(actual), train_games > 0, test_games > 0) %>%
+      mutate(
+        predicted = predicted / train_games,
+        actual = actual / test_games
+      )
+  } else {
+    combined <- train_stats %>%
+      select(all_of(join_keys), predicted = !!sym(metric)) %>%
+      inner_join(
+        test_stats %>% select(all_of(join_keys), actual = !!sym(outcome)),
+        by = join_keys,
+        relationship = "one-to-one"
+      ) %>%
+      filter(!is.na(predicted), !is.na(actual))
+  }
+
   if (nrow(combined) == 0) {
     stop("No valid observations after joining and removing NAs")
   }
-  
+
   # Calculate errors
   errors <- combined %>%
     mutate(
@@ -542,184 +624,76 @@ calculate_prediction_error <- function(train_stats, test_stats, metric, outcome)
       abs_error = abs(error),
       squared_error = error^2
     )
-  
+
   # Calculate metrics
   mae <- mean(errors$abs_error)
   rmse <- sqrt(mean(errors$squared_error))
   correlation <- cor(errors$predicted, errors$actual, method = "pearson")
   n <- nrow(errors)
-  
+
+  # Baseline: MAE of predicting every player at the sample (positional) mean
+  # of the actual outcome. mae_skill > 0 means the metric beats that baseline.
+  baseline_mae <- mean(abs(errors$actual - mean(errors$actual)))
+
   result <- tibble(
     metric = metric,
     outcome = outcome,
     mae = mae,
     rmse = rmse,
     sample_size = n,
-    correlation = correlation
+    correlation = correlation,
+    per_game = has_games,
+    baseline_mae = baseline_mae,
+    mae_skill = 1 - mae / baseline_mae
   )
-  
-  message(glue("Prediction error: MAE = {round(mae, 2)}, RMSE = {round(rmse, 2)}, n = {n}"))
+
+  message(glue("Prediction error{if (has_games) ' (per game)' else ''}: ",
+               "MAE = {round(mae, 2)}, RMSE = {round(rmse, 2)}, ",
+               "baseline MAE = {round(baseline_mae, 2)}, n = {n}"))
   
   return(result)
 }
 
 
-#' Test Metric Stability Across Season Halves
+#' Test Metric Stability Across Season Halves (NOT IMPLEMENTED)
 #'
 #' @description
-#' Calculates correlation between first-half and second-half season performance
-#' to assess metric stability (test-retest reliability).
+#' Deprecated / not implemented. This function was a stub: it required a
+#' 'player_id' column that does not exist in raw play-by-play data and always
+#' returned correlation = NA. It now stops immediately rather than returning
+#' misleading output.
 #'
-#' @param pbp_data Play-by-play data from load_and_validate_pbp()
-#' @param metric Character. Metric to test for stability
-#' @param min_games Integer. Minimum games required in each half (default: 4)
+#' For a working alternative, split the season with
+#' \code{\link{split_season_by_week}}, aggregate each half with a
+#' get_player_*_stats() function, and pass the results to
+#' \code{\link{calculate_predictive_correlations}}.
 #'
-#' @return Tibble with one row containing:
-#'   \describe{
-#'     \item{metric}{Name of metric tested}
-#'     \item{correlation}{Correlation between first and second half}
-#'     \item{p_value}{Statistical significance}
-#'     \item{conf_low}{Lower 95% confidence interval}
-#'     \item{conf_high}{Upper 95% confidence interval}
-#'     \item{sample_size}{Number of players included}
-#'   }
+#' @param pbp_data Unused.
+#' @param metric Unused.
+#' @param min_games Unused.
 #'
-#' @details
-#' NFL Context: Tests whether early-season performance is a stable indicator.
-#' High correlation = metric stabilizes early, low correlation = high variance.
-#' 
-#' Method: 
-#' 1. Split season into two equal halves
-#' 2. Calculate metric for each player in each half
-#' 3. Correlate first-half values with second-half values
-#' 
-#' Interpretation:
-#' - r > 0.7: High stability (early values reliable)
-#' - r = 0.4-0.7: Moderate stability
-#' - r < 0.4: Low stability (need more games for reliable estimate)
-#' 
-#' Use case: "How many games before yards per carry stabilizes?"
+#' @return Does not return; always throws an error.
 #'
 #' @examples
 #' \dontrun{
-#' pbp <- load_and_validate_pbp(2025)
-#' 
-#' # Test EPA stability
-#' stability_epa <- test_metric_stability(pbp, metric = "rush_epa_per_play")
-#' 
-#' # Test yards per carry stability
-#' stability_ypc <- test_metric_stability(pbp, metric = "yards_per_carry")
-#' 
-#' # Compare
-#' cat("EPA stability:", stability_epa$correlation, "\n")
-#' cat("YPC stability:", stability_ypc$correlation, "\n")
+#' # test_metric_stability() is not implemented. Working alternative:
+#' splits <- split_season_by_week(pbp, split_week = 8)
+#' train_stats <- get_player_rushing_stats(splits$train)
+#' test_stats <- get_player_rushing_stats(splits$test)
+#'
+#' calculate_predictive_correlations(
+#'   train_stats = train_stats,
+#'   test_stats = test_stats,
+#'   metrics = "rush_epa_per_play",
+#'   outcome = "rush_epa_per_play"
+#' )
 #' }
 #'
-#' @seealso 
-#' \code{\link{split_season_by_week}} for alternative split methods
+#' @seealso
+#' \code{\link{calculate_predictive_correlations}} for the working alternative
 #'
+#' @keywords internal
 #' @export
 test_metric_stability <- function(pbp_data, metric, min_games = 4) {
-  
-  # Input validation
-  if (!is.data.frame(pbp_data)) {
-    stop("pbp_data must be a data frame")
-  }
-  
-  if (!is.character(metric) || length(metric) != 1) {
-    stop("metric must be a single character string")
-  }
-  
-  if (!is.numeric(min_games) || length(min_games) != 1 || min_games < 1) {
-    stop("min_games must be a single positive integer")
-  }
-  
-  # Verify required columns
-  required_cols <- c("week", "season", "player_id", "game_id")
-  missing_cols <- setdiff(required_cols, names(pbp_data))
-  if (length(missing_cols) > 0) {
-    stop(glue("Missing required columns: {paste(missing_cols, collapse=', ')}"))
-  }
-  
-  # Find mid-season week (split in half)
-  max_week <- max(pbp_data$week, na.rm = TRUE)
-  mid_week <- floor(max_week / 2)
-  
-  message(glue("Testing {metric} stability: weeks 1-{mid_week} vs {mid_week + 1}-{max_week}"))
-  
-  # This function needs position-specific stat functions to work
-  # For now, we'll return a template showing the expected structure
-  # In practice, you'd call get_player_rushing_stats() or similar for each half
-  
-  # Split into halves
-  first_half <- pbp_data %>% filter(week <= mid_week)
-  second_half <- pbp_data %>% filter(week > mid_week)
-  
-  # Calculate stats for each half (this is position-specific)
-  # User must provide the appropriate function based on what metric they're testing
-  # For example, if testing rush_epa_per_play, use get_player_rushing_stats()
-  
-  # Placeholder: assume metric is available at player-week level
-  # Real implementation would aggregate using appropriate function
-  
-  # For demonstration, calculate simple game-level aggregation
-  first_half_stats <- first_half %>%
-    filter(!is.na(player_id)) %>%
-    group_by(player_id) %>%
-    summarise(
-      games_played = n_distinct(game_id),
-      .groups = "drop"
-    ) %>%
-    filter(games_played >= min_games)
-  
-  second_half_stats <- second_half %>%
-    filter(!is.na(player_id)) %>%
-    group_by(player_id) %>%
-    summarise(
-      games_played = n_distinct(game_id),
-      .groups = "drop"
-    ) %>%
-    filter(games_played >= min_games)
-  
-  # Join players who qualified in both halves
-  qualified_players <- inner_join(
-    first_half_stats %>% select(player_id),
-    second_half_stats %>% select(player_id),
-    by = "player_id"
-  )
-  
-  n_players <- nrow(qualified_players)
-  
-  if (n_players < 3) {
-    warning(glue("Only {n_players} players with {min_games}+ games in both halves. ",
-                 "Need at least 3 for correlation."))
-    
-    return(tibble(
-      metric = metric,
-      correlation = NA_real_,
-      p_value = NA_real_,
-      conf_low = NA_real_,
-      conf_high = NA_real_,
-      sample_size = n_players
-    ))
-  }
-  
-  message(glue("NOTE: test_metric_stability() requires position-specific aggregation. ",
-               "Found {n_players} players with sufficient games in both halves. ",
-               "To complete analysis, pass aggregated stats (from get_player_*_stats) ",
-               "instead of raw play-by-play data, or use calculate_predictive_correlations()."))
-  
-  # Return template showing expected structure
-  # Real implementation would calculate correlation between first_half$metric and second_half$metric
-  result <- tibble(
-    metric = metric,
-    correlation = NA_real_,
-    p_value = NA_real_,
-    conf_low = NA_real_,
-    conf_high = NA_real_,
-    sample_size = n_players,
-    note = "Requires aggregated stats input - see calculate_predictive_correlations() for working implementation"
-  )
-  
-  return(result)
+  stop("test_metric_stability() is not implemented — see calculate_predictive_correlations() for a working alternative.")
 }

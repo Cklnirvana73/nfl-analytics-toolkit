@@ -99,13 +99,9 @@ get_player_rushing_stats <- function(pbp_data,
       !is.na(rusher_player_name)
     )
   
-  # Additional NFL filter: Remove QB kneels if play_type column has that value
-  if ("qb_kneel" %in% unique(rushing_plays$play_type)) {
-    rushing_plays <- rushing_plays %>%
-      filter(play_type != "qb_kneel")
-    message("Filtered out QB kneel downs (victory formation)")
-  }
-  
+  # NOTE: QB kneels are already excluded by the play_type == "run" filter above
+  # (nflfastR codes kneels as play_type == "qb_kneel"), so no extra filter is needed.
+
   if (nrow(rushing_plays) == 0) {
     warning("No rushing plays found with given filters")
     return(tibble())
@@ -217,7 +213,9 @@ get_player_rushing_stats <- function(pbp_data,
 #' - Passer rating ranges from 0.0 to 158.3 (maximum possible)
 #' - League average typically 85-95
 #' - Below 70 = poor, 70-85 = below average, 85-95 = average, 95-105 = above average, 105+ = elite
-#' - Includes QB spikes and kneels in attempt count (per NFL official stats)
+#' - Attempts exclude sacks (nflfastR codes sacks as pass plays) and QB kneels;
+#'   spikes count as attempts per NFL official stats
+#' - Sacks are reported separately; sack_rate = sacks / dropbacks (attempts + sacks)
 #' - CPOE (Completion Percentage Over Expected) separates QB accuracy from receiver performance
 #'
 #' **Passer Rating Formula:**
@@ -289,28 +287,40 @@ get_player_passing_stats <- function(pbp_data,
     pbp_data <- pbp_data %>% filter(week <= !!week_max)
   }
   
-  # Filter to passing plays (including sacks, spikes, kneels) and exclude NAs
+  # Filter to passing plays (including sacks and spikes; kneels are runs, not
+  # pass plays, and are excluded) and exclude NAs
   passing_plays <- pbp_data %>%
     filter(
-      play_type %in% c("pass", "qb_spike", "qb_kneel"),
+      play_type %in% c("pass", "qb_spike"),
       !is.na(passer_player_id),
       !is.na(passer_player_name)
     )
-  
+
   if (nrow(passing_plays) == 0) {
     warning("No passing plays found with given filters")
     return(tibble())
   }
-  
+
+  # CRITICAL FIX: nflfastR codes sacks as play_type == "pass", so a raw n()
+  # inflates attempts. A true pass attempt requires sack == 0 (and
+  # pass_attempt == 1 when that column is available).
+  if ("pass_attempt" %in% names(passing_plays)) {
+    passing_plays <- passing_plays %>%
+      mutate(is_pass_attempt = sack == 0 & pass_attempt == 1)
+  } else {
+    passing_plays <- passing_plays %>%
+      mutate(is_pass_attempt = sack == 0)
+  }
+
   # Calculate per-player statistics
   pass_stats <- passing_plays %>%
     group_by(passer_player_id, passer_player_name) %>%
     summarise(
       # Get most recent team
       recent_team = last(posteam),
-      
+
       # Volume metrics
-      attempts = n(),
+      attempts = sum(is_pass_attempt, na.rm = TRUE),
       completions = sum(complete_pass == 1, na.rm = TRUE),
       games_played = n_distinct(game_id),
       
@@ -330,8 +340,11 @@ get_player_passing_stats <- function(pbp_data,
       air_yards_per_attempt = mean(air_yards, na.rm = TRUE),
       
       # Context metrics
-      sack_rate = sum(sack == 1, na.rm = TRUE) / attempts,
-      
+      # Sacks are tracked separately from attempts; sack_rate is per dropback
+      # (attempts + sacks), the standard definition
+      sacks = sum(sack == 1, na.rm = TRUE),
+      sack_rate = sacks / (attempts + sacks),
+
       .groups = "drop"
     ) %>%
     # CRITICAL FIX: Correct NFL Passer Rating Formula
@@ -389,7 +402,8 @@ get_player_passing_stats <- function(pbp_data,
 #'
 #' @details
 #' **NFL Context:**
-#' - Target share = player targets / total team targets (correctly calculated at season level)
+#' - Target share = player targets / team targets, computed per (player, team)
+#'   stint and combined as a target-weighted average so traded players are correct
 #' - Typical WR1: 20-28% target share
 #' - Typical WR2: 12-18% target share
 #' - Typical TE1: 15-22% target share
@@ -479,10 +493,26 @@ get_player_receiving_stats <- function(pbp_data,
   }
   
   # CRITICAL FIX: Calculate team-level target totals FIRST (season-level, not game-level)
+  # receiving_plays already requires a non-NA receiver_player_id, so n() here
+  # counts targeted passes only (not sacks/throwaways)
   team_season_targets <- receiving_plays %>%
     group_by(posteam) %>%
     summarise(team_total_targets = n(), .groups = "drop")
-  
+
+  # CRITICAL FIX: Compute target share per (player, team) stint, then combine
+  # as a volume-weighted average. Dividing a traded player's ALL-team targets
+  # by only his final team's total produced incorrect shares.
+  player_target_share <- receiving_plays %>%
+    group_by(receiver_player_id, posteam) %>%
+    summarise(stint_targets = n(), .groups = "drop") %>%
+    left_join(team_season_targets, by = "posteam") %>%
+    mutate(stint_share = stint_targets / team_total_targets) %>%
+    group_by(receiver_player_id) %>%
+    summarise(
+      target_share = sum(stint_share * stint_targets) / sum(stint_targets),
+      .groups = "drop"
+    )
+
   # Calculate per-player statistics
   rec_stats <- receiving_plays %>%
     group_by(receiver_player_id, receiver_player_name) %>%
@@ -513,13 +543,9 @@ get_player_receiving_stats <- function(pbp_data,
       
       .groups = "drop"
     ) %>%
-    # CRITICAL FIX: Join season-level team totals and calculate correct target share
-    left_join(team_season_targets, by = c("recent_team" = "posteam")) %>%
-    mutate(
-      # Now correctly: player targets / team season total targets
-      target_share = targets / team_total_targets
-    ) %>%
-    select(-team_total_targets) %>%  # Remove helper column
+    # CRITICAL FIX: Join per-player target share (volume-weighted across team
+    # stints so traded players are handled correctly)
+    left_join(player_target_share, by = "receiver_player_id") %>%
     # Rename for clarity
     rename(
       player_id = receiver_player_id,

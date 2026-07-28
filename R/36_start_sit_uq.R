@@ -422,7 +422,8 @@ utils::globalVariables(c(
       def_team = .data$team,
       opponent = .data$opponent,
       adj_proj = .data$adj_proj,
-      sigma    = def_sigma * dplyr::coalesce(.data$matchup_factor, 1)
+      # Matchup shifts the mean (already in adj_proj); sigma stays unscaled.
+      sigma    = def_sigma
     ) %>%
     dplyr::arrange(dplyr::desc(.data$adj_proj)) %>%
     dplyr::slice_head(n = max_suggestions) %>%
@@ -550,13 +551,14 @@ analyze_start_sit <- function(lineup, reconciled,
     dplyr::left_join(recon_iv, by = "nfl_gsis_id") %>%
     dplyr::mutate(
       mu_s = .data$adj_proj,
+      # Matchup scales the mean only (already in adj_proj); sigma is left
+      # unscaled -- a favorable matchup should not widen the distribution.
       # Condition is row-varying (position), so dplyr::if_else is correct here.
       sigma_s = dplyr::if_else(
         .data$position == "DEF",
-        def_sigma * dplyr::coalesce(.data$matchup_factor, 1),
+        def_sigma,
         .recover_sigma(.data$r32_projection_lower_80,
-                       .data$r32_projection_upper_80) *
-          dplyr::coalesce(.data$matchup_factor, 1)
+                       .data$r32_projection_upper_80)
       )
     )
 
@@ -570,8 +572,8 @@ analyze_start_sit <- function(lineup, reconciled,
       alt_player = .data$player_name,
       alt_source = "bench",
       mu_a    = .data$adj_proj,
-      sigma_a = .recover_sigma(.data$lower_80, .data$upper_80) *
-        dplyr::coalesce(.data$matchup_factor, 1)
+      # Matchup scales the mean only (already in adj_proj); sigma unscaled.
+      sigma_a = .recover_sigma(.data$lower_80, .data$upper_80)
     )
 
   # DEF alternatives: benched DEFs, plus available waiver DEFs when requested
@@ -610,20 +612,28 @@ analyze_start_sit <- function(lineup, reconciled,
 
   def_alts <- def_alt_raw %>%
     dplyr::mutate(
-      sigma_a = def_sigma * dplyr::coalesce(.data$matchup_factor, 1)
+      # Matchup scales the mean only (already in mu_a); sigma unscaled.
+      sigma_a = def_sigma
     ) %>%
     dplyr::select(position, alt_player, alt_source, mu_a, sigma_a)
 
   alternatives <- dplyr::bind_rows(off_alts, def_alts)
 
   # ---- per-slot metrics ----
-  metric_rows <- purrr::map_dfr(seq_len(nrow(starters2)), function(i) {
-    row  <- starters2[i, ]
-    elig <- .eligible_positions_for_slot(row$slot)
-    cand <- alternatives %>% dplyr::filter(.data$position %in% elig)
+  # Alternatives are assigned EXCLUSIVELY: a benched player can be the best
+  # alternative for at most one slot. Slots are processed greedily in
+  # descending first-pass regret (computed vs the full pool), and each slot's
+  # chosen alternative is removed from the pool before the next slot is
+  # evaluated. Without this, one strong bench player could stand in as the
+  # replacement for several starters at once and the summed regrets would
+  # count him repeatedly.
+  alternatives <- alternatives %>%
+    dplyr::mutate(alt_row = dplyr::row_number())
 
+  metrics_for <- function(row, cand) {
     if (nrow(cand) == 0L) {
       return(tibble::tibble(
+        alt_row = NA_integer_,
         alt_player = NA_character_, alt_position = NA_character_,
         alt_source = NA_character_, alt_adj_proj = NA_real_,
         p_start_correct = NA_real_, avg_miss = NA_real_,
@@ -644,6 +654,7 @@ analyze_start_sit <- function(lineup, reconciled,
     }
 
     tibble::tibble(
+      alt_row         = best$alt_row,
       alt_player      = best$alt_player,
       alt_position    = best$position,
       alt_source      = best$alt_source,
@@ -653,11 +664,39 @@ analyze_start_sit <- function(lineup, reconciled,
       expected_regret = round(e_reg, 2),
       stakes          = .stakes_label(e_reg)
     )
-  })
+  }
+
+  # First pass: regret vs the full pool, used only to order the greedy pass.
+  first_pass_regret <- vapply(seq_len(nrow(starters2)), function(i) {
+    row  <- starters2[i, ]
+    cand <- alternatives %>%
+      dplyr::filter(.data$position %in% .eligible_positions_for_slot(row$slot))
+    m <- metrics_for(row, cand)
+    if (is.na(m$expected_regret)) -Inf else m$expected_regret
+  }, numeric(1))
+
+  # Greedy pass: highest-regret slot claims its alternative first.
+  metric_rows_list <- vector("list", nrow(starters2))
+  remaining <- alternatives
+  for (i in order(first_pass_regret, decreasing = TRUE)) {
+    row  <- starters2[i, ]
+    cand <- remaining %>%
+      dplyr::filter(.data$position %in% .eligible_positions_for_slot(row$slot))
+    m <- metrics_for(row, cand)
+    if (!is.na(m$alt_row)) {
+      remaining <- remaining %>% dplyr::filter(.data$alt_row != m$alt_row)
+    }
+    metric_rows_list[[i]] <- dplyr::select(m, -alt_row)
+  }
+  metric_rows <- dplyr::bind_rows(metric_rows_list)
 
   enriched <- dplyr::bind_cols(starters, metric_rows) %>%
     dplyr::mutate(uq_schema_tag = SCHEMA_TAG_UQ)
 
+  # week_risk_score is an UPPER-BOUND HEURISTIC: per-slot expected regrets are
+  # computed independently (each slot vs its own exclusively-assigned best
+  # alternative) and summed, ignoring cross-slot correlation, so the true
+  # joint risk is at most this sum.
   week_risk_score <- sum(enriched$expected_regret, na.rm = TRUE)
 
   # ---- DEF streaming recommendation (open DEF slot) ----

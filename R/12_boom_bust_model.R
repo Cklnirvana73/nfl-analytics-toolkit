@@ -53,13 +53,20 @@ library(yardstick)
 # ==============================================================================
 # define_outcome_tiers()
 #
-# Assigns boom / average / bust labels to every player-week row.
+# Assigns boom / average / bust labels to every player-week row. The label
+# describes NEXT week's outcome (ppr_points_next_week): a row's features are
+# from week W, and the tier classifies the player's week W+1 performance.
+# Labeling from ppr_points_this_week would leak the target -- same-week
+# features (epa_this_week, plays_this_week, success_rate_this_week) directly
+# determine same-week fantasy points.
 # Thresholds are derived from the TRAINING window only and then applied
 # to all rows including test. Never recompute thresholds on test data.
 #
 # @param ml_data      tibble from prepare_model_features(). Required columns:
 #                     player_id, season, week, position_group,
-#                     ppr_points_this_week, has_target (lgl), is_absence_week (lgl)
+#                     ppr_points_next_week (created via lead() from
+#                     ppr_points_this_week if absent),
+#                     has_target (lgl), is_absence_week (lgl)
 # @param train_weeks  integer vector. Weeks used to compute thresholds.
 #                     Default 1:14 mirrors the Week 9 train/test cutoff.
 # @param bust_pct     numeric (0,1). Quantile below which = bust. Default 0.25.
@@ -74,11 +81,11 @@ library(yardstick)
 # @details
 # Strict inequalities at both boundaries prevent double-classification at
 # exact quantile boundary rows:
-#   bust:    ppr_points_this_week <  bust_threshold
-#   boom:    ppr_points_this_week >  boom_threshold
+#   bust:    ppr_points_next_week <  bust_threshold
+#   boom:    ppr_points_next_week >  boom_threshold
 #   average: all remaining rows (including exact boundary values)
 #
-# Absence weeks and rows with NA ppr_points_this_week receive NA tier.
+# Absence weeks and rows with NA ppr_points_next_week receive NA tier.
 # Model training uses only rows where has_target == TRUE and
 # is_absence_week == FALSE.
 #
@@ -102,6 +109,21 @@ define_outcome_tiers <- function(ml_data,
     stop("define_outcome_tiers: missing required columns: ",
          paste(missing, collapse = ", "))
   }
+
+  # The classification target is NEXT week's outcome. prepare_model_features()
+  # already creates ppr_points_next_week; create it via lead() if absent so
+  # this function also works on raw feature matrices.
+  if (!"ppr_points_next_week" %in% names(ml_data)) {
+    message("define_outcome_tiers: ppr_points_next_week not found -- ",
+            "creating via lead(ppr_points_this_week) within player groups.")
+    grp_cols <- intersect(c("player_id", "position_group", "season", "team"),
+                          names(ml_data))
+    ml_data <- ml_data %>%
+      group_by(across(all_of(grp_cols))) %>%
+      arrange(week, .by_group = TRUE) %>%
+      mutate(ppr_points_next_week = lead(ppr_points_this_week, 1)) %>%
+      ungroup()
+  }
   if (!is.numeric(bust_pct) || bust_pct <= 0 || bust_pct >= 1) {
     stop("define_outcome_tiers: bust_pct must be numeric in (0, 1)")
   }
@@ -120,12 +142,12 @@ define_outcome_tiers <- function(ml_data,
       week %in% train_weeks,
       has_target      == TRUE,
       !is_absence_week,
-      !is.na(ppr_points_this_week)
+      !is.na(ppr_points_next_week)
     ) %>%
     group_by(position_group) %>%
     summarise(
-      bust_threshold = quantile(ppr_points_this_week, bust_pct, na.rm = TRUE),
-      boom_threshold = quantile(ppr_points_this_week, boom_pct, na.rm = TRUE),
+      bust_threshold = quantile(ppr_points_next_week, bust_pct, na.rm = TRUE),
+      boom_threshold = quantile(ppr_points_next_week, boom_pct, na.rm = TRUE),
       n_train        = n(),
       .groups        = "drop"
     )
@@ -147,9 +169,9 @@ define_outcome_tiers <- function(ml_data,
     mutate(
       outcome_tier = case_when(
         is_absence_week                        ~ NA_character_,
-        is.na(ppr_points_this_week)            ~ NA_character_,
-        ppr_points_this_week > boom_threshold  ~ "boom",
-        ppr_points_this_week < bust_threshold  ~ "bust",
+        is.na(ppr_points_next_week)            ~ NA_character_,
+        ppr_points_next_week > boom_threshold  ~ "boom",
+        ppr_points_next_week < bust_threshold  ~ "bust",
         TRUE                                   ~ "average"
       ),
       tier_computed_from_training = TRUE
@@ -227,12 +249,21 @@ train_classification_model <- function(ml_data_tiered,
   message("train_classification_model: ", position)
   message(strrep("-", 60))
 
-  id_cols <- intersect(
-    c("player_id", "player_name", "season", "team", "opponent",
-      "position_group", "is_absence_week", "has_target",
-      "ppr_points_this_week", "ppr_points_next_week",
-      "bust_threshold", "boom_threshold", "tier_computed_from_training"),
-    names(ml_data_tiered)
+  id_cols <- union(
+    intersect(
+      c("player_id", "player_name", "season", "team", "opponent",
+        "next_opponent",   # 32-team identifier: matchup strength enters via
+                           # next_opp_def_epa_allowed, not 32 one-hot dummies
+        "next_opp_tier",   # def_styles full-season classification: leaks
+                           # future games (Week 11 audit), same as opponent_tier
+        "position_group", "is_absence_week", "has_target",
+        "ppr_points_this_week", "ppr_points_next_week",
+        "bust_threshold", "boom_threshold", "tier_computed_from_training"),
+      names(ml_data_tiered)
+    ),
+    # Defensive: the tier label derives from ppr_points_next_week, so no
+    # *_next_week outcome column may leak into the feature set.
+    grep("_next_week$", names(ml_data_tiered), value = TRUE)
   )
 
   pos_data <- ml_data_tiered %>%
@@ -268,15 +299,23 @@ train_classification_model <- function(ml_data_tiered,
   }
 
   cv_weeks  <- seq(cv_week_min, train_week_max)
-  fold_list <- compact(map(cv_weeks, function(val_week) {
+  # Capture the validation week alongside each split BEFORE compacting --
+  # otherwise dropped (NULL) folds shift the week labels off by one or more.
+  fold_specs <- compact(map(cv_weeks, function(val_week) {
     train_idx <- which(train_data$week < val_week)
     val_idx   <- which(train_data$week == val_week)
     if (length(train_idx) == 0 || length(val_idx) == 0) return(NULL)
-    make_splits(
-      list(analysis = train_idx, assessment = val_idx),
-      data = train_data
+    list(
+      week  = val_week,
+      split = make_splits(
+        list(analysis = train_idx, assessment = val_idx),
+        data = train_data
+      )
     )
   }))
+
+  fold_list  <- map(fold_specs, "split")
+  fold_weeks <- map_dbl(fold_specs, "week")
 
   if (length(fold_list) == 0) {
     stop("train_classification_model: no valid CV folds produced. ",
@@ -285,7 +324,7 @@ train_classification_model <- function(ml_data_tiered,
 
   cv_folds <- manual_rset(
     fold_list,
-    ids = paste0("week_", cv_weeks[seq_along(fold_list)])
+    ids = paste0("week_", fold_weeks)
   )
   message("  CV folds: ", length(fold_list))
 
@@ -325,7 +364,8 @@ train_classification_model <- function(ml_data_tiered,
     add_model(xgb_spec)
 
   set.seed(seed)
-  tune_grid <- grid_latin_hypercube(
+  # Named grid_lhs (not tune_grid) to avoid shadowing tune::tune_grid() below
+  grid_lhs <- grid_latin_hypercube(
     trees(range          = c(100L, 800L)),
     tree_depth(range     = c(3L, 7L)),
     learn_rate(range     = c(-2.5, -0.7), trans = scales::log10_trans()),
@@ -336,13 +376,13 @@ train_classification_model <- function(ml_data_tiered,
     size = 25
   )
 
-  message("  Tuning ", nrow(tune_grid), " combinations across ",
+  message("  Tuning ", nrow(grid_lhs), " combinations across ",
           length(fold_list), " folds...")
 
   tune_results <- tune_grid(
     cls_workflow,
     resamples = cv_folds,
-    grid      = tune_grid,
+    grid      = grid_lhs,
     metrics   = metric_set(mn_log_loss, accuracy),
     control   = control_grid(save_pred = TRUE, verbose = FALSE, allow_par = FALSE)
   )
@@ -370,7 +410,7 @@ train_classification_model <- function(ml_data_tiered,
       xgboost::xgb.importance(model = extract_fit_engine(fold_fit)) %>%
         as_tibble() %>%
         select(variable = Feature, importance = Gain) %>%
-        mutate(fold = paste0("week_", cv_weeks[i]))
+        mutate(fold = paste0("week_", fold_weeks[i]))
     }, error = function(e) {
       tibble(variable = character(0), importance = numeric(0), fold = character(0))
     })
@@ -683,6 +723,12 @@ evaluate_classifier <- function(model_result, verbose = TRUE) {
 # regression_preds uses predicted_ppr as the prediction column and
 # predicted_week as the target week. Actual PPR values are joined from
 # ml_data_tiered$ppr_points_this_week on player_id + week = predicted_week.
+#
+# NOTE: outcome_tier now describes NEXT week's outcome relative to the
+# classifier's feature week (see define_outcome_tiers()). cls_preds$week is
+# the feature week, so its tier corresponds to production in week + 1; keep
+# this offset in mind when interpreting actual_ppr (joined at the feature
+# week) alongside the tier columns.
 #
 # A player ranked 5th by regression with p_boom = 0.45 may be a better start
 # than the player ranked 3rd with p_boom = 0.12. Regression captures expected

@@ -80,9 +80,12 @@ library(here)
 #' comparisons. This is the foundational usage layer -- efficiency adjustments
 #' (game script, opponent) are applied in later weeks.
 #'
-#' Target share is computed as receiver targets / team pass attempts (including
-#' incompletions). Air yards share uses total air yards on all targets, not
-#' just completions, to capture true opportunity quality.
+#' Target share is computed as receiver targets / team targets, where a team
+#' target is any pass play with an intended receiver (incompletions included;
+#' sacks and throwaways excluded). Air yards share uses air yards on all
+#' targets, not just completions, to capture true opportunity quality;
+#' negative air yards (screens behind the line) are clamped to 0 in both
+#' numerator and denominator so shares stay in [0, 1].
 #'
 #' Multi-team players are handled by team-week grouping. A player traded from
 #' KC to BUF in Week 9 will have separate rows for each team's games.
@@ -115,14 +118,17 @@ library(here)
 #'     \item{position_group}{Derived position group: "passer", "rusher", "receiver" (chr)}
 #'     \item{team}{Team abbreviation for this game-week (chr)}
 #'     \item{targets}{Targets received (int, receivers only)}
-#'     \item{team_targets}{Total team targets (int)}
+#'     \item{team_targets}{Total team targets: pass plays with an intended
+#'       receiver, so sacks/throwaways are excluded (int)}
 #'     \item{target_share}{targets / team_targets (dbl, NA if team_targets == 0)}
 #'     \item{rushes}{Rush attempts (int, rushers only)}
 #'     \item{team_rushes}{Total team rushes (int)}
 #'     \item{rush_share}{rushes / team_rushes (dbl, NA if team_rushes == 0)}
 #'     \item{air_yards}{Total air yards on targets (dbl, receivers/passers)}
 #'     \item{team_air_yards}{Total team air yards (dbl)}
-#'     \item{air_yards_share}{air_yards / team_air_yards (dbl, NA if team_air_yards == 0)}
+#'     \item{air_yards_share}{Share of team air yards, using positive air
+#'       yards only in numerator and denominator (dbl, NA if the team has no
+#'       positive air yards)}
 #'     \item{redzone_targets}{Targets inside opponent 20-yard line (int)}
 #'     \item{redzone_rushes}{Rush attempts inside opponent 20-yard line (int)}
 #'     \item{redzone_opportunities}{redzone_targets + redzone_rushes (int)}
@@ -254,8 +260,13 @@ calculate_usage_metrics <- function(pbp_data,
     filter(play_type == "pass", !is.na(posteam)) %>%
     group_by(season, week, game_id, posteam) %>%
     summarise(
-      team_targets   = n(),
+      # CRITICAL FIX: a target requires an intended receiver. n() would count
+      # sacks/throwaways (receiver NA), deflating every target share.
+      team_targets   = sum(!is.na(receiver_player_id)),
       team_air_yards = sum(air_yards, na.rm = TRUE),
+      # Positive air yards only, for air_yards_share (negative air yards on
+      # screens would otherwise produce negative/explosive shares)
+      team_air_yards_pos = sum(pmax(air_yards, 0), na.rm = TRUE),
       .groups = "drop"
     )
 
@@ -288,6 +299,8 @@ calculate_usage_metrics <- function(pbp_data,
     summarise(
       targets         = n(),
       air_yards       = sum(air_yards, na.rm = TRUE),
+      # Positive-only numerator to match team_air_yards_pos denominator
+      air_yards_pos   = sum(pmax(air_yards, 0), na.rm = TRUE),
       redzone_targets = sum(!is.na(yardline_100) & yardline_100 <= 20, na.rm = TRUE),
       .groups = "drop"
     ) %>%
@@ -330,8 +343,10 @@ calculate_usage_metrics <- function(pbp_data,
       target_share   = ifelse(!is.na(team_targets) & team_targets > 0,
                               targets / team_targets, NA_real_),
       rush_share     = NA_real_,
-      air_yards_share = ifelse(!is.na(team_air_yards) & team_air_yards > 0,
-                               air_yards / team_air_yards, NA_real_),
+      # Positive air yards in both numerator and denominator: negative
+      # air-yard targets (screens) are clamped to 0 so shares stay in [0, 1]
+      air_yards_share = ifelse(!is.na(team_air_yards_pos) & team_air_yards_pos > 0,
+                               air_yards_pos / team_air_yards_pos, NA_real_),
       redzone_opportunities = redzone_targets + redzone_rushes,
       redzone_share  = ifelse(!is.na(team_redzone_plays) & team_redzone_plays > 0,
                               redzone_opportunities / team_redzone_plays, NA_real_),
@@ -513,21 +528,16 @@ calculate_usage_trends <- function(usage_data,
   # --- Build rolling features per player-position_group-team ---
   # Group by player + position_group to handle receivers who also rush
 
-  roll_fn <- function(x, window, min_obs) {
-    # Apply lag(1) first to prevent current week from entering the window
-    x_lagged <- lag(x, 1)
-    zoo::rollapply(x_lagged, width = window, FUN = mean,
-                   fill = NA, align = "right", na.rm = TRUE,
-                   partial = FALSE)
-  }
-
   # For partial windows with min_games requirement
+  # partial = TRUE lets windows shorter than 'window' through, so min_obs is
+  # the only gate (otherwise the first window-1 appearances would all be NA)
   roll_partial_fn <- function(x, window, min_obs) {
+    # Apply lag(1) first to prevent current week from entering the window
     x_lagged <- lag(x, 1)
     zoo::rollapply(x_lagged, width = window, FUN = function(vals) {
       non_na <- vals[!is.na(vals)]
       if (length(non_na) >= min_obs) mean(non_na) else NA_real_
-    }, fill = NA, align = "right")
+    }, fill = NA, align = "right", partial = TRUE)
   }
 
   result <- usage_sorted %>%
@@ -606,13 +616,15 @@ calculate_usage_trends <- function(usage_data,
 #' @param min_redzone_opps Minimum total red zone opportunities (inside 20)
 #'   for player to be included. Default: 5.
 #'
-#' @return Tibble with one row per player-team-season. Columns:
+#' @return Tibble with one row per player-position_group-season (traded
+#'   players get a single season row). Columns:
 #'   \describe{
 #'     \item{season}{Season year (int)}
 #'     \item{player_id}{GSIS player ID (chr)}
 #'     \item{player_name}{Player name (chr)}
 #'     \item{position_group}{"receiver" or "rusher" (chr)}
-#'     \item{team}{Most recent team (chr)}
+#'     \item{team}{Team with the most red zone plays for this player
+#'       (majority-plays rule) (chr)}
 #'     \item{games_played}{Distinct game-weeks with red zone opportunity (int)}
 #'     \item{rz20_targets}{Targets inside opponent 20-yard line (int)}
 #'     \item{rz20_rushes}{Rushes inside opponent 20-yard line (int)}
@@ -703,6 +715,9 @@ get_redzone_profile <- function(pbp_data,
   message(glue("Computing red zone profile from {nrow(pbp_clean)} clean plays"))
 
   # --- Helper to build red zone stats at given threshold ---
+  # All thresholds aggregate at the SAME grain (season, player_id,
+  # position_group) so the joins below cannot fan out for traded players.
+  # Team is resolved with the majority-plays rule (team with most RZ plays).
   rz_player_stats <- function(data, threshold, prefix_recv, prefix_rush) {
     # Receivers
     recv <- data %>%
@@ -711,9 +726,9 @@ get_redzone_profile <- function(pbp_data,
              yardline_100 <= threshold) %>%
       group_by(season,
                player_id = receiver_player_id,
-               player_name = receiver_player_name,
-               team = posteam) %>%
+               player_name = receiver_player_name) %>%
       summarise(
+        team = names(which.max(table(posteam))),
         !!paste0(prefix_recv, "_targets") := n(),
         !!paste0(prefix_recv, "_tds")     := sum(touchdown == 1, na.rm = TRUE),
         !!paste0(prefix_recv, "_epa")     := sum(epa, na.rm = TRUE),
@@ -731,17 +746,17 @@ get_redzone_profile <- function(pbp_data,
              yardline_100 <= threshold) %>%
       group_by(season,
                player_id = rusher_player_id,
-               player_name = rusher_player_name,
-               team = posteam) %>%
+               player_name = rusher_player_name) %>%
       summarise(
+        team = names(which.max(table(posteam))),
         !!paste0(prefix_rush, "_rushes") := n(),
         !!paste0(prefix_rush, "_tds")    := sum(touchdown == 1, na.rm = TRUE),
+        !!paste0(prefix_rush, "_epa")    := sum(epa, na.rm = TRUE),
         games_played = n_distinct(game_id),
         .groups = "drop"
       ) %>%
       mutate(position_group = "rusher",
-             !!paste0(prefix_rush, "_targets") := 0L,
-             !!paste0(prefix_rush, "_epa")     := NA_real_)
+             !!paste0(prefix_rush, "_targets") := 0L)
 
     bind_rows(recv, rush)
   }
@@ -750,14 +765,16 @@ get_redzone_profile <- function(pbp_data,
   rz10 <- rz_player_stats(pbp_clean, 10, "rz10", "rz10")
   rz5  <- rz_player_stats(pbp_clean,  5, "rz5",  "rz5")
 
-  # Join all thresholds
+  # Join all thresholds (same grain everywhere; one-to-one enforced)
   rz_profile <- rz20 %>%
     left_join(rz10 %>% select(season, player_id, position_group,
                                rz10_targets, rz10_rushes, rz10_tds),
-              by = c("season", "player_id", "position_group")) %>%
+              by = c("season", "player_id", "position_group"),
+              relationship = "one-to-one") %>%
     left_join(rz5 %>% select(season, player_id, position_group,
                               rz5_targets, rz5_rushes, rz5_tds),
-              by = c("season", "player_id", "position_group")) %>%
+              by = c("season", "player_id", "position_group"),
+              relationship = "one-to-one") %>%
     mutate(
       # Fill NAs with 0 for players with rz20 ops but none at rz10/rz5
       across(c(rz10_targets, rz10_rushes, rz10_tds,

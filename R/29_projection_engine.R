@@ -207,19 +207,111 @@ CI_80_Z <- 1.282
 SUPPORTED_POSITIONS <- c("QB", "RB", "WR", "TE")
 
 # ------------------------------------------------------------------------------
-# Position-level R/24 v1 RMSE values (from confirmed R/27 holdout)
+# Translation sigma (uncertainty of the rookie / early-career prior)
 # ------------------------------------------------------------------------------
+#
+# The translation prior's sigma is the v1 (R/24) LOCO holdout RMSE of the model
+# variant that actually produced the point estimate, PER POSITION. Because
+# ROOKIE_TRANSLATION_VARIANT uses base for QB and enriched for RB/WR/TE, the
+# sigma must be variant-matched: base RMSE for QB, enriched RMSE for RB/WR/TE.
+# Weighting an enriched point estimate with base uncertainty (or vice versa)
+# miscalibrates the precision blend.
+#
+# These values are READ LIVE from the v1 performance file at projection-build
+# time, never hardcoded, so they re-sync on every retrain and cannot silently
+# go stale. If the file is missing or malformed the build fails loudly rather
+# than falling back to a value that could drift.
 
-# These RMSE values quantify how uncertain the prior is for rookies and
-# early-career players whose prior is dominated by R/24 pred_base.
-# Source: confirmed R/27 v3 vs v1 comparison output.
-# Values represent RMSE on PPR/game scale across holdout draft classes.
-TRANSLATION_RMSE_BY_POSITION <- list(
-  QB = 6.088,
-  RB = 4.133,
-  WR = 3.896,
-  TE = 2.582
+#' Read variant-matched v1 translation RMSE (sigma) per position
+#'
+#' For each position, returns the v1 (R/24) LOCO holdout RMSE for the variant
+#' that position uses in the prior (see \code{ROOKIE_TRANSLATION_VARIANT}),
+#' read from \code{s2_week10_performance.rds}. Fails loudly on a missing file,
+#' missing columns, or a missing/invalid row; there is deliberately no
+#' hardcoded fallback.
+#'
+#' @param perf_path Character. Path to the v1 performance RDS
+#'   (\code{s2_week10_performance.rds}).
+#' @return Named numeric vector (QB, RB, WR, TE) of variant-matched RMSE.
+.load_translation_sigmas <- function(perf_path) {
+  if (!file.exists(perf_path)) {
+    stop(
+      ".load_translation_sigmas(): v1 performance file not found at: ", perf_path,
+      "\n  Run run_week10_pipeline() (R/24) to regenerate it before building priors.",
+      call. = FALSE
+    )
+  }
+
+  perf    <- readRDS(perf_path)
+  req_col <- c("draft_position", "model_variant", "rmse")
+  missing <- setdiff(req_col, names(perf))
+  if (length(missing) > 0L) {
+    stop(
+      ".load_translation_sigmas(): performance file missing columns: ",
+      paste(missing, collapse = ", "), call. = FALSE
+    )
+  }
+
+  positions <- names(ROOKIE_TRANSLATION_VARIANT)
+  sigmas <- vapply(positions, function(pos) {
+    variant <- ROOKIE_TRANSLATION_VARIANT[[pos]]
+    row <- perf[perf$draft_position == pos & perf$model_variant == variant, ,
+                drop = FALSE]
+    if (nrow(row) != 1L || is.na(row$rmse[1L]) || row$rmse[1L] <= 0) {
+      stop(sprintf(
+        ".load_translation_sigmas(): no single valid RMSE for %s / %s in %s",
+        pos, variant, perf_path), call. = FALSE)
+    }
+    row$rmse[1L]
+  }, numeric(1L))
+
+  names(sigmas) <- positions
+  sigmas
+}
+
+# ------------------------------------------------------------------------------
+# Translation lifecycle constants (Season 3 Wave A1)
+# ------------------------------------------------------------------------------
+#
+# The college translation is a pre-NFL signal. It is most informative for
+# rookies, decays as a player accrues real NFL production, and is statistically
+# dead once enough NFL history exists. Two hard guardrails sit ON TOP OF the
+# existing precision-weighted blend (which already hands off smoothly from
+# translation to history as NFL games accrue):
+#
+#   ROOKIE_TRANSLATION_VARIANT -- which translation point estimate feeds the
+#     prior, per position. Enriched (adds draft capital) beats base at RB/WR/TE
+#     on v1 LOCO holdout (RB R2 0.19->0.40, WR base R2 negative->0.16,
+#     TE 0.07->0.25); QB gains almost nothing from draft capital (5.29->5.16
+#     RMSE) and draft slot is a noisy QB signal, so QB stays on base. The
+#     base-vs-enriched GAP is itself the article signal and is exposed
+#     elsewhere; this constant governs only the projection prior.
+#
+#   TRANSLATION_PHASEOUT_EXP -- years_exp >= this gets ZERO translation weight;
+#     the prior becomes 100% NFL history. Set empirically: the translation's
+#     partial correlation with same-season PPG (after conditioning on NFL
+#     history) is insignificant at every position by year 4, and the only
+#     "significant" later cells are tiny-sample negative-sign artifacts. The
+#     signal makes its last real stand at year 3 (WR significant, RB
+#     borderline). See diagnostics/s3_diag_translation_decay.R.
+#
+#   HISTORY_ONLY_FLOOR_SEASONS -- a player is not forced to history-only until
+#     he has at least this many QUALIFYING NFL seasons. Protects the slow
+#     developer (the fading-but-real 4th-year-breakout case): do not commit a
+#     player's prior to thin early history before he has had time to show it.
+#
+#   ROOKIE_TRUST_CAP -- downward-only haircut on a rookie's (years_exp == 0)
+#     translation point estimate. Rookies are the highest-variance projection
+#     in the system; this trims, never raises. Applied before blending.
+#
+# Coherence: floor (3) keeps some translation alive THROUGH year 3; phase-out
+# (4) zeroes it AT year 4. No gap, no overlap.
+ROOKIE_TRANSLATION_VARIANT <- list(
+  QB = "base", RB = "enriched", WR = "enriched", TE = "enriched"
 )
+TRANSLATION_PHASEOUT_EXP   <- 4L
+HISTORY_ONLY_FLOOR_SEASONS <- 3L
+ROOKIE_TRUST_CAP           <- 0.85
 
 # ------------------------------------------------------------------------------
 # Default Sleeper PPR scoring settings (passed to calculate_fantasy_points_ext)
@@ -242,8 +334,11 @@ DEFAULT_SCORING_SETTINGS <- list(
   te_premium           = TRUE,
   rush_att_bonus       = 0,       # not standard Sleeper
   first_down_points    = 0,
-  long_td_bonus        = 0,
-  long_td_threshold    = 40,
+  # [2026-07-16] long_td_bonus + long_td_threshold -> long_td_tiers.
+  # R/17 retired the scalar pair; it could not express per-stat-type or
+  # multi-tier long TD bonuses and used > semantics. NULL = no bonus, which
+  # is what this default always meant.
+  long_td_tiers        = NULL,
   hundred_yard_bonus   = 0,
   superflex_pass_td    = 0,
   two_point_conversion = 2,
@@ -296,7 +391,7 @@ PROSPECTS_PATH_DEFAULT <- here::here(
 )
 
 TRANSLATION_PREDS_PATH_DEFAULT <- here::here(
-  "data", "season2_cache", "s2_week10_predictions.rds"
+  "data", "season3_cache", "s3_r39_translation_preds_augmented.rds"
 )
 
 OUTPUT_PROJECTIONS_PATH <- here::here(
@@ -345,16 +440,83 @@ INJURY_EFFECTS_PATH <- here::here(
 )
 
 # Fraction of the R/25 PPG effect to apply as a preseason mu adjustment.
-# Full effect = -4.54 PPG. Using 0.30 (30%) as a conservative preseason
-# estimate since the player may be fully recovered by the start of next season.
-# Increase toward 1.0 if projecting mid-season after a recent return.
-INJURY_EFFECT_FRACTION <- 0.30
+#
+# NEUTRALIZED 2026-07-16 (was 0.30). Machinery intact for revival; only the
+# weight is zeroed. Same pattern as COACH_PATTERN_WEIGHT.
+#
+# Reason. The weight was never the problem. R/25's treatment group is the
+# problem, and it is degenerate by construction:
+#
+#   MIN_PRIOR_GAMES_W11    = 2   -> must play weeks 1 and 2
+#   TREATMENT_RETURN_MAX_W11 = 4 -> must be back by week 4
+#   => the absence can ONLY be week 3. There is one path through.
+#
+# Verified 2026-07-16 against s2_week11_groups.rds, all 15 of the 2025
+# treatment players: first_absent_week = 3, return_week = 4,
+# n_absent_weeks = 1, n_prior_games = 2. Fifteen rows, one configuration.
+# Across all 15 analysis seasons: 163 of 163 treatment players are identical
+# on those four fields.
+#
+# So this constant did not adjust for injury. It adjusted for missing week 3.
+#
+# Worse, the filters silently drop the players it is meant to serve. A player
+# is in the R/25 file only if he EITHER missed zero weeks 1-8, OR missed time
+# and returned by week 4. Everyone else fails both filters and vanishes.
+# Checked against real 2025 season-enders: Nabers (ACL wk 4), Kittle, Conner,
+# Murray, McLaurin, Ekeler, Purdy, Aiyuk, Godwin, Watson, Mixon, Daniels,
+# Pearsall are NOT IN THE FILE. Dobbins (season-ending foot) is classified
+# CONTROL, i.e. healthy, and gets zero adjustment.
+#
+# R/25 also failed 2 of its own 5 assumption checks on the run that produced
+# this estimate (return-timing concentration 100%, parallel-trends prior-PPG
+# gap 4.11) and reported an SMD of -15.5 on n_prior_games. Its own spec text
+# warns that inferred absence may reflect benching. The estimate was consumed
+# anyway.
+#
+# To revive: fix R/25's group construction first (widen the training window so
+# onset is not forced to week 3, and admit non-returning players), re-estimate,
+# then set this above 0.00. Do not raise it against the current groups file.
+#
+# Prior value and its rationale, preserved:
+#   Full effect = -4.54 PPG. Using 0.30 (30%) as a conservative preseason
+#   estimate since the player may be fully recovered by the start of next
+#   season. Increase toward 1.0 if projecting mid-season after a recent return.
+INJURY_EFFECT_FRACTION <- 0.00
 
 # Sigma inflation multipliers by weeks missed in prior season
 # More missed time = wider projection interval
-INJURY_SIGMA_MULTIPLIER_MILD    <- 1.10  # 1-2 weeks missed
-INJURY_SIGMA_MULTIPLIER_MODERATE <- 1.20  # 3-4 weeks missed
-INJURY_SIGMA_MULTIPLIER_SEVERE  <- 1.30  # 5+ weeks missed
+# NEUTRALIZED 2026-07-16. MILD 1.10 -> 1.00. Machinery intact, same pattern as
+# COACH_PATTERN_WEIGHT and INJURY_EFFECT_FRACTION. Do not delete the code path.
+#
+# WHY. The mu neutralize (INJURY_EFFECT_FRACTION -> 0.00) removed half of an
+# adjustment sourced from a degenerate R/25 treatment group. This is the other
+# half, and it fires on the same population.
+#
+# R/25's filters MIN_PRIOR_GAMES_W11 = 2 and TREATMENT_RETURN_MAX_W11 = 4 force
+# every treatment player-season into ONE configuration: played weeks 1-2,
+# missed week 3, returned week 4. Verified on the production file: all 163
+# treatment rows across 2011-2025 are identical on first_absent_week,
+# return_week, n_absent_weeks and n_prior_games. It is not an injury measure,
+# it is a "who sat out week 3" measure.
+#
+# Consequence for 2026: 15 players got sigma 1.10 for missing week 3 of 2025,
+# while Nabers (ACL, week 4), Kittle, Conner, Murray, McLaurin, Ekeler, Purdy,
+# Aiyuk, Godwin, Watson, Mixon, Daniels and Pearsall are ABSENT from R/25's
+# file entirely and got 1.00. Dobbins, season-ending foot, is classified as
+# CONTROL. The widening is pointed at the healthiest group in the file. A hedge
+# aimed the wrong way is worse than no hedge.
+#
+# MODERATE and SEVERE are left at their original values deliberately. Because
+# n_absent_weeks is always 1, both branches are unreachable. Zeroing unreachable
+# code would imply an evidentiary claim that was never made. They stay as-is,
+# documented as dead, so a repaired R/25 revives them intact.
+#
+# REVIVE WHEN: an availability layer exists that projects expected games, and
+# the widening keys off a real absence-duration signal rather than off R/25's
+# week-3 artifact.
+INJURY_SIGMA_MULTIPLIER_MILD    <- 1.00  # was 1.10. Neutralized, see above.
+INJURY_SIGMA_MULTIPLIER_MODERATE <- 1.20  # UNREACHABLE: n_absent_weeks always 1
+INJURY_SIGMA_MULTIPLIER_SEVERE  <- 1.30  # UNREACHABLE: n_absent_weeks always 1
 
 # ------------------------------------------------------------------------------
 # Usage ramp constants (Build 3 integration)
@@ -372,10 +534,33 @@ RAMP_ROOKIE_EFFECTS_PATH <- here::here(
   "data", "season2_cache", "s2_week12_rookie_effects.rds"
 )
 
-# Fraction of the R/26 vet ramp effect to apply as preseason mu adjustment.
-# Full vet effect = -1.55 PPG. Using 0.30 (30%) as conservative preseason
-# estimate. Rookie effect (+0.19 PPG) is non-significant; no adjustment applied.
-RAMP_EFFECT_FRACTION <- 0.30
+# NEUTRALIZED 2026-07-16. 0.30 -> 0.00. Machinery intact, same pattern as
+# COACH_PATTERN_WEIGHT and INJURY_EFFECT_FRACTION. Do not delete the code path.
+#
+# WHY. ESTIMAND MISMATCH. R/26 measures a WITHIN-season ramp: a player's usage
+# rises, and production within that same season lags it. R/29 applied the
+# estimate ACROSS seasons, to a player's prior_mu for the following year. Those
+# are different quantities and the second does not follow from the first.
+#
+# Tested. Once own-season production is controlled, the cross-season adjusted
+# coefficient collapses to -0.064 with p = 0.769. R/29 was applying
+# 0.30 * -1.5533 = -0.466 PPG to 86 players on the strength of a coefficient
+# that does not survive its own controls.
+#
+# This is the same disposition as the coach prior, the veteran talent
+# multiplier, the NGS efficiency wire-in, the L2 EB gate, and the R/25 injury
+# adjustment. Tested, negative, neutralized. The difference is that this one
+# had been moving production boards since May.
+#
+# PRIOR VALUE AND ITS RATIONALE, preserved for revival:
+#   Full vet effect = -1.55 PPG (within-season). 0.30 was chosen as a
+#   conservative preseason haircut. Rookie effect (+0.19 PPG) was already
+#   non-significant and never applied.
+#
+# REVIVE WHEN: a CROSS-season ramp instrument exists, or R/26 is re-specified
+# so its estimand matches the way R/29 consumes it. The within-season effect is
+# not disproven; it is being asked a question it does not answer.
+RAMP_EFFECT_FRACTION <- 0.00  # was 0.30. Neutralized, see above.
 
 # Players with n_nfl_seasons >= this threshold treated as veterans for ramp
 # adjustment. Rookies (0-1 seasons) get no downward adjustment.
@@ -385,7 +570,7 @@ RAMP_VETERAN_THRESHOLD <- 2L
 # Schema tag
 # ------------------------------------------------------------------------------
 
-R29_SCHEMA_TAG <- "s2_w15_v1"
+R29_SCHEMA_TAG <- "s3_r29_v1"
 
 # ------------------------------------------------------------------------------
 # Null-coalescing operator (defined early; used throughout)
@@ -407,9 +592,16 @@ if (getRversion() >= "2.15.1") {
     "total_fantasy_points", "pass_fantasy_points", "rush_fantasy_points",
     "rec_fantasy_points",
     "ecr", "sd", "best", "worst", "tier", "pos_rank", "player_owned_avg",
-    "n_games", "ppr_per_game", "ppr_var",
+    "n_games", "n_games_total", "ppr_per_game", "ppr_var",
     "prior_mu", "prior_sigma", "ytd_mean", "ytd_sigma", "ytd_n",
     "posterior_mu", "posterior_sigma",
+    # Season 3 Wave A1 lifecycle columns and temporaries
+    "draft_year", "pred_type", "years_exp", "lifecycle_state",
+    "pred_selected", "has_prediction", "mu_fallback", "mu_translation",
+    "sigma_translation", "has_translation", "has_history",
+    ".variant", ".phased_out", ".is_rookie", ".has_hist_raw",
+    ".fb_intercept", ".fb_slope",
+    ".mu_for_blend", "ppr_per_game_y13",
     "current_age", "effective_historical_age", "aging_delta_ppg",
     "prior_mu_pre_age", "birth_date",
     "injury_group_prior_season", "injury_n_absent_weeks",
@@ -1233,7 +1425,11 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 #' @param cache_dir Character. Path to pbp cache directory.
 #' @param min_games Integer. Per-season minimum games to count as qualifying.
 #' @param scoring_settings List of scoring parameters.
-#' @return Tibble: player_id, position, n_nfl_seasons, hist_mean, hist_sigma.
+#' @return Tibble: player_id, position, n_nfl_seasons, n_games_total,
+#'   hist_mean, hist_sigma. n_games_total is the summed game count across the
+#'   qualifying seasons; it feeds the history precision in
+#'   .blend_prior_components (hist_sigma is a PER-GAME sd, so precision must
+#'   scale with games, not seasons).
 #' @keywords internal
 .compute_player_historical_stats <- function(season,
                                               cache_dir = CACHE_DIR_DEFAULT,
@@ -1288,6 +1484,7 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
       player_id = character(),
       position = character(),
       n_nfl_seasons = integer(),
+      n_games_total = integer(),
       hist_mean = numeric(),
       hist_sigma = numeric()
     ))
@@ -1298,6 +1495,7 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     dplyr::group_by(player_id, position) %>%
     dplyr::summarise(
       n_nfl_seasons = dplyr::n(),
+      n_games_total = as.integer(sum(n_games, na.rm = TRUE)),
       hist_mean     = mean(season_mean, na.rm = TRUE),
       # Pooled SD across qualifying seasons (simple mean of within-season SDs)
       hist_sigma    = mean(season_sigma, na.rm = TRUE),
@@ -1318,29 +1516,41 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 #'
 #' Math:
 #'   precision_translation = 1 / sigma_translation^2
-#'   precision_history     = n_nfl_seasons / sigma_history^2
+#'   precision_history     = n_games_total / sigma_history^2
 #'   blended_precision     = precision_translation + precision_history
 #'   blended_mu = (precision_translation * mu_translation +
 #'                 precision_history * mu_history) / blended_precision
 #'   blended_sigma = sqrt(1 / blended_precision)
 #'
+#' [2026-07-27] BUG FIX: precision_history previously used n_nfl_seasons /
+#' sigma_history^2. sigma_history is a PER-GAME sd, so the precision of the
+#' history mean (an average of n_games_total games) is n_games_total /
+#' sigma_game^2 -- the season-count version understated history precision by
+#' roughly the games-per-season factor (~17x), over-weighting the translation
+#' arm for every veteran. The function now takes n_games_total (summed
+#' qualifying-season games from .compute_player_historical_stats); n_nfl_seasons
+#' is retained only as the has-history gate.
+#'
 #' For rookies (n_nfl_seasons = 0), precision_history = 0 and the prior
-#' reduces to the translation prior. For veterans with many seasons,
+#' reduces to the translation prior. For veterans with many games,
 #' precision_history dominates and the prior converges to historical NFL
 #' performance. Transition is automatic; no tier boundary.
 #'
 #' @param mu_translation Numeric. Prior mean from R/24 pred_base (PPR/game).
 #' @param sigma_translation Numeric. Translation RMSE for the position.
 #' @param mu_history Numeric. Mean PPR/game from NFL history (NA if no history).
-#' @param sigma_history Numeric. SD PPR/game from NFL history.
-#' @param n_nfl_seasons Integer. Count of qualifying NFL seasons.
+#' @param sigma_history Numeric. Per-game SD of PPR/game from NFL history.
+#' @param n_nfl_seasons Integer. Count of qualifying NFL seasons (gate only).
+#' @param n_games_total Integer. Total games across the qualifying seasons;
+#'   scales the history precision.
 #' @return Named list: list(prior_mu, prior_sigma).
 #' @keywords internal
 .blend_prior_components <- function(mu_translation,
                                      sigma_translation,
                                      mu_history,
                                      sigma_history,
-                                     n_nfl_seasons) {
+                                     n_nfl_seasons,
+                                     n_games_total) {
 
   # Guard against zero or NA sigmas
   sigma_translation <- ifelse(is.na(sigma_translation) | sigma_translation <= 0,
@@ -1351,7 +1561,9 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
                  !is.na(sigma_history) &
                  sigma_history > 0 &
                  !is.na(n_nfl_seasons) &
-                 n_nfl_seasons >= 1L
+                 n_nfl_seasons >= 1L &
+                 !is.na(n_games_total) &
+                 n_games_total >= 1L
 
   if (!has_history) {
     return(list(
@@ -1360,7 +1572,9 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     ))
   }
 
-  precision_history <- n_nfl_seasons / (sigma_history^2)
+  # sigma_history is per-game, so the mean of n_games_total games has
+  # precision n_games_total / sigma_game^2 (see bug-fix note above).
+  precision_history <- n_games_total / (sigma_history^2)
   blended_precision <- precision_translation + precision_history
 
   blended_mu <- (precision_translation * mu_translation +
@@ -1440,9 +1654,22 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 #'   - Downward prior_mu adjustment: INJURY_EFFECT_FRACTION * effect_ppg
 #'   - Sigma inflation based on n_absent_weeks
 #'
-#' Effect size (R/25 bootstrap estimate): -4.54 PPG (CI: -5.55 to -3.53).
-#' INJURY_EFFECT_FRACTION = 0.30 gives a -1.36 PPG conservative preseason
-#' adjustment. Increase toward 1.0 for mid-season projections.
+#' NEUTRALIZED 2026-07-16. INJURY_EFFECT_FRACTION = 0.00, so injury_mu_adj is
+#' 0 for every player and this function is a no-op on mu. It still runs, still
+#' emits its columns, and still sets injury_sigma_multiplier. See the comment
+#' at INJURY_EFFECT_FRACTION for the evidence.
+#'
+#' Short version: R/25's treatment group can only ever contain players who
+#' missed exactly week 3 (MIN_PRIOR_GAMES_W11 = 2 and TREATMENT_RETURN_MAX_W11
+#' = 4 admit one configuration). All 163 treatment player-seasons across
+#' 2011-2025 are identical on first_absent_week, return_week, n_absent_weeks,
+#' and n_prior_games. Real season-ending injuries fail both R/25 filters and
+#' are absent from the groups file entirely.
+#'
+#' Effect size (R/25 bootstrap estimate, reproduced 2026-07-16): -4.53733 PPG,
+#' CI [-5.5497, -3.5298], n_treatment = 115, n_control = 1830. The estimate
+#' reproduces exactly. It is the group it was estimated on that does not
+#' support the use R/29 was making of it.
 #'
 #' @param priors Tibble from build_projection_priors() before injury adjustment.
 #' @param injury_groups Tibble from .load_injury_groups().
@@ -1672,9 +1899,14 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 #' @keywords internal
 .compute_volume_efficiency_blend <- function(priors, panel_data,
                                                season,
-                                               min_games = 8L) {
+                                               min_games = 8L,
+                                               scoring_settings = DEFAULT_SCORING_SETTINGS) {
 
   prior_seasons <- (season - 3L):(season - 1L)
+
+  # League-aware scoring for the volume prior. Merge the caller's ruleset over
+  # DEFAULT_SCORING_SETTINGS so any keys the league omits fall back to defaults.
+  sc <- utils::modifyList(DEFAULT_SCORING_SETTINGS, scoring_settings %||% list())
 
   # Filter panel to qualifying player-seasons
   panel_use <- panel_data %>%
@@ -1703,9 +1935,25 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     ))
   }
 
-  # Compute PPR PPG per player-season from panel stats
-  # Using DEFAULT_SCORING_SETTINGS core PPR settings (pass 0.04/4/-2,
-  # rush 0.1/6, rec 0.1/6, receptions 1.0 per reception)
+  # sacks_taken is the only newly-referenced term (for a QB sack penalty). It
+  # comes from R/16's passing builder; guard so an older panel cache without it
+  # cannot crash the run. Missing means no sacks recorded, so 0 is correct.
+  if (!"sacks_taken" %in% names(panel_use)) panel_use$sacks_taken <- 0
+
+  # Compute PPG per player-season from panel stats using the LEAGUE'S scoring.
+  #
+  # WHY (decision, 2026-07): this volume prior used to hardcode PPR, so two
+  # leagues with different scoring got the same volume-implied prior. That
+  # contradicts the per-league ranking goal. Now it scores from `sc` (the
+  # league ruleset). This is the "Option A" fix: the R/16 panel holds SEASON
+  # AGGREGATES, so only scoring terms expressible from season totals are honored
+  # here -- per-yard, per-TD, INT, PPR, the per-attempt rush bonus, and a QB
+  # sack penalty. Play-level bonuses (tiered PPR, long-TD, 100/300/400-yard
+  # bonuses, first-down points, 2PT) CANNOT be applied at the aggregate level
+  # and are intentionally omitted from THIS prior signal only. They are still
+  # fully applied to the final projection and everything downstream, which score
+  # play-by-play via calculate_fantasy_points_ext(). Backlog: rebuild the panel
+  # at play level to make even this prior bonus-aware.
   panel_use <- panel_use %>%
     dplyr::mutate(
       # Coalesce each stat term to 0 before summing. The R/16 panel stores NA
@@ -1717,14 +1965,16 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
       # correct substitution. (Diagnosed: 93% of window player-seasons were
       # being dropped, TEs hit hardest at 209/213.)
       panel_fantasy_pts =
-        dplyr::coalesce(passing_yards, 0) * 0.04 +
-        dplyr::coalesce(pass_tds, 0) * 4 -
-        dplyr::coalesce(interceptions_thrown, 0) * 2 +
-        dplyr::coalesce(rushing_yards, 0) * 0.1 +
-        dplyr::coalesce(rush_tds, 0) * 6 +
-        dplyr::coalesce(receiving_yards, 0) * 0.1 +
-        dplyr::coalesce(rec_tds, 0) * 6 +
-        dplyr::coalesce(receptions, 0) * 1,
+        dplyr::coalesce(passing_yards, 0)        * sc$pass_yd +
+        dplyr::coalesce(pass_tds, 0)             * sc$pass_td +
+        dplyr::coalesce(interceptions_thrown, 0) * sc$pass_int +
+        dplyr::coalesce(sacks_taken, 0)          * sc$sack_penalty +
+        dplyr::coalesce(rushing_yards, 0)        * sc$rush_yd +
+        dplyr::coalesce(rush_tds, 0)             * sc$rush_td +
+        dplyr::coalesce(rush_attempts, 0)        * sc$rush_att_bonus +
+        dplyr::coalesce(receiving_yards, 0)      * sc$rec_yd +
+        dplyr::coalesce(rec_tds, 0)              * sc$rec_td +
+        dplyr::coalesce(receptions, 0)           * sc$ppr,
       panel_ppg = panel_fantasy_pts / pmax(games_played, 1),
 
       # Position-specific opportunity rate (touches per game)
@@ -1777,16 +2027,17 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     ) %>%
     dplyr::filter(n_panel_seasons >= 1L, is.finite(volume_implied_ppg))
 
-  # Join to priors and compute blend adjustment
-  # Only apply to players with NFL history (translation_only / score_final
-  # players have no panel data so prior_mu_pre_age would be irrelevant)
+  # Join to priors and compute blend adjustment.
+  # Apply only to players with real NFL history -- the volume-implied PPG comes
+  # from the R/16 panel, which only exists for players who have played. Gate on
+  # has_history (robust to lifecycle-label changes) rather than enumerating
+  # prior_source states; the !is.na(volume_implied_ppg) filter below is the
+  # second gate (player must actually be in the panel). Rookies and pure-
+  # fallback players have no panel rows and are excluded by both gates.
   adj <- priors %>%
-    dplyr::select(nfl_gsis_id, prior_source, prior_mu_pre_age,
+    dplyr::select(nfl_gsis_id, prior_source, has_history, prior_mu_pre_age,
                   n_nfl_seasons, position) %>%
-    dplyr::filter(
-      prior_source %in% c("blended", "veteran_history_only",
-                           "history_only_fallback")
-    ) %>%
+    dplyr::filter(has_history) %>%
     dplyr::left_join(
       player_vol %>% dplyr::select(player_id, volume_implied_ppg,
                                     n_panel_seasons),
@@ -2455,6 +2706,87 @@ load_consensus_projections_fantasypros <- function(season,
   proj_out
 }
 
+# ------------------------------------------------------------------------------
+# .fit_score_final_fallback (Season 3 Wave A1)
+# ------------------------------------------------------------------------------
+
+#' Fit per-position score_final -> PPR/game calibration for the last-resort prior
+#'
+#' Replaces the legacy uncalibrated `score_final * 0.15` anchor. That constant
+#' assumed (a) a single global scale across all positions and (b) that the
+#' minimum training prediction maps to ~0 PPR/game; both are false. score_final
+#' is a per-position min-max rescaling of the v3 enriched prediction, so the
+#' relationship between score_final and actual PPR/game differs by position and
+#' has a nonzero intercept.
+#'
+#' This fits `ppr_per_game_y13 ~ score_final` per position on training rows that
+#' have BOTH columns, and returns per-position (intercept, slope). The fallback
+#' is the LAST resort -- it fires only for a player with no usable translation
+#' point estimate after R/39 (which scores the rookie cohort live), so it should
+#' be rare. When it does fire, an empirical position-specific line is far better
+#' than a hand-picked global multiplier.
+#'
+#' Guard: a position with fewer than MIN_FALLBACK_FIT_N complete rows cannot
+#' support a fit; that position falls back to the legacy 0.15 anchor with a
+#' warning rather than fitting a line on too few points.
+#'
+#' @param fallback_df Tibble with at least position, score_final,
+#'   ppr_per_game_y13 (training rows only -- prediction-cohort rows have NA
+#'   outcome and are excluded by the is.na filter).
+#' @param verbose Logical. Print fitted coefficients. Default TRUE.
+#' @return Named list per position: list(intercept = <dbl>, slope = <dbl>,
+#'   method = "fit" | "legacy_0.15", n = <int>).
+#' @keywords internal
+.fit_score_final_fallback <- function(fallback_df, verbose = TRUE) {
+
+  MIN_FALLBACK_FIT_N <- 15L
+  LEGACY_MULTIPLIER  <- 0.15
+
+  out <- list()
+  for (pos in SUPPORTED_POSITIONS) {
+    d <- fallback_df %>%
+      dplyr::filter(
+        .data$position == pos,
+        !is.na(.data$score_final),
+        !is.na(.data$ppr_per_game_y13)
+      )
+    n <- nrow(d)
+
+    if (n < MIN_FALLBACK_FIT_N || stats::sd(d$score_final) == 0) {
+      warning(glue(
+        ".fit_score_final_fallback(): {pos} has {n} complete rows ",
+        "(< {MIN_FALLBACK_FIT_N}) -- using legacy {LEGACY_MULTIPLIER} anchor ",
+        "for this position's fallback."
+      ), call. = FALSE)
+      out[[pos]] <- list(intercept = 0, slope = LEGACY_MULTIPLIER,
+                         method = "legacy_0.15", n = n)
+      next
+    }
+
+    fit <- stats::lm(ppr_per_game_y13 ~ score_final, data = d)
+    out[[pos]] <- list(
+      intercept = unname(stats::coef(fit)[1]),
+      slope     = unname(stats::coef(fit)[2]),
+      method    = "fit",
+      n         = n
+    )
+  }
+
+  if (verbose) {
+    message("  score_final -> PPR/game fallback calibration (per position):")
+    for (pos in SUPPORTED_POSITIONS) {
+      o <- out[[pos]]
+      message(glue(
+        "    {pos}: ppg = {round(o$intercept, 3)} + ",
+        "{round(o$slope, 4)} * score_final  ",
+        "[{o$method}, n = {o$n}]"
+      ))
+    }
+  }
+
+  out
+}
+
 # ==============================================================================
 # EXPORT 4: build_projection_priors
 # ==============================================================================
@@ -2481,26 +2813,40 @@ load_consensus_projections_fantasypros <- function(season,
 #'   priors for veterans not in R/28 (pre-2015 draftees). Default TRUE.
 #' @return Tibble: nfl_gsis_id, position, prior_mu, prior_sigma,
 #'   n_nfl_seasons, score_final, score_v1, has_translation, has_history,
-#'   prior_source ("blended", "translation_only", or "history_only").
+#'   prior_source, years_exp. prior_source is the lifecycle state, one of:
+#'   "translation_active", "translation_capped_rookie",
+#'   "phased_out_history_only", "calibrated_fallback",
+#'   "phaseout_no_history_fallback", "veteran_history_only".
 #'
 #' @details
 #' The precision-weighted blend uses these formulas:
 #'   precision_translation = 1 / sigma_translation^2
-#'   precision_history     = n_nfl_seasons / sigma_history^2
+#'   precision_history     = n_games_total / sigma_history^2
 #'   prior_mu              = weighted average by precision
 #'   prior_sigma           = 1 / sqrt(total precision)
 #'
-#' Sigma_translation comes from TRANSLATION_RMSE_BY_POSITION which contains
-#' the confirmed R/27 holdout RMSE values for each position. Sigma_history
-#' comes from the within-player SD of PPR/game across prior NFL seasons.
+#' Sigma_translation is read live from the v1 (R/24) performance file by
+#' .load_translation_sigmas(), variant-matched per position (base for QB,
+#' enriched for RB/WR/TE) to the model that produced the point estimate.
+#' Sigma_history comes from the within-player SD of
+#' PPR/game across prior NFL seasons.
 #'
-#' For rookies (no NFL history), prior_mu = pred_base and
-#' prior_sigma = TRANSLATION_RMSE_BY_POSITION[position]. As seasons of NFL
-#' history accumulate, the prior shifts smoothly toward historical mean.
+#' The translation lifecycle (Season 3 Wave A1) governs how the college signal
+#' is used as a function of NFL experience (years_exp = season - draft_year):
+#'   - years_exp == 0 (rookie): translation point estimate is haircut by
+#'     ROOKIE_TRUST_CAP (downward only), then blended.
+#'   - years_exp 1..3: translation blended against history by precision; the
+#'     HISTORY_ONLY_FLOOR_SEASONS guard keeps some translation alive through a
+#'     slow developer's early seasons.
+#'   - years_exp >= TRANSLATION_PHASEOUT_EXP (4): translation gets ZERO weight;
+#'     prior is pure NFL history. Safety net: a phased-out player with no
+#'     history (rare data glitch) falls to the calibrated score_final line
+#'     rather than producing an empty prior.
+#'   - no usable translation point estimate: calibrated per-position
+#'     score_final -> PPR/game line (replaces the legacy 0.15 anchor).
 #'
 #' For pre-2015 veterans (not in R/28), prior_mu = hist_mean and
-#' prior_sigma = hist_sigma. These players have no translation score so
-#' the prior_source is "history_only".
+#' prior_sigma = hist_sigma; prior_source is "veteran_history_only".
 #'
 #' @examples
 #' \dontrun{
@@ -2512,6 +2858,9 @@ load_consensus_projections_fantasypros <- function(season,
 build_projection_priors <- function(season,
                                      prospects_path = PROSPECTS_PATH_DEFAULT,
                                      translation_path = TRANSLATION_PREDS_PATH_DEFAULT,
+                                     translation_perf_path =
+                                       file.path(CACHE_DIR_DEFAULT,
+                                                 "s2_week10_performance.rds"),
                                      cache_dir = CACHE_DIR_DEFAULT,
                                      scoring_settings = DEFAULT_SCORING_SETTINGS,
                                      include_pre2015_vets = TRUE) {
@@ -2533,6 +2882,12 @@ build_projection_priors <- function(season,
     )
   }
 
+  # Variant-matched v1 translation sigma, read live from the v1 performance
+  # file in season2_cache (where R/24 writes it; NOT the season3 augmented
+  # predictions dir). Fails loud if absent so a stale or missing baseline can
+  # never silently miscalibrate the prior.
+  translation_sigmas <- .load_translation_sigmas(translation_perf_path)
+
   message("STEP 1/4: Loading R/28 prospects and R/24 predictions...")
 
   prospects <- readr::read_csv(prospects_path, show_col_types = FALSE) %>%
@@ -2546,17 +2901,38 @@ build_projection_priors <- function(season,
   message(glue("  Predictions: {nrow(predictions)} rows ",
                "({length(unique(predictions$nfl_gsis_id))} unique gsis_ids)"))
 
-  # Join R/28 + R/24 on nfl_gsis_id
+  # Join R/28 prospects + R/39 augmented translation predictions on nfl_gsis_id.
+  # The R/39 file carries pred_base and pred_enriched (rookies scored live
+  # against the v1 models; training rows keep their LOCO predictions), plus
+  # draft_year (for years_exp) and pred_type ("final_model" rookie vs "loco"
+  # training -- informational; the lifecycle logic keys on years_exp, not type).
   base <- prospects %>%
     dplyr::select(nfl_gsis_id, position, score_v1, score_final,
                   score_base, score_enriched) %>%
     dplyr::left_join(
-      predictions %>% dplyr::select(nfl_gsis_id, pred_base, pred_enriched),
+      predictions %>% dplyr::select(nfl_gsis_id, pred_base, pred_enriched,
+                                    draft_year, pred_type),
       by = "nfl_gsis_id"
     )
 
   message(glue("  Joined: {nrow(base)} prospect rows; ",
-               "{sum(!is.na(base$pred_base))} have R/24 pred_base"))
+               "{sum(!is.na(base$pred_base))} have pred_base, ",
+               "{sum(!is.na(base$pred_enriched))} have pred_enriched"))
+
+  # Fit the per-position score_final -> PPR/game fallback calibration once, from
+  # the training rows in the joined set (those with a known ppr_per_game_y13).
+  # The R/39 augmented file does not carry ppr_per_game_y13 into `base` (only
+  # pred_* and meta were selected), so pull outcome from the predictions object
+  # directly for the fit.
+  fallback_fit_df <- prospects %>%
+    dplyr::select(nfl_gsis_id, position, score_final) %>%
+    dplyr::inner_join(
+      predictions %>%
+        dplyr::filter(pred_type == "loco") %>%
+        dplyr::select(nfl_gsis_id, ppr_per_game_y13),
+      by = "nfl_gsis_id"
+    )
+  fallback_calib <- .fit_score_final_fallback(fallback_fit_df)
 
   message("STEP 2/4: Computing NFL historical performance...")
 
@@ -2573,51 +2949,158 @@ build_projection_priors <- function(season,
   r28_priors <- base %>%
     dplyr::left_join(
       history %>% dplyr::select(player_id, hist_mean, hist_sigma,
-                                 n_nfl_seasons),
+                                 n_nfl_seasons, n_games_total),
       by = c("nfl_gsis_id" = "player_id")
     )
 
   r28_priors <- r28_priors %>%
     dplyr::rowwise() %>%
     dplyr::mutate(
-      # Use R/24 pred_base when available; fall back to score_final scaled
-      # when not. The 0.15 multiplier maps the 0-100 score scale to a
-      # rough PPR/game expectation where 100 corresponds to ~15 PPR/game
-      # (a position-leading season). This is documented as a fallback,
-      # not a primary path; ~58% of R/28 players have pred_base.
-      mu_translation = dplyr::if_else(
-        !is.na(pred_base),
-        as.numeric(pred_base),
-        as.numeric(score_final) * 0.15
+      # --- years_exp: NFL seasons of experience (0 = rookie year). NA when
+      # draft_year is missing; an NA years_exp is treated as neither rookie nor
+      # phased-out (it flows through the normal translation/blend path).
+      years_exp = if (!is.na(draft_year)) season - as.integer(draft_year)
+                  else NA_integer_,
+
+      # --- Per-position point-estimate variant (QB base, RB/WR/TE enriched).
+      # Select the configured prediction; if the configured one is NA but the
+      # other exists, fall to the available one rather than dropping to the
+      # score_final fallback unnecessarily.
+      .variant = ROOKIE_TRANSLATION_VARIANT[[position]] %||% "base",
+      pred_selected = {
+        primary  <- if (.variant == "enriched") pred_enriched else pred_base
+        fallback <- if (.variant == "enriched") pred_base else pred_enriched
+        if (!is.na(primary)) as.numeric(primary)
+        else if (!is.na(fallback)) as.numeric(fallback)
+        else NA_real_
+      },
+      has_prediction = !is.na(pred_selected),
+
+      # --- Lifecycle state. Order matters: phase-out is checked first, then
+      # rookie cap, then normal translation, then the calibrated fallback.
+      #   phased_out  : years_exp >= TRANSLATION_PHASEOUT_EXP -> zero translation
+      #                 weight; prior is 100% NFL history (Option A: route via
+      #                 has_translation = FALSE through the existing history
+      #                 path). Safety net: if no computable history exists for a
+      #                 phased-out player (a long-career vet whose recent 3-season
+      #                 window is all sub-8-game seasons, or a data glitch), use
+      #                 the calibrated score_final line -- NEVER the translation.
+      #                 The phase-out's premise is that a 4+ year player's college
+      #                 signal is dead; falling back to it for the MOST
+      #                 experienced players would be the worst case. So there is
+      #                 no "phaseout uses translation" state.
+      #   rookie      : years_exp == 0 -> mu_translation = ROOKIE_TRUST_CAP *
+      #                 pred_selected (downward-only haircut).
+      #   translation : years_exp 1..3 (or NA) with a prediction -> use
+      #                 pred_selected; blended against history by precision.
+      #   fallback    : no usable prediction -> calibrated per-position line.
+      .phased_out = !is.na(years_exp) & years_exp >= TRANSLATION_PHASEOUT_EXP,
+      .is_rookie  = !is.na(years_exp) & years_exp == 0L,
+      .has_hist_raw = !is.na(hist_mean) & !is.na(n_nfl_seasons) &
+                      n_nfl_seasons >= 1L,
+
+      lifecycle_state = dplyr::case_when(
+        .phased_out &  .has_hist_raw  ~ "phased_out_history_only",
+        # Phased out, no computable history: calibrated fallback, NOT translation
+        # (Option 1). A 4+ year player's college signal is dead by construction.
+        .phased_out & !.has_hist_raw  ~ "phaseout_no_history_fallback",
+        .is_rookie  &  has_prediction ~ "translation_capped_rookie",
+        has_prediction                ~ "translation_active",
+        TRUE                          ~ "calibrated_fallback"
       ),
-      sigma_translation = TRANSLATION_RMSE_BY_POSITION[[position]] %||%
-                          mean(unlist(TRANSLATION_RMSE_BY_POSITION)),
+
+      # --- Calibrated fallback value (used by fallback states). Pull the two
+      # scalars directly rather than storing the 4-element list in a column
+      # cell (which mutate rejects as size 4). Guard a position whose fit was
+      # unavailable.
+      .fb_intercept = {
+        f <- fallback_calib[[position]]
+        if (!is.null(f)) f$intercept else 0
+      },
+      .fb_slope = {
+        f <- fallback_calib[[position]]
+        if (!is.null(f)) f$slope else 0.15
+      },
+      mu_fallback = .fb_intercept + .fb_slope * as.numeric(score_final),
+
+      # --- mu_translation by state.
+      mu_translation = dplyr::case_when(
+        lifecycle_state == "translation_capped_rookie"
+          ~ ROOKIE_TRUST_CAP * pred_selected,
+        lifecycle_state == "translation_active"
+          ~ pred_selected,
+        lifecycle_state %in% c("calibrated_fallback",
+                               "phaseout_no_history_fallback")
+          ~ mu_fallback,
+        # phased_out_history_only: translation is zeroed; mu_translation is
+        # unused because the post-blend overwrite forces pure history. Set NA.
+        TRUE ~ NA_real_
+      ),
+
+      sigma_translation = translation_sigmas[[position]],
+
+      # has_translation drives .blend_prior_components(): FALSE -> history-only.
+      # The two fallback states carry mu_fallback as their mu_translation with no
+      # usable history, so the blend returns the fallback line unchanged.
+      has_translation = lifecycle_state %in% c(
+        "translation_capped_rookie", "translation_active",
+        "calibrated_fallback", "phaseout_no_history_fallback"
+      ),
+
+      # For phased_out_history_only, pass NA translation so the blend returns
+      # pure history (precision_translation drops out). The post-blend overwrite
+      # below is belt-and-suspenders on top of this. All other states pass their
+      # real mu_translation; .blend_prior_components() correctly returns the
+      # translation alone when history is absent (n_nfl_seasons 0/NA) and blends
+      # when history is present.
+      .mu_for_blend = if (lifecycle_state == "phased_out_history_only")
+                        NA_real_ else mu_translation,
+
       blend = list(.blend_prior_components(
-        mu_translation     = mu_translation,
+        mu_translation     = .mu_for_blend,
         sigma_translation  = sigma_translation,
         mu_history         = hist_mean,
         sigma_history      = hist_sigma,
-        n_nfl_seasons      = n_nfl_seasons
+        n_nfl_seasons      = n_nfl_seasons,
+        n_games_total      = n_games_total
       ))
     ) %>%
     dplyr::ungroup() %>%
     dplyr::mutate(
-      prior_mu        = purrr::map_dbl(blend, "prior_mu"),
-      prior_sigma     = purrr::map_dbl(blend, "prior_sigma"),
+      # For phased_out_history_only, force the prior to pure history: the blend
+      # above still mixed in any mu_translation we passed, so overwrite with the
+      # history mean/sigma directly for that state. This is the explicit
+      # zero-translation guardrail (Option A).
+      prior_mu = dplyr::if_else(
+        lifecycle_state == "phased_out_history_only",
+        hist_mean,
+        purrr::map_dbl(blend, "prior_mu")
+      ),
+      prior_sigma = dplyr::if_else(
+        lifecycle_state == "phased_out_history_only",
+        hist_sigma,
+        purrr::map_dbl(blend, "prior_sigma")
+      ),
       n_nfl_seasons   = dplyr::coalesce(n_nfl_seasons, 0L),
-      has_translation = !is.na(pred_base),
       has_history     = n_nfl_seasons >= 1L,
-      prior_source    = dplyr::case_when(
-        has_translation & has_history  ~ "blended",
-        has_translation & !has_history ~ "translation_only",
-        !has_translation & has_history ~ "history_only_fallback",
-        TRUE                            ~ "score_final_fallback"
-      )
+      prior_source    = lifecycle_state
     ) %>%
     dplyr::select(
       nfl_gsis_id, position, prior_mu, prior_sigma, n_nfl_seasons,
-      score_final, score_v1, has_translation, has_history, prior_source
+      score_final, score_v1, has_translation, has_history, prior_source,
+      years_exp
     )
+
+  # Lifecycle state summary -- shows how many players took each path and the
+  # mean rookie haircut, so a run immediately reveals whether gates fired on
+  # sensible populations.
+  message("  Lifecycle state breakdown:")
+  lc_summary <- r28_priors %>%
+    dplyr::count(prior_source, name = "n") %>%
+    dplyr::arrange(dplyr::desc(n))
+  for (i in seq_len(nrow(lc_summary))) {
+    message(glue("    {lc_summary$prior_source[i]}: {lc_summary$n[i]}"))
+  }
 
   # ---- STEP 4: Add history-only priors for non-R/28 veterans ----
 
@@ -2635,18 +3118,24 @@ build_projection_priors <- function(season,
         # as a conservative variance estimate
         prior_sigma   = dplyr::if_else(
           is.na(hist_sigma) | hist_sigma <= 0,
-          purrr::map_dbl(position, ~ TRANSLATION_RMSE_BY_POSITION[[.x]] %||% 4.0),
+          purrr::map_dbl(position, ~ translation_sigmas[[.x]]),
           hist_sigma
         ),
         score_final     = NA_real_,
         score_v1        = NA_real_,
         has_translation = FALSE,
         has_history     = TRUE,
-        prior_source    = "veteran_history_only"
+        prior_source    = "veteran_history_only",
+        # Pre-2015 vets are by definition well past phase-out; years_exp is not
+        # computed for them (no draft_year in the history table) and is unused
+        # downstream for history-only players. NA keeps the column aligned for
+        # the bind_rows with r28_priors.
+        years_exp       = NA_integer_
       ) %>%
       dplyr::select(
         nfl_gsis_id, position, prior_mu, prior_sigma, n_nfl_seasons,
-        score_final, score_v1, has_translation, has_history, prior_source
+        score_final, score_v1, has_translation, has_history, prior_source,
+        years_exp
       )
 
     message(glue("  Added {nrow(vet_priors)} non-R/28 veterans ",
@@ -2655,13 +3144,17 @@ build_projection_priors <- function(season,
     priors <- dplyr::bind_rows(r28_priors, vet_priors) %>%
       # Deduplication: a player can appear in both R/28 and the veteran
       # history extension (e.g., multi-position players like Taysom Hill).
-      # Keep the R/28-derived entry when both exist; it has richer features.
+      # Keep the richest entry when both exist. Priority: any state carrying a
+      # live translation or blend first, then history-based states, with the
+      # bare pre-2015 veteran row last.
       dplyr::arrange(dplyr::case_when(
-        prior_source == "blended"               ~ 1L,
-        prior_source == "history_only_fallback" ~ 2L,
-        prior_source == "score_final_fallback"  ~ 3L,
-        prior_source == "translation_only"      ~ 4L,
-        TRUE                                    ~ 5L
+        prior_source == "translation_active"              ~ 1L,
+        prior_source == "translation_capped_rookie"       ~ 2L,
+        prior_source == "phased_out_history_only"         ~ 3L,
+        prior_source == "calibrated_fallback"             ~ 4L,
+        prior_source == "phaseout_no_history_fallback"    ~ 5L,
+        prior_source == "veteran_history_only"            ~ 6L,
+        TRUE                                              ~ 7L
       )) %>%
       dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
   } else {
@@ -2801,9 +3294,10 @@ build_projection_priors <- function(season,
     panel_data <- readRDS(AGING_PANEL_CACHE_PATH)
 
     vol_adj <- .compute_volume_efficiency_blend(
-      priors     = priors,
-      panel_data = panel_data,
-      season     = season
+      priors           = priors,
+      panel_data       = panel_data,
+      season           = season,
+      scoring_settings = scoring_settings
     )
 
     # Free panel memory after use

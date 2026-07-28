@@ -445,12 +445,14 @@ classify_player_position <- function(player_ids = NULL,
       # Available ~2016+ via tracking data. Returns NA for earlier seasons.
       # The column exists in normalized data (OPTIONAL_COLUMN) but is NA
       # for seasons before tracking data was available.
-      mean_cpoe = dplyr::if_else(
-        "cpoe" %in% names(pbp) &&
-          sum(!is.na(cpoe[pass_attempt == 1L])) > 0L,
-        mean(cpoe[pass_attempt == 1L], na.rm = TRUE),
-        NA_real_
-      ),
+      # Base if/else (not dplyr::if_else): if_else evaluates both branches
+      # eagerly, which errors with object-not-found when cpoe is absent.
+      # Short-circuit && guards the cpoe reference.
+      mean_cpoe = if ("cpoe" %in% names(pbp) &&
+                        sum(!is.na(cpoe[pass_attempt == 1L])) > 0L)
+        mean(cpoe[pass_attempt == 1L], na.rm = TRUE)
+      else
+        NA_real_,
 
       .groups = "drop"
     )
@@ -841,11 +843,35 @@ build_player_season_panel <- function(
     # Filter to regular season offensive plays.
     # season_type column exists in nflfastR but is not in Season 2 CORE_COLUMNS.
     # Guard for the (unlikely) case it's missing.
+    #
+    # TWO-POINT PLAYS ARE RETAINED [2026-07-15]. Previously this filter kept
+    # only play_type %in% c("pass","run"), which silently dropped two-point
+    # conversions that nflfastR tags "no_play" because a defensive penalty was
+    # enforced between downs. The conversion still counted; only the penalty
+    # moved to the ensuing kickoff. Three real cases across 2010-2025:
+    #   2015_13_IND_PIT  Roethlisberger -> W.Johnson, succeeds, def. holding
+    #   2019_06_SEA_CLE  Mayfield -> D.Harris, succeeds, def. holding
+    #   2020_04_CLE_DAL  S.Carlson rush on a blocked-XP recovery, def. offside
+    # A player whose only snap in a game was one of these was credited with zero
+    # games_played for it.
+    #
+    # This changes ONLY games_played. .build_passing_stats(), .build_rushing_
+    # stats() and .build_receiving_stats() each already exclude
+    # two_point_attempt == 1L (lines 398, 478, 541), which is correct: by NFL
+    # convention two-point yards and TDs do not count toward passing, rushing or
+    # receiving totals. So the extra rows are invisible to every counting column
+    # and to the min_plays / low_volume threshold, and visible only to
+    # .build_games_played(), which is the thing that was wrong.
+    #
+    # Two-point plays already tagged "pass" or "run" (the large majority: 107 of
+    # 113 in 2016) were always retained by this filter and already counted
+    # toward games_played. Only the "no_play"-tagged ones were being lost.
     if ("season_type" %in% names(pbp_raw)) {
       pbp <- pbp_raw %>%
         dplyr::filter(
           season_type == "REG",
-          play_type %in% c("pass", "run")
+          play_type %in% c("pass", "run") |
+            dplyr::coalesce(two_point_attempt, 0L) == 1L
         )
     } else {
       warning(glue::glue(
@@ -853,7 +879,10 @@ build_player_season_panel <- function(
         "Including all season types (pre-season + playoffs may be included)."
       ))
       pbp <- pbp_raw %>%
-        dplyr::filter(play_type %in% c("pass", "run"))
+        dplyr::filter(
+          play_type %in% c("pass", "run") |
+            dplyr::coalesce(two_point_attempt, 0L) == 1L
+        )
     }
 
     rm(pbp_raw)
@@ -1253,4 +1282,698 @@ validate_panel_integrity <- function(panel, verbose = TRUE) {
   }
 
   return(results)
+}
+
+
+# ==============================================================================
+# SECTION: GAME-LEVEL SCORED PANEL  [2026-07-15, A2-b / B1]
+# ==============================================================================
+#
+# WHY THIS EXISTS
+# ---------------
+# R/23_aging_curves.R historically computed fantasy points from the SEASON-level
+# panel via its own compute_season_ppg(), which hardcoded eight scoring terms.
+# That hardcode happened to match DK Best Ball on every term the season panel
+# could support, but it was structurally scoring-blind: it could not represent
+# fumbles, per-game threshold bonuses, tiered PPR, TE premium, rush attempt
+# bonuses, sack penalties, superflex, or first-down points.
+#
+# Three of those are not a granularity problem, they are a data problem: the
+# season panel never carried fumbles, first downs, or two-point conversions.
+# The rest (100-yard games, 300-yard passing games, per-reception yardage tiers)
+# are irreducibly GAME- or PLAY-level and cannot be recovered from season totals.
+#
+# The fix is to score at the play level through R/17's engine, which already
+# implements every one of those terms, and roll up to a season fp_per_game.
+#
+# DESIGN
+# ------
+# Additive. build_player_season_panel() is untouched, as are all its consumers.
+# attach_scored_ppg() takes an existing panel and OVERWRITES ONLY the fantasy
+# points columns, deliberately reusing the panel's own games_played so that the
+# only thing that changes versus the legacy path is the numerator. That isolates
+# any downstream rank diff to the scoring change alone.
+#
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# Internal: stable cache key for a scoring settings list
+# ------------------------------------------------------------------------------
+.scoring_settings_key <- function(scoring_settings) {
+  # Sort by name so that list order never changes the key. NULL-valued entries
+  # (e.g. tiered_rec_tiers) are serialized as the literal "NULL" so that
+  # absence and presence produce different keys.
+  if (length(scoring_settings) == 0L) return("noscoring")
+
+  nms <- sort(names(scoring_settings))
+  flat <- vapply(nms, function(n) {
+    v <- scoring_settings[[n]]
+    if (is.null(v)) {
+      paste0(n, "=NULL")
+    } else {
+      # format() drops names from named vectors, so configs differing only in
+      # element names (e.g. long_td_tiers thresholds) would hash identically.
+      # Serialize names alongside values explicitly.
+      vals <- format(v, trim = TRUE, digits = 10)
+      if (!is.null(names(v))) {
+        vals <- paste0(names(v), "=", vals)
+      }
+      paste0(n, "=", paste(vals, collapse = ","))
+    }
+  }, character(1))
+
+  # rlang::hash() is used rather than digest::digest() so that no new package
+  # dependency is introduced: rlang is already required by dplyr.
+  substr(rlang::hash(paste(flat, collapse = "|")), 1, 10)
+}
+
+
+# ------------------------------------------------------------------------------
+# Internal: merge caller scoring against R/17 defaults and reject unknown keys
+# ------------------------------------------------------------------------------
+.resolve_scoring_settings <- function(scoring_settings) {
+
+  if (!exists("get_ext_scoring_defaults", mode = "function")) {
+    r17_path <- here::here("R", "17_extended_scoring.R")
+    if (!file.exists(r17_path)) {
+      stop(glue::glue(
+        "R/17_extended_scoring.R not found at: {r17_path}\n",
+        "This file is required for get_ext_scoring_defaults() and ",
+        "calculate_fantasy_points_ext()."
+      ))
+    }
+    source(r17_path)
+  }
+
+  defaults <- get_ext_scoring_defaults()
+
+  if (is.null(scoring_settings)) return(defaults)
+
+  if (!is.list(scoring_settings)) {
+    stop("scoring_settings must be a named list, or NULL to use R/17 defaults.")
+  }
+
+  unknown <- setdiff(names(scoring_settings), names(defaults))
+  if (length(unknown) > 0L) {
+    stop(glue::glue(
+      "scoring_settings contains keys R/17 does not implement: ",
+      "{paste(unknown, collapse = ', ')}.\n",
+      "Valid keys: {paste(sort(names(defaults)), collapse = ', ')}"
+    ))
+  }
+
+  # utils::modifyList drops entries whose value is NULL, which would silently
+  # revert an explicit tiered_rec_tiers = NULL to the default. Assign directly.
+  out <- defaults
+  for (n in names(scoring_settings)) out[n] <- list(scoring_settings[[n]])
+  out
+}
+
+
+# ------------------------------------------------------------------------------
+# Internal: hard-fail on scoring terms that the loaded PBP cannot support
+# ------------------------------------------------------------------------------
+# R/17 soft-checks several columns: if they are absent it silently scores them
+# as zero (first_down_rush at R/17:859, first_down_pass at R/17:991), and a NULL
+# roster_data silently disables te_premium. A scoring setting that is quietly
+# ignored is worse than one that is honestly hardcoded, because the output looks
+# parameterized and is not. Fail loudly instead.
+# ------------------------------------------------------------------------------
+.assert_pbp_supports_scoring <- function(pbp, scoring, season, has_roster) {
+
+  problems <- character(0)
+
+  # Numeric comparison, not identical(): a caller passing first_down_points = 0L
+  # would fail identical(0L, 0) and trip the guard spuriously.
+  .is_active <- function(x) !is.null(x) && !is.na(x) && x != 0
+
+  if (.is_active(scoring$first_down_points) &&
+      !all(c("first_down_rush", "first_down_pass") %in% names(pbp))) {
+    problems <- c(problems, glue::glue(
+      "first_down_points = {scoring$first_down_points} but season {season} PBP ",
+      "is missing first_down_rush and/or first_down_pass. R/17 would silently ",
+      "score these as zero."
+    ))
+  }
+
+  if (isTRUE(scoring$te_premium) && !has_roster) {
+    problems <- c(problems, glue::glue(
+      "te_premium = TRUE but no roster_data was resolved. R/17 would silently ",
+      "skip the TE premium."
+    ))
+  }
+
+  if (.is_active(scoring$two_point_conversion) &&
+      !"two_point_attempt" %in% names(pbp)) {
+    problems <- c(problems, glue::glue(
+      "two_point_conversion = {scoring$two_point_conversion} but season ",
+      "{season} PBP is missing two_point_attempt."
+    ))
+  }
+
+  if (length(problems) > 0L) {
+    stop(glue::glue(
+      "Scoring settings cannot be honored by the loaded play-by-play:\n  - ",
+      "{paste(problems, collapse = '\n  - ')}"
+    ), call. = FALSE)
+  }
+
+  invisible(TRUE)
+}
+
+
+#' Build a Player-Game Panel Scored Under Arbitrary League Settings
+#'
+#' @description
+#' Loads normalized play-by-play one season at a time and scores it through
+#' R/17's \code{calculate_fantasy_points_ext()}, returning player-GAME rows.
+#' Unlike the season panel, this carries every scoring term R/17 implements,
+#' including per-game threshold bonuses, tiered PPR, and first downs.
+#'
+#' Results are cached per season per scoring key. Entries are invalidated
+#' automatically when the source PBP changes; see \code{force_refresh}.
+#'
+#' @param seasons Integer vector. Seasons to score. Default
+#'   \code{PANEL_SEASONS_DEFAULT}.
+#' @param scoring_settings Named list, or NULL for R/17 defaults. Keys must be a
+#'   subset of \code{names(get_ext_scoring_defaults())}; unknown keys are an
+#'   error.
+#' @param cache_dir Character. Directory holding normalized PBP from R/15.
+#' @param game_cache_dir Character. Directory for the scored game panel cache.
+#'   Default \code{data/season3_cache}. Entries are named
+#'   \code{s3_r16_gamepanel_<season>_<scoring_key>.rds}.
+#' @param roster_data Data frame or NULL. Passed to R/17 for its position
+#'   lookup. Supplying this explicitly DISABLES the cache, because the cache key
+#'   cannot capture custom rosters. Prefer \code{use_roster} where possible.
+#' @param use_roster Logical or NULL. Auto-load rosters via nflreadr for
+#'   \code{seasons} and pass them to R/17. Affects both the TE premium and
+#'   whether R/17's \code{position} column is roster-anchored or play-inferred.
+#'   Auto-loaded rosters are deterministic given the season, so this IS folded
+#'   into the cache key. NULL (default) resolves to TRUE only when
+#'   \code{te_premium} is TRUE.
+#' @param use_cache Logical. Read and write the game panel cache. Default TRUE.
+#' @param force_refresh Logical. Rebuild every season and overwrite its cache
+#'   entry, ignoring any existing one. Default FALSE.
+#' @param verbose Logical. Print progress. Default TRUE.
+#'
+#' @return A tibble of player-game rows: the full column set returned by
+#'   \code{calculate_fantasy_points_ext()}, stacked across seasons.
+#'
+#' @seealso \code{\link{attach_scored_ppg}}, \code{\link{build_player_season_panel}}
+
+
+# ------------------------------------------------------------------------------
+# Internal: game panel cache path and staleness-checked read/write
+# ------------------------------------------------------------------------------
+# Cached per SEASON rather than per season-range, so that a 2010:2025 run and a
+# 2023:2024 run share entries.
+#
+# STALENESS. This project's recurring operational failure is a cache that no
+# longer matches its source. The scoring key alone does not protect against it:
+# if R/15's normalized PBP is regenerated, every game panel built from it is
+# silently wrong. Each entry therefore records the size and mtime of the exact
+# pbp_normalized_<season>.rds it was built from, and is rejected on read if
+# either has moved. A rejected entry rebuilds; it never falls through as valid.
+# ------------------------------------------------------------------------------
+
+GAME_PANEL_CACHE_VERSION <- "s3_r16_gp_v1"
+
+.game_panel_cache_path <- function(game_cache_dir, season, scoring_key) {
+  file.path(
+    game_cache_dir,
+    sprintf("s3_r16_gamepanel_%d_%s.rds", as.integer(season), scoring_key)
+  )
+}
+
+.pbp_source_fingerprint <- function(cache_dir, season) {
+  src <- file.path(cache_dir, sprintf("pbp_normalized_%d.rds", as.integer(season)))
+  if (!file.exists(src)) {
+    return(list(path = src, exists = FALSE, size = NA_real_, mtime = NA))
+  }
+  info <- file.info(src)
+  list(
+    path   = src,
+    exists = TRUE,
+    size   = as.numeric(info$size),
+    mtime  = as.character(info$mtime)
+  )
+}
+
+.read_game_panel_cache <- function(path, scoring_key, fingerprint, verbose) {
+
+  if (!file.exists(path)) return(NULL)
+
+  entry <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(entry) || !is.list(entry) ||
+      !all(c("meta", "data") %in% names(entry))) {
+    if (verbose) message("    Cache entry unreadable or malformed. Rebuilding.")
+    return(NULL)
+  }
+
+  m <- entry$meta
+
+  if (!identical(m$cache_version, GAME_PANEL_CACHE_VERSION)) {
+    if (verbose) message(glue::glue(
+      "    Cache entry version '{m$cache_version}' != ",
+      "'{GAME_PANEL_CACHE_VERSION}'. Rebuilding."
+    ))
+    return(NULL)
+  }
+
+  if (!identical(m$scoring_key, scoring_key)) {
+    if (verbose) message("    Cache entry scoring key mismatch. Rebuilding.")
+    return(NULL)
+  }
+
+  if (!identical(m$pbp_size, fingerprint$size) ||
+      !identical(m$pbp_mtime, fingerprint$mtime)) {
+    if (verbose) message(glue::glue(
+      "    STALE: source PBP has changed since this entry was built ",
+      "(built against size {m$pbp_size} / {m$pbp_mtime}; ",
+      "source is now {fingerprint$size} / {fingerprint$mtime}). Rebuilding."
+    ))
+    return(NULL)
+  }
+
+  entry$data
+}
+
+.write_game_panel_cache <- function(path, data, scoring, scoring_key,
+                                    season, fingerprint) {
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  saveRDS(
+    list(
+      meta = list(
+        cache_version = GAME_PANEL_CACHE_VERSION,
+        season        = as.integer(season),
+        scoring_key   = scoring_key,
+        scoring       = scoring,
+        pbp_path      = fingerprint$path,
+        pbp_size      = fingerprint$size,
+        pbp_mtime     = fingerprint$mtime,
+        n_rows        = nrow(data),
+        built_at      = Sys.time()
+      ),
+      data = data
+    ),
+    file = path
+  )
+  invisible(path)
+}
+
+
+#' @export
+build_player_game_panel <- function(
+    seasons          = PANEL_SEASONS_DEFAULT,
+    scoring_settings = NULL,
+    cache_dir        = here::here("data", "season2_cache"),
+    game_cache_dir   = here::here("data", "season3_cache"),
+    roster_data      = NULL,
+    use_roster       = NULL,
+    use_cache        = TRUE,
+    force_refresh    = FALSE,
+    verbose          = TRUE
+) {
+
+  if (!is.numeric(seasons) || length(seasons) == 0L) {
+    stop("seasons must be a non-empty numeric vector (e.g., 2010:2025).")
+  }
+  seasons <- sort(as.integer(seasons))
+
+  # A caller-supplied roster changes R/17's position lookup but is not captured
+  # by the scoring key, so a cache entry built from auto-loaded rosters would be
+  # silently reused for it. Bypass the cache rather than risk that.
+  #
+  # use_roster is DIFFERENT: it auto-loads rosters via nflreadr for the requested
+  # seasons, which is deterministic given the season, so it IS cacheable and is
+  # folded into the cache key below.
+  caller_supplied_roster <- !is.null(roster_data)
+  if (caller_supplied_roster && use_cache) {
+    if (verbose) message(
+      "  roster_data supplied by caller: bypassing the game panel cache ",
+      "(the cache key does not capture custom rosters)."
+    )
+    use_cache <- FALSE
+  }
+
+  if (!dir.exists(cache_dir)) {
+    stop(glue::glue(
+      "cache_dir not found: {cache_dir}\n",
+      "Run load_multi_season_pbp() from R/15_multi_season_pbp.R first."
+    ))
+  }
+
+  scoring <- .resolve_scoring_settings(scoring_settings)
+
+  if (!exists("load_normalized_season", mode = "function")) {
+    r15_path <- here::here("R", "15_multi_season_pbp.R")
+    if (!file.exists(r15_path)) {
+      stop(glue::glue("R/15_multi_season_pbp.R not found at: {r15_path}"))
+    }
+    if (verbose) message("Sourcing R/15_multi_season_pbp.R...")
+    source(r15_path)
+  }
+
+  # use_roster default: TRUE only when the scoring actually needs a position
+  # lookup. Callers that want R/17's `position` column roster-anchored rather
+  # than play-inferred (R/45's build_actual_ppg does) pass TRUE explicitly.
+  if (is.null(use_roster)) use_roster <- isTRUE(scoring$te_premium)
+
+  if (isTRUE(scoring$te_premium) && !use_roster && !caller_supplied_roster) {
+    stop(
+      "te_premium = TRUE requires a position lookup, but use_roster = FALSE ",
+      "and no roster_data was supplied. R/17 would silently skip the premium.",
+      call. = FALSE
+    )
+  }
+
+  # The roster choice changes R/17's output, so it must be part of the key or a
+  # roster-anchored run would collide with a play-inferred one.
+  scoring_key <- .scoring_settings_key(
+    c(scoring, list(.use_roster = use_roster))
+  )
+
+  if (verbose) {
+    message(glue::glue(
+      "\n--- build_player_game_panel() ---",
+      "\nSeasons     : {min(seasons)}-{max(seasons)} ({length(seasons)} seasons)",
+      "\nScoring key : {scoring_key}",
+      "\nRosters     : {if (caller_supplied_roster) 'caller-supplied' else if (use_roster) 'auto-loaded' else 'none (play-inferred position)'}",
+      "\nPBP cache   : {cache_dir}",
+      "\nPanel cache : {if (use_cache) game_cache_dir else '(disabled)'}",
+      "{if (force_refresh) '\\nforce_refresh = TRUE: every season will be rebuilt.' else ''}"
+    ))
+  }
+
+  # Roster resolution is DEFERRED until a cache miss actually needs it, so that
+  # a fully cached run does not pay for an nflreadr call it will not use.
+  roster_resolved <- caller_supplied_roster
+  has_roster      <- !is.null(roster_data) && nrow(roster_data) > 0L
+
+  .ensure_roster <- function() {
+    if (roster_resolved) return(invisible(NULL))
+    if (isTRUE(use_roster)) {
+      if (verbose) message("    Loading rosters for R/17 position lookup...")
+      roster_data <<- nflreadr::load_rosters(seasons = seasons)
+      has_roster  <<- !is.null(roster_data) && nrow(roster_data) > 0L
+    }
+    roster_resolved <<- TRUE
+    invisible(NULL)
+  }
+
+  season_results <- vector("list", length(seasons))
+  n_hit <- 0L
+  n_built <- 0L
+
+  for (i in seq_along(seasons)) {
+    yr <- seasons[i]
+    if (verbose) message(glue::glue("\n  {i}/{length(seasons)}: Season {yr}..."))
+
+    fingerprint <- .pbp_source_fingerprint(cache_dir, yr)
+    cache_path  <- .game_panel_cache_path(game_cache_dir, yr, scoring_key)
+
+    # --- Try the cache ---
+    if (use_cache && !force_refresh) {
+      cached <- .read_game_panel_cache(
+        path        = cache_path,
+        scoring_key = scoring_key,
+        fingerprint = fingerprint,
+        verbose     = verbose
+      )
+      if (!is.null(cached)) {
+        if (verbose) message(glue::glue(
+          "    Cache hit: {format(nrow(cached), big.mark = ',')} player-games."
+        ))
+        season_results[[i]] <- cached
+        n_hit <- n_hit + 1L
+        next
+      }
+    }
+
+    # --- Miss: build it ---
+    .ensure_roster()
+
+    pbp_raw <- load_normalized_season(season = yr, cache_dir = cache_dir)
+
+    # NOTE [2026-07-15]: do NOT add a season_type == "REG" filter here.
+    # calculate_fantasy_points_ext() already applies one (R/17:410-414), so the
+    # postseason never reaches the scoring components. Verified: season 2023
+    # loads 285 games (272 regular + 13 playoff) and R/17 filters 49,665 plays
+    # to 47,399 unmodified, producing the identical 5,372 player-games with or
+    # without a filter here.
+    #
+    # A filter here would also be actively harmful in the edge case where
+    # season_type is absent: R/17's filter is conditional on the column
+    # existing, and build_player_season_panel() likewise warns and includes all
+    # season types (R/16:850-857). In that case games_played and the scored
+    # points BOTH include the postseason and remain consistent. Erroring out
+    # here would break a path that works.
+    #
+    # The numerator/denominator invariant is asserted directly in
+    # attach_scored_ppg() instead, which is the layer that actually couples them.
+
+    .assert_pbp_supports_scoring(
+      pbp        = pbp_raw,
+      scoring    = scoring,
+      season     = yr,
+      has_roster = has_roster
+    )
+
+    # Subset rosters to THIS season before handing them to R/17. R/17 builds its
+    # position lookup with distinct(player_id, .keep_all = TRUE) (R/17:463),
+    # which keeps one arbitrary row per player. Passing all 16 seasons at once
+    # would let a player who changed position (e.g. WR to TE) be scored under
+    # the wrong position for every season. Subsetting confines that collision to
+    # within-season, where it is far rarer.
+    roster_yr <- roster_data
+    if (has_roster && "season" %in% names(roster_data)) {
+      roster_yr <- roster_data %>% dplyr::filter(season == yr)
+      if (nrow(roster_yr) == 0L) {
+        stop(glue::glue(
+          "Season {yr}: roster_data contains no rows for this season, but ",
+          "te_premium requires a position lookup."
+        ), call. = FALSE)
+      }
+    }
+
+    scored_yr <- do.call(
+      calculate_fantasy_points_ext,
+      c(
+        list(
+          pbp_data    = pbp_raw,
+          roster_data = roster_yr,
+          season      = yr
+        ),
+        scoring
+      )
+    )
+
+    if (use_cache) {
+      .write_game_panel_cache(
+        path        = cache_path,
+        data        = scored_yr,
+        scoring     = scoring,
+        scoring_key = scoring_key,
+        season      = yr,
+        fingerprint = fingerprint
+      )
+      if (verbose) message(glue::glue("    Cached -> {basename(cache_path)}"))
+    }
+
+    season_results[[i]] <- scored_yr
+    n_built <- n_built + 1L
+
+    rm(pbp_raw, scored_yr)
+    gc()
+  }
+
+  out <- dplyr::bind_rows(season_results)
+
+  if (nrow(out) == 0L) {
+    stop("build_player_game_panel(): no player-games produced. Check cache_dir.")
+  }
+
+  if (verbose) {
+    message(glue::glue(
+      "\n  Complete. {format(nrow(out), big.mark = ',')} player-games across ",
+      "{length(seasons)} seasons. ",
+      "({n_hit} from cache, {n_built} rebuilt)"
+    ))
+  }
+
+  out
+}
+
+
+#' Attach Correctly Scored Points Per Game to a Season Panel
+#'
+#' @description
+#' Aggregates a player-game panel to season totals and joins the result onto an
+#' existing season panel, replacing \code{season_fp} and \code{fp_per_game}.
+#'
+#' The panel's OWN \code{games_played} is used as the denominator, not a count
+#' derived from the game panel. This is deliberate: it holds the denominator
+#' fixed so that a diff against the legacy \code{compute_season_ppg()} path
+#' isolates the scoring change and nothing else.
+#'
+#' @param panel Tibble. Output of \code{\link{build_player_season_panel}}. Must
+#'   carry \code{player_id}, \code{season}, and \code{games_played}.
+#' @param game_panel Tibble or NULL. Output of
+#'   \code{\link{build_player_game_panel}}. If NULL it is built from
+#'   \code{seasons} and \code{scoring_settings}.
+#' @param seasons Integer vector. Only used when \code{game_panel} is NULL.
+#'   Defaults to the seasons present in \code{panel}.
+#' @param scoring_settings Named list or NULL. Only used when \code{game_panel}
+#'   is NULL.
+#' @param cache_dir Character. Only used when \code{game_panel} is NULL.
+#' @param verbose Logical. Print progress and match diagnostics. Default TRUE.
+#'
+#' @return \code{panel} with \code{season_fp} and \code{fp_per_game} columns
+#'   set from the scored game panel. Players present in the panel but absent
+#'   from the game panel receive \code{season_fp = 0}.
+#'
+#' @seealso \code{\link{build_player_game_panel}}
+#'
+#' @export
+attach_scored_ppg <- function(
+    panel,
+    game_panel       = NULL,
+    seasons          = NULL,
+    scoring_settings = NULL,
+    cache_dir        = here::here("data", "season2_cache"),
+    game_cache_dir   = here::here("data", "season3_cache"),
+    use_cache        = TRUE,
+    force_refresh    = FALSE,
+    verbose          = TRUE
+) {
+
+  if (!is.data.frame(panel) || nrow(panel) == 0L) {
+    stop("panel must be a non-empty data frame.")
+  }
+  required <- c("player_id", "season", "games_played")
+  missing_cols <- setdiff(required, names(panel))
+  if (length(missing_cols) > 0L) {
+    stop(glue::glue(
+      "panel is missing columns: {paste(missing_cols, collapse = ', ')}."
+    ))
+  }
+
+  if (is.null(game_panel)) {
+    if (is.null(seasons)) seasons <- sort(unique(as.integer(panel$season)))
+    game_panel <- build_player_game_panel(
+      seasons          = seasons,
+      scoring_settings = scoring_settings,
+      cache_dir        = cache_dir,
+      game_cache_dir   = game_cache_dir,
+      use_cache        = use_cache,
+      force_refresh    = force_refresh,
+      verbose          = verbose
+    )
+  }
+
+  if (!"total_fantasy_points" %in% names(game_panel)) {
+    stop(
+      "game_panel is missing total_fantasy_points. ",
+      "Expected the output of build_player_game_panel()."
+    )
+  }
+
+  season_fp_tbl <- game_panel %>%
+    dplyr::group_by(player_id, season) %>%
+    dplyr::summarise(
+      season_fp_scored = sum(total_fantasy_points, na.rm = TRUE),
+      n_games_scored   = dplyr::n_distinct(game_id),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(season = as.integer(season))
+
+  out <- panel %>%
+    dplyr::mutate(season = as.integer(season)) %>%
+    dplyr::left_join(season_fp_tbl, by = c("player_id", "season"))
+
+  # --------------------------------------------------------------------------
+  # DENOMINATOR CONSISTENCY ASSERTION  [2026-07-15]
+  # --------------------------------------------------------------------------
+  # The numerator comes from the game panel; the denominator is the season
+  # panel's own games_played. Those two only agree if both were built from the
+  # same filters. On 2026-07-15 they were not: build_player_game_panel() scored
+  # the postseason while the season panel is season_type == "REG" only, which
+  # inflated fp_per_game for playoff participants in an age-correlated way.
+  #
+  # A player can legitimately be scored in FEWER games than games_played (he
+  # played but recorded no scoring-relevant plays). He can never legitimately be
+  # scored in MORE games than he played. Any such row means the two paths
+  # disagree about which games count.
+  # --------------------------------------------------------------------------
+  over_scored <- out %>%
+    dplyr::filter(
+      !is.na(n_games_scored),
+      !is.na(games_played),
+      n_games_scored > games_played
+    )
+
+  if (nrow(over_scored) > 0L) {
+    ex <- over_scored %>%
+      dplyr::arrange(dplyr::desc(n_games_scored - games_played)) %>%
+      dplyr::slice_head(n = 5)
+    stop(glue::glue(
+      "attach_scored_ppg(): {nrow(over_scored)} player-season(s) were scored in ",
+      "MORE games than the panel says they played. The game panel and the season ",
+      "panel disagree about which games count (check the season_type / week ",
+      "filters on both sides).\n",
+      "Worst offenders:\n",
+      "{paste(sprintf('  %s (%s): scored %d games, panel says %d', ex$player_id, ex$season, ex$n_games_scored, ex$games_played), collapse = '\n')}"
+    ), call. = FALSE)
+  }
+
+  out <- out %>% dplyr::select(-n_games_scored)
+
+  n_unmatched <- sum(is.na(out$season_fp_scored))
+  pct_unmatched <- n_unmatched / nrow(out)
+
+  # Coalescing an unmatched join to zero is exactly the failure that produced
+  # the R/32 volume bug on 2026-07-15: an NA turned into a real zero and the
+  # wrongness looked like data. A handful of unmatched rows is expected (panel
+  # players with no scoring-relevant plays). A systematic player_id mismatch
+  # between R/16 and R/17 would show up as MASS unmatching, so refuse to
+  # coalesce past a threshold rather than quietly zeroing out the panel.
+  if (pct_unmatched > 0.05) {
+    stop(glue::glue(
+      "attach_scored_ppg(): {round(100 * pct_unmatched, 1)}% of panel rows ",
+      "({format(n_unmatched, big.mark = ',')} of {format(nrow(out), big.mark = ',')}) ",
+      "found no match in the scored game panel. That is too high to be players ",
+      "with no scoring plays, and points at a player_id or season-type mismatch ",
+      "between R/16 and R/17. Refusing to coalesce these to zero. ",
+      "Inspect the join before proceeding."
+    ), call. = FALSE)
+  }
+
+  out <- out %>%
+    dplyr::mutate(
+      season_fp = dplyr::coalesce(season_fp_scored, 0),
+      fp_per_game = dplyr::if_else(
+        dplyr::coalesce(games_played, 0L) > 0L,
+        season_fp / games_played,
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(-season_fp_scored)
+
+  if (verbose) {
+    message(glue::glue(
+      "\n  attach_scored_ppg(): {format(nrow(out) - n_unmatched, big.mark = ',')}",
+      " of {format(nrow(out), big.mark = ',')} panel rows matched a scored ",
+      "player-season."
+    ))
+    if (n_unmatched > 0L) {
+      message(glue::glue(
+        "  {format(n_unmatched, big.mark = ',')} unmatched rows set to ",
+        "season_fp = 0. These are players in the panel with no scoring-relevant ",
+        "plays (e.g. blockers, special teams only)."
+      ))
+    }
+  }
+
+  out
 }
