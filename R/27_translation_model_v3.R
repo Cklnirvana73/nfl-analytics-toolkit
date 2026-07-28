@@ -89,7 +89,7 @@
 #   Line ~1050 : run_week13_pipeline()
 #
 # Season 2 output prefix : s2_week13_
-# Schema tag             : s2_w13_v3
+# Schema tag             : s2_w13_v3_2
 # Author                 : Christian LeBlanc
 # Created                : 2026-05
 # ==============================================================================
@@ -140,7 +140,7 @@ if (!exists("link_cfb_to_nfl", mode = "function")) {
 # ==============================================================================
 
 # Schema tag for v3 outputs
-V3_SCHEMA_TAG <- "s2_w13_v3_1"
+V3_SCHEMA_TAG <- "s2_w13_v3_2"  # v3_2: + dominator/target_share + speed_score
 
 # Output prefix for all v3 files
 V3_OUTPUT_PREFIX <- "s2_week13_"
@@ -159,6 +159,15 @@ COMBINE_COLS_BY_POS <- list(
   WR = c("ht", "wt", "forty", "vertical", "broad_jump"),
   TE = c("ht", "wt", "forty", "vertical", "broad_jump")
 )
+
+# Derived athletic composites computed in .load_combine_features() from the raw
+# combine columns above. speed_score = (wt * 200) / forty^4 is a NONLINEAR
+# transform, so it carries signal a linear model cannot recover from raw wt and
+# forty alone. burst_score = vertical + broad_jump is a LINEAR sum, hence
+# redundant for the Elastic Net when both raw inputs are already features; it is
+# computed and carried for the R/40 sweep and any future tree model, but is NOT
+# added to the v3 Elastic Net feature lists (see Step 7).
+COMBINE_DERIVED_COLS <- c("speed_score", "burst_score")
 
 # Recruiting cache path
 RECRUITING_CACHE_PATH <- here::here(
@@ -217,10 +226,13 @@ DENSITY_POINTS_PER_TD   <- 6.0
 BREAKOUT_THRESHOLD_PERCENTILE <- 0.50
 
 # --- R/24 v1 constant overrides ---
-# R/24 v1 sets CUTOFF_YEAR <- 2022L. As of 2026 the 2023 draft class has
-# 3 complete NFL seasons (2023, 2024, 2025) and must be included in training.
-# These three constants are redefined here to override the v1 values.
-# All downstream functions that reference CUTOFF_YEAR use this value.
+# R/24 v1 now also sets CUTOFF_YEAR <- 2023L (it was 2022L when this override
+# was introduced), so the redefinition below is currently a no-op kept for
+# self-containment. IMPORTANT: these overrides must track R/24 -- if R/24
+# advances CUTOFF_YEAR (e.g. to 2024L after the 2026 NFL season), update the
+# values here in lockstep. The guard below fails loudly on drift.
+stopifnot("R/27 CUTOFF_YEAR override has drifted from R/24 -- update both in lockstep" =
+            CUTOFF_YEAR == 2023L)
 CUTOFF_YEAR            <- 2023L
 # Floor matches R/24 v1 (2015L). R/27 originally used 2017L, replicating
 # v2's training-window narrowing -- a documented reason v2 performed worse.
@@ -409,7 +421,23 @@ utils::globalVariables(c(
       by = c("draft_year", "norm_pfr_name")
     ) %>%
     dplyr::select(nfl_gsis_id, draft_position,
-                  dplyr::all_of(COMBINE_COLS_ALL))
+                  dplyr::all_of(COMBINE_COLS_ALL)) %>%
+    # Derived athletic composites. speed_score is the standard weight-adjusted
+    # 40 metric; nonlinear in wt and forty, so it adds signal a linear model
+    # cannot recover from the raw columns. burst_score is the vertical + broad
+    # jump explosiveness sum (carried for downstream use; see COMBINE_DERIVED_COLS).
+    dplyr::mutate(
+      speed_score = dplyr::if_else(
+        !is.na(wt) & !is.na(forty) & forty > 0,
+        (wt * 200) / (forty^4),
+        NA_real_
+      ),
+      burst_score = dplyr::if_else(
+        !is.na(vertical) & !is.na(broad_jump),
+        vertical + broad_jump,
+        NA_real_
+      )
+    )
 
   # Report NA rates per column per position
   if (verbose) {
@@ -838,10 +866,12 @@ utils::globalVariables(c(
         dplyr::arrange(season)
 
       if (nrow(player_seasons) == 0L || is.na(thresh)) {
+        # No data to evaluate: breakout status unknown (not "never broke out").
         return(tibble::tibble(
           cfb_player_name      = p_name,
           breakout_age         = NA_real_,
-          seasons_since_breakout = NA_integer_
+          seasons_since_breakout = NA_integer_,
+          never_broke_out      = NA_real_
         ))
       }
 
@@ -851,10 +881,14 @@ utils::globalVariables(c(
       first_above <- which(above)[1L]
 
       if (is.na(first_above)) {
+        # Observed college career, never crossed the threshold. Without this
+        # indicator, the NA breakout_age gets median-imputed downstream,
+        # silently turning "never broke out" into "broke out at average age".
         return(tibble::tibble(
           cfb_player_name      = p_name,
           breakout_age         = NA_real_,
-          seasons_since_breakout = NA_integer_
+          seasons_since_breakout = NA_integer_,
+          never_broke_out      = 1
         ))
       }
 
@@ -868,7 +902,8 @@ utils::globalVariables(c(
       tibble::tibble(
         cfb_player_name        = p_name,
         breakout_age           = b_age,
-        seasons_since_breakout = as.integer(years_before_draft)
+        seasons_since_breakout = as.integer(years_before_draft),
+        never_broke_out        = 0
       )
     }
   )
@@ -883,6 +918,146 @@ utils::globalVariables(c(
   }
 
   breakout_results
+}
+
+
+# ------------------------------------------------------------------------------
+# .compute_dominator_features
+#
+# College dominator rating and target share, the canonical receiver/RB prospect
+# metrics, computed from the CFB panel. For each player season, the player's
+# share of his team's production is computed against team-season totals summed
+# over the FULL panel (every FBS player on that team that season), so the
+# denominators reflect complete team production, not just NFL-bound players.
+#
+# Position-aware shares (Decision A locked with Christian):
+#   WR, TE -> receiving share (rec yards, rec TDs)
+#   RB     -> scrimmage share (rush + rec yards, rush + rec TDs)
+#   target_share is receiving targets over team targets for all three.
+# QB is not computed (dominator is not a QB concept) and is left to NA via the
+# left join downstream; QB feature lists never reference these columns.
+#
+# Per player we keep BOTH peak (best single season) and final-season values
+# (Decision A), because peak captures the breakout and final captures the exit
+# profile. Seasons are restricted to <= cfb_final_season to match the leakage
+# handling in .compute_breakout_age().
+#
+# Returns: tibble(cfb_player_name, peak_dominator_rating, final_dominator_rating,
+#                 peak_target_share, final_target_share). Keyed on
+# cfb_player_name; joined into the matrix like the breakout features.
+# Not exported.
+# ------------------------------------------------------------------------------
+.compute_dominator_features <- function(cfb_panel, crosswalk, verbose = TRUE) {
+
+  stopifnot(is.data.frame(cfb_panel), is.data.frame(crosswalk))
+
+  required_panel <- c("player_name", "season", "primary_team",
+                      "receiving_yards", "rec_tds", "targets",
+                      "rushing_yards", "rush_tds")
+  missing_panel <- setdiff(required_panel, names(cfb_panel))
+  if (length(missing_panel) > 0L) {
+    stop(glue(
+      ".compute_dominator_features(): cfb_panel missing columns: ",
+      "{paste(missing_panel, collapse = ', ')}"
+    ), call. = FALSE)
+  }
+
+  if (verbose) message("Computing dominator and target-share features...")
+
+  # Team-season totals over the full panel. NA stats count as 0 in team sums.
+  team_totals <- cfb_panel %>%
+    dplyr::group_by(primary_team, season) %>%
+    dplyr::summarise(
+      team_rec_yds  = sum(receiving_yards, na.rm = TRUE),
+      team_rec_td   = sum(rec_tds,         na.rm = TRUE),
+      team_tgt      = sum(targets,         na.rm = TRUE),
+      team_rush_yds = sum(rushing_yards,   na.rm = TRUE),
+      team_rush_td  = sum(rush_tds,        na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      team_scrim_yds = team_rec_yds + team_rush_yds,
+      team_scrim_td  = team_rec_td  + team_rush_td
+    )
+
+  # RB/WR/TE matched players only.
+  matched <- crosswalk %>%
+    dplyr::filter(!is.na(cfb_player_name),
+                  draft_position %in% c("RB", "WR", "TE")) %>%
+    dplyr::select(cfb_player_name, cfb_final_season, draft_position) %>%
+    dplyr::distinct()
+
+  if (nrow(matched) == 0L) {
+    if (verbose) message("  No RB/WR/TE matched players; returning empty.")
+    return(tibble::tibble(
+      cfb_player_name        = character(),
+      peak_dominator_rating  = numeric(),
+      final_dominator_rating = numeric(),
+      peak_target_share      = numeric(),
+      final_target_share     = numeric()
+    ))
+  }
+
+  safe_share <- function(num, den) {
+    dplyr::if_else(!is.na(den) & den > 0, num / den, NA_real_)
+  }
+
+  player_seasons <- cfb_panel %>%
+    dplyr::select(player_name, season, primary_team,
+                  receiving_yards, rec_tds, targets,
+                  rushing_yards, rush_tds) %>%
+    dplyr::rename(cfb_player_name = player_name) %>%
+    dplyr::inner_join(matched, by = "cfb_player_name") %>%
+    dplyr::filter(season <= cfb_final_season) %>%
+    dplyr::left_join(team_totals, by = c("primary_team", "season")) %>%
+    dplyr::mutate(
+      yards_share = dplyr::if_else(
+        draft_position == "RB",
+        safe_share(dplyr::coalesce(rushing_yards, 0) +
+                     dplyr::coalesce(receiving_yards, 0), team_scrim_yds),
+        safe_share(dplyr::coalesce(receiving_yards, 0), team_rec_yds)
+      ),
+      td_share = dplyr::if_else(
+        draft_position == "RB",
+        safe_share(dplyr::coalesce(rush_tds, 0) +
+                     dplyr::coalesce(rec_tds, 0), team_scrim_td),
+        safe_share(dplyr::coalesce(rec_tds, 0), team_rec_td)
+      ),
+      dominator_season = dplyr::if_else(
+        !is.na(yards_share) & !is.na(td_share),
+        (yards_share + td_share) / 2,
+        dplyr::coalesce(yards_share, td_share)
+      ),
+      target_share_season = safe_share(dplyr::coalesce(targets, 0), team_tgt)
+    )
+
+  dominator_features <- player_seasons %>%
+    dplyr::group_by(cfb_player_name) %>%
+    dplyr::summarise(
+      peak_dominator_rating = if (all(is.na(dominator_season))) {
+        NA_real_
+      } else {
+        max(dominator_season, na.rm = TRUE)
+      },
+      peak_target_share = if (all(is.na(target_share_season))) {
+        NA_real_
+      } else {
+        max(target_share_season, na.rm = TRUE)
+      },
+      final_dominator_rating = dominator_season[which.max(season)],
+      final_target_share     = target_share_season[which.max(season)],
+      .groups = "drop"
+    )
+
+  if (verbose) {
+    n_dom <- sum(!is.na(dominator_features$peak_dominator_rating))
+    message(glue(
+      "  Dominator computed: {n_dom} / {nrow(dominator_features)} ",
+      "RB/WR/TE players"
+    ))
+  }
+
+  dominator_features
 }
 
 
@@ -1275,6 +1450,7 @@ build_translation_features_v3 <- function(cfb_panel,
                                             production_slopes,
                                             breakout_features,
                                             teammate_density,
+                                            dominator_features,
                                             cutoff_year    = CUTOFF_YEAR,
                                             min_ppr_outcome = MIN_PPR_OUTCOME,
                                             verbose        = TRUE) {
@@ -1290,6 +1466,7 @@ build_translation_features_v3 <- function(cfb_panel,
     is.data.frame(production_slopes),
     is.data.frame(breakout_features),
     is.data.frame(teammate_density),
+    is.data.frame(dominator_features),
     is.numeric(cutoff_year), length(cutoff_year) == 1L
   )
   cutoff_year <- as.integer(cutoff_year)
@@ -1330,7 +1507,8 @@ build_translation_features_v3 <- function(cfb_panel,
   n_before <- nrow(all_players)
 
   combine_keyed <- combine_features %>%
-    dplyr::select(nfl_gsis_id, dplyr::all_of(COMBINE_COLS_ALL)) %>%
+    dplyr::select(nfl_gsis_id,
+                  dplyr::all_of(c(COMBINE_COLS_ALL, COMBINE_DERIVED_COLS))) %>%
     dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
 
   all_players <- all_players %>%
@@ -1414,6 +1592,24 @@ build_translation_features_v3 <- function(cfb_panel,
     "  Teammate density available: {n_density} / {nrow(all_players)} players"
   ))
 
+  # --- Step 5.6: Join dominator / target-share features ---
+  message("\nStep 5.6: Joining dominator and target-share features...")
+
+  n_before <- nrow(all_players)
+
+  dominator_keyed <- dominator_features %>%
+    dplyr::distinct(cfb_player_name, .keep_all = TRUE)
+
+  all_players <- all_players %>%
+    dplyr::left_join(dominator_keyed, by = "cfb_player_name")
+
+  stopifnot(nrow(all_players) == n_before)
+
+  n_dom <- sum(!is.na(all_players$peak_dominator_rating))
+  message(glue(
+    "  Dominator available: {n_dom} / {nrow(all_players)} players"
+  ))
+
   # --- Step 6: Compute derived features ---
   message("\nStep 6: Computing derived features (role proxy, interaction)...")
 
@@ -1441,8 +1637,10 @@ build_translation_features_v3 <- function(cfb_panel,
            dplyr::coalesce(receptions, 0L)) / total_plays,
         NA_real_
       ),
+      # targets is a non-negative count, so targets + 1 > 0 always holds;
+      # only the NA check is needed.
       rush_to_rec_ratio = dplyr::if_else(
-        !is.na(targets) & (targets + 1L) > 0L,
+        !is.na(targets),
         dplyr::coalesce(rush_attempts, 0L) / (targets + 1L),
         NA_real_
       )
@@ -1484,6 +1682,36 @@ build_translation_features_v3 <- function(cfb_panel,
     "density_x_role non-NA: {sum(!is.na(all_players$density_x_role))}"
   ))
 
+  # --- Step 6b: Missingness indicators (computed BEFORE imputation) ---
+  # Median imputation erases the missingness signal: a player who skipped the
+  # combine gets an average forty, an unranked recruit gets an average rating,
+  # and a player who never broke out gets an average breakout age. These
+  # indicators preserve that information for the models.
+  message("\nStep 6b: Computing missingness indicators (pre-imputation)...")
+
+  workout_cols <- intersect(c("forty", "vertical", "broad_jump"),
+                            names(all_players))
+  all_players$combine_tested <- if (length(workout_cols) > 0L) {
+    as.numeric(rowSums(
+      !is.na(all_players[, workout_cols, drop = FALSE])
+    ) > 0L)
+  } else {
+    0
+  }
+
+  all_players$recruiting_unranked <- if ("recruiting_rating" %in%
+                                         names(all_players)) {
+    as.numeric(is.na(all_players$recruiting_rating))
+  } else {
+    1
+  }
+
+  message(glue(
+    "  combine_tested = 1: {sum(all_players$combine_tested == 1)} | ",
+    "recruiting_unranked = 1: {sum(all_players$recruiting_unranked == 1)} | ",
+    "never_broke_out = 1: {sum(all_players$never_broke_out == 1, na.rm = TRUE)}"
+  ))
+
   # --- Step 7: Define v3 feature columns per position ---
   message("\nStep 7: Building v3 feature column sets...")
 
@@ -1492,31 +1720,54 @@ build_translation_features_v3 <- function(cfb_panel,
   # signal. Elastic Net splits coefficient unpredictably; pure noise.
   # recruiting_stars dropped: r=0.907 with recruiting_rating -- stars is a
   # coarse binning of rating. recruiting_rating carries all the information.
+  #
+  # s2_w13_v3.2 additions (RB/WR/TE only):
+  #   speed_score            -- weight-adjusted 40; nonlinear, not recoverable
+  #                             from raw wt + forty by a linear model.
+  #   peak/final_dominator_rating, peak/final_target_share
+  #                          -- canonical college market-share signals, absent
+  #                             until now. Receiving share for WR/TE, scrimmage
+  #                             share for RB.
+  # burst_score deliberately NOT added: it is vertical + broad_jump, a linear
+  # sum of two columns already present, so it is redundant for the Elastic Net
+  # (same logic that dropped sos_x_age). It is computed and carried for the R/40
+  # sweep and any future tree model.
+  # Missingness indicators (Step 6b) included for all positions:
+  #   combine_tested, recruiting_unranked, never_broke_out
   v3_cols_QB <- c(
     "ht", "wt", "forty",
     "pass_epa_slope",
     "recruiting_rating",
     "breakout_age", "seasons_since_breakout",
     "pos_recruiting_density", "pos_volume_concentration",
-    "pos_scoring_concentration"
+    "pos_scoring_concentration",
+    "combine_tested", "recruiting_unranked", "never_broke_out"
   )
   v3_cols_RB <- c(
     "ht", "wt", "forty", "vertical", "broad_jump",
+    "speed_score",
     "rec_epa_slope", "rush_epa_slope",
     "recruiting_rating",
     "rec_role_share", "rush_to_rec_ratio",
     "breakout_age", "seasons_since_breakout",
     "pos_recruiting_density", "pos_volume_concentration",
-    "pos_scoring_concentration", "density_x_role"
+    "pos_scoring_concentration", "density_x_role",
+    "peak_dominator_rating", "final_dominator_rating",
+    "peak_target_share", "final_target_share",
+    "combine_tested", "recruiting_unranked", "never_broke_out"
   )
   v3_cols_WR <- c(
     "ht", "wt", "forty", "vertical", "broad_jump",
+    "speed_score",
     "rec_epa_slope",
     "recruiting_rating",
     "rec_role_share",
     "breakout_age", "seasons_since_breakout",
     "pos_recruiting_density", "pos_volume_concentration",
-    "pos_scoring_concentration", "density_x_role"
+    "pos_scoring_concentration", "density_x_role",
+    "peak_dominator_rating", "final_dominator_rating",
+    "peak_target_share", "final_target_share",
+    "combine_tested", "recruiting_unranked", "never_broke_out"
   )
   v3_cols_TE <- v3_cols_WR  # same as WR
 
@@ -1532,13 +1783,17 @@ build_translation_features_v3 <- function(cfb_panel,
   # many-to-many fan-outs occur silently. This pass corrects all of them.
   v3_numeric_cols_all <- unique(c(
     COMBINE_COLS_ALL,
+    COMBINE_DERIVED_COLS,
     "rec_epa_slope", "rush_epa_slope", "pass_epa_slope",
     "sos_x_age",
     "recruiting_rating", "recruiting_stars",
     "rec_role_share", "rush_to_rec_ratio",
     "breakout_age", "seasons_since_breakout",
     "pos_recruiting_density", "pos_volume_concentration",
-    "pos_scoring_concentration", "density_x_role"
+    "pos_scoring_concentration", "density_x_role",
+    "peak_dominator_rating", "final_dominator_rating",
+    "peak_target_share", "final_target_share",
+    "combine_tested", "recruiting_unranked", "never_broke_out"
   ))
   for (.col in v3_numeric_cols_all) {
     if (.col %in% names(all_players)) {
@@ -1637,6 +1892,13 @@ build_translation_features_v3 <- function(cfb_panel,
   # Enriched = base + draft capital (same as v1 enriched, now also includes v3).
   # age_centered is already in v1 base cols; only draft_round and draft_pick
   # are added by the enriched model (matches R/24 v1 enr_cols construction).
+  #
+  # SYNC WARNING: R/24's train_translation_model() IGNORES this list -- it
+  # derives its own enriched columns internally as
+  # c(base_feature_cols[[pos]], "draft_round", "draft_pick") (see R/24
+  # ~line 1682). The construction below must mirror that derivation exactly;
+  # if either side changes, enriched_feature_cols_v3 (used for reporting /
+  # CSV export) silently diverges from what the model actually trains on.
   enriched_feature_cols_v3 <- purrr::map(TRANSLATION_POSITIONS, function(pos) {
     base <- base_feature_cols_v3[[pos]]
     enrich_extras <- c("draft_round", "draft_pick")
@@ -1889,6 +2151,11 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
     cfb_panel, crosswalk, recruiting_board, verbose = verbose
   )
 
+  if (verbose) message("\n--- Step 4c: Computing Dominator / Target Share ---")
+  dominator_features <- .compute_dominator_features(
+    cfb_panel, crosswalk, verbose = verbose
+  )
+
   # --- Step 5: Build v3 feature matrix ---
   if (verbose) message("\n--- Step 5: Building v3 Feature Matrix ---")
   feature_matrix_v3 <- build_translation_features_v3(
@@ -1901,6 +2168,7 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
     production_slopes   = production_slopes,
     breakout_features   = breakout_features,
     teammate_density    = teammate_density,
+    dominator_features  = dominator_features,
     cutoff_year         = cutoff_year,
     min_ppr_outcome     = min_ppr_outcome,
     verbose             = verbose
@@ -1950,16 +2218,23 @@ run_week13_pipeline <- function(cfb_panel             = NULL,
   # --- Step 10: Save RDS outputs ---
   if (verbose) message(glue("\n--- Step 10: Saving Outputs to {output_dir} ---"))
 
-  saveRDS(crosswalk,
-    file.path(output_dir, "s2_week13_crosswalk.rds"))
-  saveRDS(feature_matrix_v3,
-    file.path(output_dir, "s2_week13_feature_matrix.rds"))
-  saveRDS(model_list,
-    file.path(output_dir, "s2_week13_models.rds"))
-  saveRDS(performance,
-    file.path(output_dir, "s2_week13_performance.rds"))
-  saveRDS(model_list$loco_predictions,
-    file.path(output_dir, "s2_week13_predictions.rds"))
+  # Every run writes the canonical file (for downstream readers) AND a
+  # date-stamped copy (YYYYMMDD, date only) into output_dir/backups/, so each
+  # rebuild is recoverable with no manual step. A same-day rerun overwrites
+  # that day's snapshot by design (date only, no time).
+  .version_dir <- file.path(output_dir, "backups")
+  if (!dir.exists(.version_dir)) dir.create(.version_dir, recursive = TRUE)
+  .date_tag <- format(Sys.Date(), "%Y%m%d")
+  save_dated <- function(obj, name) {
+    saveRDS(obj, file.path(output_dir,   paste0(name, ".rds")))
+    saveRDS(obj, file.path(.version_dir, paste0(name, "_", .date_tag, ".rds")))
+  }
+
+  save_dated(crosswalk,                   "s2_week13_crosswalk")
+  save_dated(feature_matrix_v3,           "s2_week13_feature_matrix")
+  save_dated(model_list,                  "s2_week13_models")
+  save_dated(performance,                 "s2_week13_performance")
+  save_dated(model_list$loco_predictions, "s2_week13_predictions")
 
   # --- Step 11: Export feature matrix as CSV for Python notebook ---
   if (verbose) message("\n--- Step 11: Exporting CSV for Python/MLflow Notebook ---")

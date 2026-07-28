@@ -219,6 +219,84 @@ PPR_RECEPTION <-  1.00
 PPR_REC_YD    <-  0.10
 PPR_REC_TD    <-  6.00
 
+# --- Season 3 Wave A2: scoring-agnostic stat-line outcome -------------------
+# The legacy outcome (ppr_per_game_y13) is a POINTS quantity computed under the
+# fixed constants above. Any consumer that receives it is locked to that one
+# scoring, which is the root of the scoring-blindness defect: a model fit on a
+# points target cannot answer "what is this player worth under a different
+# ruleset" without a refit.
+#
+# A2 replaces the single points target with the eight raw per-game stat
+# components. Points under ANY linear scoring are then recovered downstream by
+# score_stat_line(). This is exact, not an approximation: the outcome averages
+# per-game rates across qualifying seasons, and scoring is linear in the
+# components, so
+#     mean_s( sum_c w_c * comp_c(s) )  ==  sum_c w_c * mean_s( comp_c(s) )
+# The scored average component line equals the averaged scored line for every
+# linear scoring. Nothing is lost by decomposing.
+#
+# KNOWN GAPS (inherited from the legacy outcome, NOT introduced here):
+#   - fumbles_lost and two_pt_conversions are absent from the R/16 panel.
+#   - Threshold bonuses (100-yard game, 300-yard passing game) are NON-LINEAR
+#     in per-game stats and cannot be recovered from a season-average line.
+#     They were never in the legacy outcome either. Do not add a bonus term to
+#     score_stat_line() expecting it to work on y13 averages; it will not.
+#
+# NAMING: the y13_ prefix is deliberate. Bare names like pass_yd_pg / rec_td_pg
+# are ALREADY IN USE as CFB feature columns in the same feature matrix. Reusing
+# them for NFL outcomes would silently collide on join.
+STAT_COMPONENTS <- c(
+  "y13_pass_yd", "y13_pass_td", "y13_int",
+  "y13_rush_yd", "y13_rush_td",
+  "y13_rec",     "y13_rec_yd",  "y13_rec_td"
+)
+
+# Panel source column for each component. Order matches STAT_COMPONENTS.
+STAT_COMPONENT_SOURCE <- c(
+  y13_pass_yd = "passing_yards",
+  y13_pass_td = "pass_tds",
+  y13_int     = "interceptions_thrown",
+  y13_rush_yd = "rushing_yards",
+  y13_rush_td = "rush_tds",
+  y13_rec     = "receptions",
+  y13_rec_yd  = "receiving_yards",
+  y13_rec_td  = "rec_tds"
+)
+
+# Scoring-list key that weights each component. Keys match the R/17 scoring
+# vocabulary (DK_BEST_BALL_SCORING, Sleeper resolver output) so any scoring list
+# already in the pipeline can be passed straight to score_stat_line().
+STAT_COMPONENT_SCORING_KEY <- c(
+  y13_pass_yd = "pass_yd",
+  y13_pass_td = "pass_td",
+  y13_int     = "pass_int",
+  y13_rush_yd = "rush_yd",
+  y13_rush_td = "rush_td",
+  y13_rec     = "ppr",
+  y13_rec_yd  = "rec_yd",
+  y13_rec_td  = "rec_td"
+)
+
+# Reference scoring, used ONLY for (a) the legacy ppr_per_game_y13 column kept
+# for backward compatibility and the A1 benchmark, and (b) is_hit / peak ranking,
+# which need one fixed yardstick to be comparable across players and seasons.
+# These values reproduce the legacy constants above exactly, so the legacy
+# column is unchanged by this rewrite.
+REFERENCE_SCORING <- list(
+  pass_yd = PPR_PASS_YD, pass_td = PPR_PASS_TD, pass_int = PPR_INT,
+  rush_yd = PPR_RUSH_YD, rush_td = PPR_RUSH_TD,
+  ppr     = PPR_RECEPTION, rec_yd = PPR_REC_YD, rec_td = PPR_REC_TD
+)
+
+# Minimum fraction of training rows that must carry a NON-ZERO value before a
+# stat component is modelled rather than treated as a constant. Components
+# below this line (RB passing yards, WR passing TDs, QB receptions) are
+# structurally absent for the position: variance is technically non-zero
+# because one or two players registered a value, but every LOCO fold and the
+# final glmnet standardization collapse on them. The constant is the honest
+# prediction, and it costs nothing, because the true value is ~0 for everyone.
+MIN_COMPONENT_NONZERO_FRAC <- 0.05
+
 # --- Linkage ---
 # Maximum normalized edit distance for fuzzy name match (0 = exact, 1 = total)
 FUZZY_NAME_THRESHOLD <- 0.20
@@ -309,7 +387,13 @@ utils::globalVariables(c(
   "rec_yd_per_team_pass_att", "rec_yd_pg", "tgt_pg", "rec_td_pg",
   "age_centered",
   "ppr_season", "ppr_per_game", "ppr_per_game_y13", "is_hit",
+  # Season 3 Wave A2 stat-line outcome components
+  "y13_pass_yd", "y13_pass_td", "y13_int",
+  "y13_rush_yd", "y13_rush_td",
+  "y13_rec", "y13_rec_yd", "y13_rec_td",
+  "component", "pred_component", "scoring_label",
   "year_in_nfl", "qualifying_seasons",
+  "peak_ppr_per_game", "peak_career_year",
   "season_rank", "ever_top_n",
   # glmnet / model output
   "feature", "base_coef", "enriched_coef",
@@ -382,16 +466,27 @@ utils::globalVariables(c(
 #
 # Args:
 #   player_seasons: tibble of one player's college season rows, sorted by
-#                   season ascending. Must contain a `season` column and
-#                   a `cfb_final_season` column (the player's last CFB season).
+#                   season ascending. Must contain a `season` column.
 #   feature_cols:   character vector of column names to average.
+#   final_season:   optional integer. The player's true final CFB season from
+#                   the crosswalk (cfb_final_season). When supplied, the
+#                   FINAL_SEASON_WEIGHT is anchored to it; otherwise it falls
+#                   back to max(season) of the rows passed in. The fallback is
+#                   wrong when the true final season was filtered out (e.g. an
+#                   injury-shortened low-volume year), which would shift the 2x
+#                   weight onto an earlier season.
 #
 # Returns: one-row tibble with weighted-average values for each feature_col.
 # Not exported.
 # ------------------------------------------------------------------------------
-.apply_multiseason_weights <- function(player_seasons, feature_cols) {
+.apply_multiseason_weights <- function(player_seasons, feature_cols,
+                                       final_season = NULL) {
   # Assign weights: final season = FINAL_SEASON_WEIGHT, prior = PRIOR_SEASON_WEIGHT
-  final_s <- max(player_seasons$season)
+  final_s <- if (!is.null(final_season) && !is.na(final_season)) {
+    final_season
+  } else {
+    max(player_seasons$season)
+  }
   weights  <- dplyr::if_else(
     player_seasons$season == final_s,
     as.numeric(FINAL_SEASON_WEIGHT),
@@ -568,9 +663,62 @@ utils::globalVariables(c(
 #          is_hit, draft_position (for position routing)
 # Not exported.
 # ------------------------------------------------------------------------------
+#' Score a stat line under an arbitrary scoring list
+#'
+#' @description
+#' Single source of truth for turning stat components into fantasy points.
+#' Accepts any data frame carrying the STAT_COMPONENTS columns (per-game rates
+#' or season totals; the arithmetic is the same) and any scoring list using the
+#' R/17 scoring vocabulary, and returns a numeric vector of points.
+#'
+#' Missing scoring keys default to 0, so a partial scoring list scores only the
+#' components it names. Missing component columns are an error, not a silent
+#' zero: a stat line that cannot be scored should fail loudly rather than
+#' quietly return an understated total.
+#'
+#' Only LINEAR per-component terms are supported. Threshold bonuses cannot be
+#' recovered from season-average rates. See the STAT_COMPONENTS comment block.
+#'
+#' @param stat_df Data frame containing the STAT_COMPONENTS columns.
+#' @param scoring Named list of scoring values (R/17 vocabulary). Defaults to
+#'   REFERENCE_SCORING, which reproduces the legacy PPR constants exactly.
+#'
+#' @return Numeric vector of points, length nrow(stat_df).
+#'
+#' @examples
+#' score_stat_line(outcomes, DK_BEST_BALL_SCORING)
+#'
+#' @export
+score_stat_line <- function(stat_df, scoring = REFERENCE_SCORING) {
+
+  missing_cols <- setdiff(STAT_COMPONENTS, names(stat_df))
+  if (length(missing_cols) > 0L) {
+    stop(glue(
+      "score_stat_line(): stat_df is missing required component column(s): ",
+      "{paste(missing_cols, collapse = ', ')}. Refusing to score a partial ",
+      "stat line."
+    ), call. = FALSE)
+  }
+  if (!is.list(scoring)) {
+    stop("score_stat_line(): `scoring` must be a named list.", call. = FALSE)
+  }
+
+  pts <- rep(0, nrow(stat_df))
+  for (comp in STAT_COMPONENTS) {
+    key <- STAT_COMPONENT_SCORING_KEY[[comp]]
+    w   <- scoring[[key]]
+    if (is.null(w) || is.na(w)) w <- 0
+    pts <- pts + dplyr::coalesce(as.numeric(stat_df[[comp]]), 0) * as.numeric(w)
+  }
+  pts
+}
+
+
 .compute_nfl_outcomes <- function(crosswalk, nfl_panel, hit_thresholds) {
 
-  # Compute PPR per game for every player-season in the NFL panel
+  # Per-game rate for every stat component, for every qualifying player-season.
+  # ppr_per_game is retained under REFERENCE_SCORING for backward compatibility
+  # and for is_hit / peak ranking, which need one fixed yardstick.
   nfl_ppr <- nfl_panel %>%
     dplyr::filter(
       !is.na(player_id),
@@ -578,19 +726,26 @@ utils::globalVariables(c(
       position %in% c("QB", "RB", "WR", "TE")
     ) %>%
     dplyr::mutate(
-      ppr_season = (
-        dplyr::coalesce(passing_yards,    0L) * PPR_PASS_YD +
-        dplyr::coalesce(pass_tds,         0L) * PPR_PASS_TD +
-        dplyr::coalesce(interceptions_thrown, 0L) * PPR_INT +
-        dplyr::coalesce(rushing_yards,    0L) * PPR_RUSH_YD +
-        dplyr::coalesce(rush_tds,         0L) * PPR_RUSH_TD +
-        dplyr::coalesce(receptions,       0L) * PPR_RECEPTION +
-        dplyr::coalesce(receiving_yards,  0L) * PPR_REC_YD +
-        dplyr::coalesce(rec_tds,          0L) * PPR_REC_TD
-      ),
-      ppr_per_game = ppr_season / games_played
-    ) %>%
-    dplyr::select(player_id, season, position, ppr_per_game, games_played)
+      y13_pass_yd = dplyr::coalesce(passing_yards,        0L) / games_played,
+      y13_pass_td = dplyr::coalesce(pass_tds,             0L) / games_played,
+      y13_int     = dplyr::coalesce(interceptions_thrown, 0L) / games_played,
+      y13_rush_yd = dplyr::coalesce(rushing_yards,        0L) / games_played,
+      y13_rush_td = dplyr::coalesce(rush_tds,             0L) / games_played,
+      y13_rec     = dplyr::coalesce(receptions,           0L) / games_played,
+      y13_rec_yd  = dplyr::coalesce(receiving_yards,      0L) / games_played,
+      y13_rec_td  = dplyr::coalesce(rec_tds,              0L) / games_played
+    )
+
+  # Reference-scoring points, computed through the same single scoring path as
+  # every other consumer. Assigned outside the pipe so this does not depend on
+  # dplyr::pick() (dplyr >= 1.1.0).
+  nfl_ppr$ppr_per_game <- score_stat_line(nfl_ppr, REFERENCE_SCORING)
+
+  nfl_ppr <- nfl_ppr %>%
+    dplyr::select(
+      player_id, season, position, ppr_per_game, games_played,
+      dplyr::all_of(STAT_COMPONENTS)
+    )
 
   # Compute hit flag: rank ALL players at each position each season
   nfl_hits <- nfl_ppr %>%
@@ -614,6 +769,23 @@ utils::globalVariables(c(
     threshold    <- hit_thresholds[[d_pos]]
     if (is.null(threshold)) threshold <- 36L
 
+    # Best-observed career season across the player's ENTIRE observed career
+    # (draft year onward), using the same min-games gate that nfl_ppr already
+    # applied. Computed independently of the Years 1-3 window so a late bloomer
+    # who never qualified in Years 1-3 still records a real peak. peak_career_year
+    # is years into the career, rookie season = 1. For recent classes this is a
+    # best-OBSERVED peak, since only a few seasons are visible yet.
+    career_seasons <- nfl_ppr %>%
+      dplyr::filter(player_id == gsis_id, season >= d_year)
+    if (nrow(career_seasons) == 0L) {
+      peak_ppg <- NA_real_
+      peak_yr  <- NA_integer_
+    } else {
+      bi       <- which.max(career_seasons$ppr_per_game)
+      peak_ppg <- career_seasons$ppr_per_game[bi]
+      peak_yr  <- as.integer(career_seasons$season[bi] - d_year + 1L)
+    }
+
     player_seasons <- nfl_hits %>%
       dplyr::filter(
         player_id == gsis_id,
@@ -622,24 +794,52 @@ utils::globalVariables(c(
       )
 
     if (nrow(player_seasons) == 0L) {
-      return(tibble::tibble(
-        nfl_gsis_id        = gsis_id,
-        ppr_per_game_y13   = 0,
-        qualifying_seasons = 0L,
-        is_hit             = FALSE,
-        draft_position     = d_pos
+      zero_components <- tibble::as_tibble(
+        stats::setNames(as.list(rep(0, length(STAT_COMPONENTS))),
+                        STAT_COMPONENTS)
+      )
+      return(dplyr::bind_cols(
+        tibble::tibble(
+          nfl_gsis_id        = gsis_id,
+          ppr_per_game_y13   = 0,
+          qualifying_seasons = 0L,
+          is_hit             = FALSE,
+          peak_ppr_per_game  = peak_ppg,
+          peak_career_year   = peak_yr,
+          draft_position     = d_pos
+        ),
+        zero_components
       ))
     }
 
+    # Legacy points outcome: unchanged computation, preserved exactly.
     avg_ppr <- mean(player_seasons$ppr_per_game, na.rm = TRUE)
     ever_top_n <- any(player_seasons$season_rank <= threshold, na.rm = TRUE)
 
-    tibble::tibble(
-      nfl_gsis_id        = gsis_id,
-      ppr_per_game_y13   = avg_ppr,
-      qualifying_seasons = nrow(player_seasons),
-      is_hit             = ever_top_n,
-      draft_position     = d_pos
+    # A2 stat-line outcome: the SAME aggregation applied per component. By
+    # linearity of scoring, score_stat_line() on this averaged line reproduces
+    # avg_ppr under REFERENCE_SCORING, and yields the correct points under any
+    # other linear scoring without a refit.
+    avg_components <- tibble::as_tibble(
+      stats::setNames(
+        lapply(STAT_COMPONENTS, function(cc) {
+          mean(player_seasons[[cc]], na.rm = TRUE)
+        }),
+        STAT_COMPONENTS
+      )
+    )
+
+    dplyr::bind_cols(
+      tibble::tibble(
+        nfl_gsis_id        = gsis_id,
+        ppr_per_game_y13   = avg_ppr,
+        qualifying_seasons = nrow(player_seasons),
+        is_hit             = ever_top_n,
+        peak_ppr_per_game  = peak_ppg,
+        peak_career_year   = peak_yr,
+        draft_position     = d_pos
+      ),
+      avg_components
     )
   })
 
@@ -1133,24 +1333,54 @@ build_translation_features <- function(cfb_panel,
       final_s    <- cw_row$cfb_final_season
       d_pos      <- cw_row$draft_position
       d_year     <- cw_row$draft_year
+      p_team     <- cw_row$cfb_primary_team
 
-      # All seasons for this player up to and including final college season
+      # All seasons for this player up to and including final college season.
+      # Strict branch: name + primary team, so two different humans sharing a
+      # name are never pooled. NOTE: transfers keep only their primary-team
+      # seasons under the strict branch -- acceptable versus pooling different
+      # players. Fall back to name-only when the strict filter finds nothing
+      # (e.g. a transfer whose crosswalk team differs from earlier panel
+      # rows), warning if R/21 flagged the name as a collision.
       player_cfb <- cfb_filtered %>%
         dplyr::filter(
           player_name == p_name,
+          primary_team == p_team,
           season <= final_s
         ) %>%
         dplyr::arrange(season)
 
+      if (nrow(player_cfb) == 0L) {
+        player_cfb <- cfb_filtered %>%
+          dplyr::filter(
+            player_name == p_name,
+            season <= final_s
+          ) %>%
+          dplyr::arrange(season)
+
+        if (nrow(player_cfb) > 0L &&
+            "has_name_collision" %in% names(player_cfb) &&
+            any(player_cfb$has_name_collision, na.rm = TRUE)) {
+          warning(glue(
+            "Name-only season match for '{p_name}' ({d_pos}, draft {d_year}): ",
+            "R/21 flags has_name_collision for this name, so these rows may ",
+            "mix different players."
+          ), call. = FALSE)
+        }
+      }
+
       if (nrow(player_cfb) == 0L) return(NULL)
 
-      # Determine feature columns for this position
-      pos_key   <- if (d_pos %in% c("WR", "TE")) d_pos else d_pos
+      # Determine feature columns for this position. All four positions map to
+      # themselves; the list lookup below handles WR/TE sharing a column set.
+      pos_key   <- d_pos
       feat_cols <- feature_cols_by_pos[[pos_key]]
       if (is.null(feat_cols)) feat_cols <- wr_te_feature_cols
 
-      # Weighted average
-      weighted_feats <- .apply_multiseason_weights(player_cfb, feat_cols)
+      # Weighted average, anchored on the crosswalk's true final season so an
+      # injury-shortened (filtered) final year cannot shift the 2x weight.
+      weighted_feats <- .apply_multiseason_weights(player_cfb, feat_cols,
+                                                   final_season = final_s)
 
       dplyr::bind_cols(
         tibble::tibble(
@@ -1231,10 +1461,39 @@ build_translation_features <- function(cfb_panel,
     dplyr::left_join(
       nfl_outcomes %>%
         dplyr::select(
-          nfl_gsis_id, ppr_per_game_y13, qualifying_seasons, is_hit
+          nfl_gsis_id, ppr_per_game_y13, qualifying_seasons, is_hit,
+          peak_ppr_per_game, peak_career_year,
+          # Season 3 Wave A2: the stat-line outcome must survive this join or
+          # train_translation_model() cannot fit component models.
+          dplyr::all_of(STAT_COMPONENTS)
         ),
       by = "nfl_gsis_id"
     )
+
+  # --- Step 5b: KEEP THE BUSTS ---
+  # Drafted players in the training classes with an NA gsis_id (or no outcome
+  # row from the join above) previously carried NA ppr_per_game_y13 and were
+  # silently dropped by the !is.na() training filter in Step 7, truncating the
+  # outcome distribution: the players the model most needs to see as failures
+  # never reached the zero-PPG branch of .compute_nfl_outcomes(). Give them
+  # the same zero treatment that branch applies to gsis-matched players with
+  # no qualifying NFL seasons.
+  zero_fill <- player_features$draft_year <= cutoff_year &
+    is.na(player_features$ppr_per_game_y13)
+  n_zero_filled <- sum(zero_fill, na.rm = TRUE)
+  if (n_zero_filled > 0L) {
+    player_features$ppr_per_game_y13[zero_fill]   <- 0
+    player_features$qualifying_seasons[zero_fill] <- 0L
+    player_features$is_hit[zero_fill]             <- FALSE
+    for (cc in STAT_COMPONENTS) {
+      player_features[[cc]][zero_fill] <- 0
+    }
+    # peak_ppr_per_game / peak_career_year stay NA, matching the zero branch.
+    message(glue(
+      "  Step 5b: retained {n_zero_filled} zero-outcome training players ",
+      "(NA gsis_id or no NFL outcome rows) with ppr_per_game_y13 = 0."
+    ))
+  }
 
   # --- Step 6: Center draft age within position on training set ---
   message("\nStep 6: Centering draft age within position...")
@@ -1411,6 +1670,10 @@ train_translation_model <- function(feature_matrix,
   models_enriched <- list()
   loco_pred_list  <- list()
 
+  # Season 3 Wave A2: per-component model containers (stat-line models)
+  models_components_base     <- list()
+  models_components_enriched <- list()
+
   for (pos in TRANSLATION_POSITIONS) {
     message(glue("\n--- Position: {pos} ---"))
 
@@ -1473,6 +1736,114 @@ train_translation_model <- function(feature_matrix,
       }
     )
 
+    # --- Season 3 Wave A2: per-component (stat-line) models -----------------
+    # One model per stat component, per feature variant. Predicting the stat
+    # line instead of a points total is what makes the output scoring-agnostic:
+    # points under any linear scoring are recovered downstream by
+    # score_stat_line(), with no refit per format.
+    #
+    # ZERO-VARIANCE GUARD: several components are structurally absent for a
+    # position (QB receptions, WR passing yards). cv.glmnet errors on a
+    # constant target, so those are short-circuited to the constant itself
+    # rather than allowed to fail the run. A constant prediction is the correct
+    # answer for a component the position never accumulates.
+    comp_loco_base <- list()
+    comp_loco_enr  <- list()
+    comp_models_base <- list()
+    comp_models_enr  <- list()
+
+    for (comp in STAT_COMPONENTS) {
+      y_c <- train_df[[comp]]
+
+      if (is.null(y_c)) {
+        stop(glue(
+          "train_translation_model(): component column '{comp}' missing from ",
+          "training data for position {pos}. Rebuild the feature matrix with ",
+          "the Wave A2 outcome (.compute_nfl_outcomes)."
+        ), call. = FALSE)
+      }
+
+      # DEGENERACY TEST. An exact-constant check is not enough: components like
+      # RB passing yards are zero for all but one or two players, so variance is
+      # non-zero overall while every LOCO fold and the final standardization
+      # still collapse. Elastic net cannot learn anything from a target that is
+      # ~entirely zero on 95-250 rows, and the honest prediction is the constant.
+      # MIN_COMPONENT_NONZERO_FRAC is a judgment call, stated here to be visible
+      # and tunable rather than buried.
+      y_nonzero_frac <- mean(!is.na(y_c) & y_c != 0)
+      const_target <- isTRUE(stats::sd(y_c, na.rm = TRUE) == 0) ||
+        all(is.na(y_c)) ||
+        dplyr::n_distinct(y_c[!is.na(y_c)]) <= 1L ||
+        y_nonzero_frac < MIN_COMPONENT_NONZERO_FRAC
+
+      if (const_target) {
+        const_val <- if (all(is.na(y_c))) 0 else stats::na.omit(y_c)[1]
+        comp_loco_base[[comp]] <- rep(const_val, length(y_c))
+        comp_loco_enr[[comp]]  <- rep(const_val, length(y_c))
+        comp_models_base[[comp]] <- list(constant = const_val)
+        comp_models_enr[[comp]]  <- list(constant = const_val)
+        next
+      }
+
+      comp_loco_base[[comp]] <- tryCatch(
+        .fit_elastic_net_loco(X_base, y_c, draft_yrs, alpha),
+        error = function(e) {
+          warning(glue(
+            "Position {pos} component {comp} base LOCO failed: ",
+            "{conditionMessage(e)}"
+          ), call. = FALSE)
+          rep(mean(y_c, na.rm = TRUE), length(y_c))
+        }
+      )
+
+      comp_loco_enr[[comp]] <- tryCatch(
+        .fit_elastic_net_loco(X_enr, y_c, draft_yrs, alpha),
+        error = function(e) {
+          warning(glue(
+            "Position {pos} component {comp} enriched LOCO failed: ",
+            "{conditionMessage(e)}"
+          ), call. = FALSE)
+          rep(mean(y_c, na.rm = TRUE), length(y_c))
+        }
+      )
+
+      # Final fits. Wrapped: even after the degeneracy test, a component can be
+      # sparse enough that glmnet's standardization fails. Degrade to the
+      # constant rather than killing a multi-hour run.
+      set.seed(GLMNET_SEED)
+      comp_models_base[[comp]] <- tryCatch(
+        glmnet::cv.glmnet(
+          x = X_base, y = y_c, alpha = alpha,
+          nfolds = min(10L, nrow(train_df))
+        ),
+        error = function(e) {
+          warning(glue(
+            "Position {pos} component {comp} base FINAL fit failed: ",
+            "{conditionMessage(e)}. Falling back to constant."
+          ), call. = FALSE)
+          list(constant = mean(y_c, na.rm = TRUE))
+        }
+      )
+
+      set.seed(GLMNET_SEED)
+      comp_models_enr[[comp]] <- tryCatch(
+        glmnet::cv.glmnet(
+          x = X_enr, y = y_c, alpha = alpha,
+          nfolds = min(10L, nrow(train_df))
+        ),
+        error = function(e) {
+          warning(glue(
+            "Position {pos} component {comp} enriched FINAL fit failed: ",
+            "{conditionMessage(e)}. Falling back to constant."
+          ), call. = FALSE)
+          list(constant = mean(y_c, na.rm = TRUE))
+        }
+      )
+    }
+
+    models_components_base[[pos]]     <- comp_models_base
+    models_components_enriched[[pos]] <- comp_models_enr
+
     # --- Final models: fit on all training data ---
     set.seed(GLMNET_SEED)
     final_base <- glmnet::cv.glmnet(
@@ -1494,14 +1865,39 @@ train_translation_model <- function(feature_matrix,
     models_enriched[[pos]] <- final_enr
 
     # Store LOCO predictions
-    loco_pred_list[[pos]] <- tibble::tibble(
-      nfl_gsis_id      = train_df$nfl_gsis_id,
-      draft_year       = train_df$draft_year,
-      draft_position   = pos,
-      ppr_per_game_y13 = y,
-      pred_base        = loco_pred_base,
-      pred_enriched    = loco_pred_enr,
-      is_hit           = train_df$is_hit
+    # Season 3 Wave A2: carry BOTH the observed component line and the LOCO
+    # component predictions. Together these let any downstream consumer compute
+    # honest out-of-sample points error under ANY scoring, with no refit:
+    # score the predicted line and the observed line under that scoring and
+    # compare. This is what replaces the per-format sigma calibration.
+    comp_truth_cols <- stats::setNames(
+      lapply(STAT_COMPONENTS, function(cc) train_df[[cc]]),
+      STAT_COMPONENTS
+    )
+    comp_pred_base_cols <- stats::setNames(
+      lapply(STAT_COMPONENTS, function(cc) comp_loco_base[[cc]]),
+      paste0("pred_base_", STAT_COMPONENTS)
+    )
+    comp_pred_enr_cols <- stats::setNames(
+      lapply(STAT_COMPONENTS, function(cc) comp_loco_enr[[cc]]),
+      paste0("pred_enriched_", STAT_COMPONENTS)
+    )
+
+    loco_pred_list[[pos]] <- dplyr::bind_cols(
+      tibble::tibble(
+        nfl_gsis_id      = train_df$nfl_gsis_id,
+        draft_year       = train_df$draft_year,
+        draft_position   = pos,
+        ppr_per_game_y13 = y,
+        pred_base        = loco_pred_base,
+        pred_enriched    = loco_pred_enr,
+        is_hit           = train_df$is_hit,
+        peak_ppr_per_game = train_df$peak_ppr_per_game,
+        peak_career_year  = train_df$peak_career_year
+      ),
+      tibble::as_tibble(comp_truth_cols),
+      tibble::as_tibble(comp_pred_base_cols),
+      tibble::as_tibble(comp_pred_enr_cols)
     )
 
     base_rmse <- sqrt(mean((y - loco_pred_base)^2, na.rm = TRUE))
@@ -1538,8 +1934,136 @@ train_translation_model <- function(feature_matrix,
     loco_predictions  = loco_predictions,
     loco_performance  = loco_performance,
     impute_medians    = feature_matrix$impute_medians,
-    base_feature_cols = feature_matrix$base_feature_cols
+    base_feature_cols = feature_matrix$base_feature_cols,
+    # Season 3 Wave A2
+    models_components_base     = models_components_base,
+    models_components_enriched = models_components_enriched,
+    stat_components            = STAT_COMPONENTS
   )
+}
+
+
+# ==============================================================================
+# FUNCTION: compare_points_vs_statline (Season 3 Wave A2 backtest)
+# ==============================================================================
+
+#' Out-of-sample comparison: direct points model (A1) vs stat-line model (A2)
+#'
+#' @description
+#' Settles which target earns production, on evidence rather than architecture
+#' preference. Both arms are evaluated on the SAME leave-one-class-out
+#' predictions already produced by \code{train_translation_model()}, so no
+#' refitting occurs here and the comparison is honestly out-of-sample.
+#'
+#' \strong{A1 (direct points):} the model fit on \code{ppr_per_game_y13}. Its
+#' prediction is a points number on the REFERENCE_SCORING scale. To evaluate it
+#' under a different scoring it must be RESCALED, because it cannot know the
+#' stat mix underneath. The rescale used here is the position-level ratio of
+#' mean observed points under the target scoring to mean observed points under
+#' the reference. This is deliberately the most favourable simple treatment of
+#' A1 under a foreign scoring, and it is exactly the band-aid rejected as the
+#' production fix. Including it here makes the comparison fair rather than
+#' rigged.
+#'
+#' \strong{A2 (stat line):} the per-component predictions, scored directly under
+#' the target scoring by \code{score_stat_line()}. No rescale, no refit.
+#'
+#' Truth in both arms is the observed component line scored under the target
+#' scoring, so the two arms are compared against an identical target.
+#'
+#' Under REFERENCE_SCORING the A1 rescale factor is 1 by construction, so that
+#' row is the clean like-for-like test of whether decomposing into components
+#' costs aggregate accuracy.
+#'
+#' @param model_list Output of \code{train_translation_model()}.
+#' @param scoring_list Named list of scoring lists to evaluate, e.g.
+#'   \code{list(reference = REFERENCE_SCORING, dk = DK_BEST_BALL_SCORING)}.
+#' @param variant Character, "base" or "enriched". Which feature variant to
+#'   compare. Default "base", matching what R/29 uses for its prior point
+#'   estimate.
+#'
+#' @return tibble: scoring_label, draft_position, n_players, rmse_a1_points,
+#'   rmse_a2_statline, rmse_delta (negative favours A2), mae_a1_points,
+#'   mae_a2_statline, a1_rescale_factor.
+#'
+#' @export
+compare_points_vs_statline <- function(model_list,
+                                       scoring_list = list(
+                                         reference = REFERENCE_SCORING
+                                       ),
+                                       variant = c("base", "enriched")) {
+
+  variant <- match.arg(variant)
+  loco <- model_list$loco_predictions
+
+  if (is.null(loco)) {
+    stop("compare_points_vs_statline(): model_list has no loco_predictions.",
+         call. = FALSE)
+  }
+
+  pred_points_col <- if (variant == "base") "pred_base" else "pred_enriched"
+  comp_prefix     <- if (variant == "base") "pred_base_" else "pred_enriched_"
+  comp_pred_cols  <- paste0(comp_prefix, STAT_COMPONENTS)
+
+  missing_cols <- setdiff(c(comp_pred_cols, STAT_COMPONENTS), names(loco))
+  if (length(missing_cols) > 0L) {
+    stop(glue(
+      "compare_points_vs_statline(): loco_predictions is missing ",
+      "{length(missing_cols)} required column(s), first: {missing_cols[1]}. ",
+      "This model object predates Wave A2; retrain before comparing."
+    ), call. = FALSE)
+  }
+
+  # Observed component line, used as truth under every scoring.
+  truth_line <- loco[, STAT_COMPONENTS, drop = FALSE]
+
+  # Predicted component line, renamed to the canonical component names so
+  # score_stat_line() can consume it directly.
+  pred_line <- loco[, comp_pred_cols, drop = FALSE]
+  names(pred_line) <- STAT_COMPONENTS
+
+  purrr::map_dfr(names(scoring_list), function(lbl) {
+
+    sc <- scoring_list[[lbl]]
+
+    truth_pts <- score_stat_line(truth_line, sc)
+    a2_pts    <- score_stat_line(pred_line,  sc)
+    ref_pts   <- score_stat_line(truth_line, REFERENCE_SCORING)
+
+    tibble::tibble(
+      draft_position = loco$draft_position,
+      truth_pts      = truth_pts,
+      a2_pts         = a2_pts,
+      ref_pts        = ref_pts,
+      a1_raw         = loco[[pred_points_col]]
+    ) %>%
+      dplyr::group_by(draft_position) %>%
+      dplyr::mutate(
+        # Position-level rescale of the A1 points prediction onto the target
+        # scoring. Exactly 1 when the target IS the reference scoring.
+        a1_rescale_factor = dplyr::if_else(
+          mean(ref_pts, na.rm = TRUE) == 0, 1,
+          mean(truth_pts, na.rm = TRUE) / mean(ref_pts, na.rm = TRUE)
+        ),
+        a1_pts = a1_raw * a1_rescale_factor
+      ) %>%
+      dplyr::summarise(
+        scoring_label     = lbl,
+        n_players         = dplyr::n(),
+        rmse_a1_points    = sqrt(mean((truth_pts - a1_pts)^2, na.rm = TRUE)),
+        rmse_a2_statline  = sqrt(mean((truth_pts - a2_pts)^2, na.rm = TRUE)),
+        mae_a1_points     = mean(abs(truth_pts - a1_pts), na.rm = TRUE),
+        mae_a2_statline   = mean(abs(truth_pts - a2_pts), na.rm = TRUE),
+        a1_rescale_factor = dplyr::first(a1_rescale_factor),
+        .groups           = "drop"
+      ) %>%
+      dplyr::mutate(rmse_delta = rmse_a2_statline - rmse_a1_points) %>%
+      dplyr::select(
+        scoring_label, draft_position, n_players,
+        rmse_a1_points, rmse_a2_statline, rmse_delta,
+        mae_a1_points, mae_a2_statline, a1_rescale_factor
+      )
+  })
 }
 
 
@@ -2278,16 +2802,23 @@ run_week10_pipeline <- function(cfb_panel        = NULL,
   # --- Save outputs ---
   if (verbose) message(glue("\nSaving outputs to: {output_dir}"))
 
-  saveRDS(crosswalk,
-    file.path(output_dir, "s2_week10_crosswalk.rds"))
-  saveRDS(feature_matrix,
-    file.path(output_dir, "s2_week10_feature_matrix.rds"))
-  saveRDS(model_list,
-    file.path(output_dir, "s2_week10_models.rds"))
-  saveRDS(performance,
-    file.path(output_dir, "s2_week10_performance.rds"))
-  saveRDS(model_list$loco_predictions,
-    file.path(output_dir, "s2_week10_predictions.rds"))
+  # Every run writes the canonical file (for downstream readers) AND a
+  # date-stamped copy (YYYYMMDD, date only) into output_dir/backups/, so each
+  # rebuild is recoverable with no manual step. A same-day rerun overwrites
+  # that day's snapshot by design (date only, no time).
+  .version_dir <- file.path(output_dir, "backups")
+  if (!dir.exists(.version_dir)) dir.create(.version_dir, recursive = TRUE)
+  .date_tag <- format(Sys.Date(), "%Y%m%d")
+  save_dated <- function(obj, name) {
+    saveRDS(obj, file.path(output_dir,   paste0(name, ".rds")))
+    saveRDS(obj, file.path(.version_dir, paste0(name, "_", .date_tag, ".rds")))
+  }
+
+  save_dated(crosswalk,                   "s2_week10_crosswalk")
+  save_dated(feature_matrix,              "s2_week10_feature_matrix")
+  save_dated(model_list,                  "s2_week10_models")
+  save_dated(performance,                 "s2_week10_performance")
+  save_dated(model_list$loco_predictions, "s2_week10_predictions")
 
   t_elapsed <- round((proc.time() - t_start)[["elapsed"]])
 

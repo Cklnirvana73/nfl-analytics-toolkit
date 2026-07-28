@@ -70,10 +70,26 @@ get_game_summary <- function(pbp_data, game_id) {
   }
   
   # Get basic game info
+  # CRITICAL FIX: total_*_score is the RUNNING score, so slice(1) returns the
+  # score after the first play (0-0). Use the game-level final score columns
+  # when available, otherwise the max of the running score.
   game_info <- game_plays %>%
     slice(1) %>%
-    select(game_id, home_team, away_team, game_date, week, 
-           total_home_score, total_away_score)
+    select(game_id, home_team, away_team, game_date, week)
+
+  if (all(c("home_score", "away_score") %in% names(game_plays))) {
+    game_info <- game_info %>%
+      mutate(
+        total_home_score = first(game_plays$home_score),
+        total_away_score = first(game_plays$away_score)
+      )
+  } else {
+    game_info <- game_info %>%
+      mutate(
+        total_home_score = max(game_plays$total_home_score, na.rm = TRUE),
+        total_away_score = max(game_plays$total_away_score, na.rm = TRUE)
+      )
+  }
   
   # Filter to offensive plays only for stats
   offensive_plays <- game_plays %>%
@@ -137,7 +153,8 @@ get_game_summary <- function(pbp_data, game_id) {
 #'
 #' @description
 #' Extracts all scoring plays from a specific game, including touchdowns,
-#' field goals, and safeties with context about game situation.
+#' field goals, safeties, extra points, and two-point conversions with
+#' context about game situation.
 #'
 #' @param pbp_data Play-by-play data from load_and_validate_pbp()
 #' @param game_id Single game ID (e.g., "2024_01_KC_BAL")
@@ -146,7 +163,8 @@ get_game_summary <- function(pbp_data, game_id) {
 #'
 #' @details
 #' **NFL Context:**
-#' - Touchdown = 6 points (extra point/2-pt conversion tracked separately)
+#' - Touchdown = 6 points (extra point/2-pt conversion are separate plays,
+#'   included here as 1 and 2 points respectively)
 #' - Field Goal = 3 points
 #' - Safety = 2 points (defensive score)
 #' - Score differential shows game flow and momentum shifts
@@ -184,6 +202,7 @@ get_scoring_plays <- function(pbp_data, game_id) {
   required_cols <- c("game_id", "play_id", "quarter_seconds_remaining", "qtr",
                      "down", "ydstogo", "posteam", "defteam", "desc",
                      "td_team", "field_goal_result", "safety",
+                     "extra_point_result", "two_point_conv_result",
                      "total_home_score", "total_away_score")
   
   missing_cols <- setdiff(required_cols, names(pbp_data))
@@ -200,30 +219,39 @@ get_scoring_plays <- function(pbp_data, game_id) {
     return(NULL)
   }
   
-  # Filter to scoring plays only
+  # Filter to scoring plays only (TDs, FGs, safeties, extra points, and
+  # 2-pt conversions so the timeline reconciles with the final score)
   scoring_plays <- game_plays %>%
     filter(
-      !is.na(td_team) | 
-      field_goal_result == "made" | 
-      safety == 1
+      !is.na(td_team) |
+      field_goal_result == "made" |
+      safety == 1 |
+      extra_point_result == "good" |
+      two_point_conv_result == "success"
     ) %>%
     mutate(
       # Determine score type and points
       score_type = case_when(
         !is.na(td_team) ~ "Touchdown",
         field_goal_result == "made" ~ "Field Goal",
+        extra_point_result == "good" ~ "Extra Point",
+        two_point_conv_result == "success" ~ "Two-Point Conversion",
         safety == 1 ~ "Safety",
         TRUE ~ "Unknown"
       ),
       points = case_when(
-        !is.na(td_team) ~ 6L,  # Base TD points (extra point/2pt conversion separate)
+        !is.na(td_team) ~ 6L,  # Base TD points (extra point/2pt conversion are separate plays)
         field_goal_result == "made" ~ 3L,
+        extra_point_result == "good" ~ 1L,
+        two_point_conv_result == "success" ~ 2L,
         safety == 1 ~ 2L,
         TRUE ~ 0L
       ),
       scoring_team = case_when(
         !is.na(td_team) ~ td_team,
         field_goal_result == "made" ~ posteam,
+        extra_point_result == "good" ~ posteam,
+        two_point_conv_result == "success" ~ posteam,
         safety == 1 ~ defteam,
         TRUE ~ NA_character_
       ),
@@ -311,10 +339,11 @@ get_drive_summary <- function(pbp_data, game_id) {
     stop("game_id must be a single character string")
   }
   
-  required_cols <- c("game_id", "drive", "posteam", "defteam", 
+  required_cols <- c("game_id", "drive", "posteam", "defteam",
                      "drive_ended_with_score", "drive_play_count",
                      "drive_yards_penalized", "drive_start_yard_line",
-                     "drive_end_yard_line", "drive_time_of_possession")
+                     "drive_end_yard_line", "drive_time_of_possession",
+                     "epa", "yards_gained")
   
   missing_cols <- setdiff(required_cols, names(pbp_data))
   if (length(missing_cols) > 0) {

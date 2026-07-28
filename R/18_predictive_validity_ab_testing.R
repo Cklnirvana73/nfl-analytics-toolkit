@@ -353,8 +353,10 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
     if (is.null(pbp)) next
 
     # Regular season filter.
-    # 17-game expansion: week <= 18 for 2021+, <= 17 for 2020, <= 16 pre-2020.
-    max_reg_week <- if (s >= 2021L) 18L else if (s == 2020L) 17L else 16L
+    # 17-game expansion: week <= 18 for 2021+. Before that, the 16-game
+    # regular season spanned WEEKS 1-17 (each team has one bye), so
+    # week <= 17 applies to all pre-2021 seasons including 2010-2019.
+    max_reg_week <- if (s >= 2021L) 18L else 17L
     pbp <- pbp %>% filter(week <= max_reg_week)
 
     # Compute weekly PPR fantasy points via Season 1 infrastructure.
@@ -535,7 +537,8 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
 #'     \item{r_roll3_ci_hi}{Bootstrap BCa 95% CI upper (dbl)}
 #'     \item{r_std_ci_lo}{Bootstrap BCa 95% CI lower (dbl)}
 #'     \item{r_std_ci_hi}{Bootstrap BCa 95% CI upper (dbl)}
-#'     \item{z_stat}{Steiger test statistic (dbl)}
+#'     \item{z_stat}{Williams t statistic (df = n - 3); a Fisher z statistic
+#'       only when the Williams denominator is degenerate (dbl)}
 #'     \item{p_value_raw}{Two-sided p-value before FDR correction (dbl)}
 #'     \item{cohens_q}{|atanh(r_roll3) - atanh(r_std)| (dbl)}
 #'     \item{better_predictor}{"roll3", "std", or "no_difference" (chr)}
@@ -612,49 +615,75 @@ compare_prediction_methods <- function(panel,
     z_r3  <- atanh(r_roll3)
     z_std <- atanh(r_std)
 
-    # Steiger (1980) Hotelling-Williams test for two dependent correlations
-    # sharing one variable (y). Accounts for correlation between predictors.
+    # Williams t-test (Steiger 1980 formulation) for two dependent
+    # correlations sharing one variable (y). Accounts for the correlation
+    # between the two predictors.
+    #   t = (r13 - r23) * sqrt(((n-1) * (1 + r12)) /
+    #         (2 * ((n-1)/(n-3)) * det_R + mean_r^2 * (1 - r12)^3))
+    # with df = n - 3, r13/r23 = predictor-outcome correlations, r12 = the
+    # predictor-predictor correlation, mean_r = (r13 + r23) / 2.
     # det_R is the determinant of the 3x3 correlation matrix of [x_r3, x_std, y].
+    # NOTE: an earlier version used 2 * det_R / (n - 1) in the denominator and
+    # a normal reference distribution -- results saved under that version are
+    # invalid and must be re-run.
     det_R <- 1 - r_roll3^2 - r_std^2 - r_r3_std^2 +
              2 * r_roll3 * r_std * r_r3_std
 
-    h_denom <- 2 * det_R / (n - 1) +
-               ((r_roll3 + r_std) / 2)^2 * (1 - r_r3_std)^3
+    mean_r  <- (r_roll3 + r_std) / 2
+    w_denom <- 2 * ((n - 1) / (n - 3)) * det_R +
+               mean_r^2 * (1 - r_r3_std)^3
 
     # Guard against degenerate denominator (near-identical predictors)
-    if (is.na(h_denom) || h_denom <= 0) {
+    if (is.na(w_denom) || w_denom <= 0) {
       warning(glue(
-        "{pos}: Steiger denominator degenerate (r_predictors = ",
+        "{pos}: Williams denominator degenerate (r_predictors = ",
         "{round(r_r3_std, 3)}). Falling back to unpaired Fisher z-test."
       ), call. = FALSE)
-      z_stat <- (z_r3 - z_std) / sqrt(2 / (n - 3))
+      z_stat          <- (z_r3 - z_std) / sqrt(2 / (n - 3))
+      p_value_raw     <- 2 * pnorm(-abs(z_stat))
+      log_p_one_sided <- pnorm(-abs(z_stat), log.p = TRUE)
+      crit_value      <- qnorm(1 - alpha / 2)
     } else {
-      z_stat <- (r_roll3 - r_std) *
-                sqrt((n - 1) * (1 + r_r3_std)) /
-                sqrt(h_denom)
+      z_stat          <- (r_roll3 - r_std) *
+                         sqrt(((n - 1) * (1 + r_r3_std)) / w_denom)
+      p_value_raw     <- 2 * pt(-abs(z_stat), df = n - 3)
+      log_p_one_sided <- pt(-abs(z_stat), df = n - 3, log.p = TRUE)
+      crit_value      <- qt(1 - alpha / 2, df = n - 3)
     }
 
-    p_value_raw <- 2 * pnorm(-abs(z_stat))
-    cohens_q    <- calculate_effect_size_ab(r_roll3, r_std)
+    cohens_q <- calculate_effect_size_ab(r_roll3, r_std)
 
     # p_value_log10: log10 of the two-sided p-value computed in log-space.
-    # pnorm(log.p = TRUE) returns log(p) without underflowing to 0.
-    # At n = 44,691 (WR), z ~ -56 and pnorm(-56) = 0 in double precision.
-    # log10(p) = log(p) / log(10). Result is a large negative number,
-    # e.g. -247 for WR, meaning p = 10^-247. Stored alongside p_value_raw
-    # so RDS consumers see the true magnitude even when p_value_raw = 0.
-    log_p_one_sided <- pnorm(-abs(z_stat), log.p = TRUE)
-    p_value_log10   <- (log_p_one_sided + log(2)) / log(10)
+    # pt()/pnorm() with log.p = TRUE return log(p) without underflowing to 0
+    # at extreme test statistics. log10(p) = log(p) / log(10). Stored
+    # alongside p_value_raw so RDS consumers see the true magnitude even when
+    # p_value_raw = 0. (Specific magnitudes quoted in earlier comments were
+    # computed under the pre-fix statistic and no longer apply.)
+    p_value_log10 <- (log_p_one_sided + log(2)) / log(10)
 
-    # Bootstrap BCa 95% CIs
+    # Bootstrap BCa 95% CIs -- CLUSTER bootstrap on player_id.
+    # Player-weeks are repeated measures of the same player, so resampling
+    # rows independently understates sampling variability. Instead, resample
+    # PLAYERS with replacement and keep all of each drawn player's rows.
+    player_vec     <- as.character(d$player_id)
+    players        <- unique(player_vec)
+    rows_by_player <- split(seq_len(n), player_vec)
+
+    cluster_cor <- function(x_vec) {
+      function(pl, i) {
+        idx <- unlist(rows_by_player[pl[i]], use.names = FALSE)
+        cor(x_vec[idx], y[idx], use = "complete.obs")
+      }
+    }
+
     boot_r3 <- boot(
-      data      = data.frame(x = x_r3, y = y),
-      statistic = function(d, i) cor(d$x[i], d$y[i]),
+      data      = players,
+      statistic = cluster_cor(x_r3),
       R         = as.integer(n_bootstrap)
     )
     boot_sd <- boot(
-      data      = data.frame(x = x_std, y = y),
-      statistic = function(d, i) cor(d$x[i], d$y[i]),
+      data      = players,
+      statistic = cluster_cor(x_std),
       R         = as.integer(n_bootstrap)
     )
 
@@ -675,7 +704,7 @@ compare_prediction_methods <- function(panel,
       }
     )
 
-    better_predictor <- if (abs(z_stat) < qnorm(1 - alpha / 2)) {
+    better_predictor <- if (abs(z_stat) < crit_value) {
       "no_difference"
     } else if (r_roll3 > r_std) {
       "roll3"
@@ -989,8 +1018,15 @@ validate_ab_assumptions <- function(panel) {
     x_sd <- d$fantasy_pts_std
     y    <- d$fantasy_pts_actual
 
-    # Shapiro-Wilk is capped at 5000 (function limit)
-    sw_idx <- if (n > 5000L) sample(n, 5000L) else seq_len(n)
+    # Shapiro-Wilk is capped at 5000 (function limit).
+    # Seed the subsample locally so assumption output is identical run to run
+    # (an unseeded sample() made these p-values change on every invocation).
+    sw_idx <- if (n > 5000L) {
+      set.seed(42L)
+      sample(n, 5000L)
+    } else {
+      seq_len(n)
+    }
 
     sw_r3 <- shapiro.test(x_r3[sw_idx])$p.value
     sw_sd <- shapiro.test(x_sd[sw_idx])$p.value
@@ -1171,6 +1207,12 @@ run_ab_test_pipeline <- function(seasons     = SEASONS_S2,
   # KEY INSIGHT block -- all numbers and direction labels computed from results.
   # Never hardcode assumed direction ("recency advantage", "std advantage", etc.).
   # The data determines the winner; the message reflects that.
+  #
+  # IMPORTANT: any results/RDS artifacts produced before the Williams-t fix in
+  # compare_prediction_methods() (denominator previously used 2*det_R/(n-1)
+  # with a normal reference distribution) were computed under a bug. Those
+  # saved p-values, z_stat values, and significance flags are invalid --
+  # re-run this pipeline before quoting findings.
   message(glue("\n{'='|>strrep(60)}"))
   message("KEY FINDINGS")
   message(glue("{'='|>strrep(60)}"))

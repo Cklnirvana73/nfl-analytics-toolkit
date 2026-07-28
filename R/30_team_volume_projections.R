@@ -232,8 +232,8 @@ HISTORICAL_WINDOW <- 3L
 HISTORICAL_SEASONS <- (SEASON - HISTORICAL_WINDOW):(SEASON - 1L)
 
 # Blend weights
-TEAM_PATTERN_WEIGHT <- 0.70
-COACH_PATTERN_WEIGHT <- 0.30
+TEAM_PATTERN_WEIGHT <- 1.00
+COACH_PATTERN_WEIGHT <- 0.00
 
 # Quality thresholds
 MIN_GAMES_TEAM_SEASON <- 14L   # Of 17 regular season games, allow some slack
@@ -318,12 +318,25 @@ SOS_FACTOR_CEILING <- 1.20
 CACHE_DIR_DEFAULT <- here::here("data", "season2_cache")
 COACHING_CHANGES_PATH <- here::here("data", "ref", "coaching_changes_2026.csv")
 QB_CHANGES_PATH <- here::here("data", "ref", "qb_changes_2026.csv")
-OUTPUT_RDS_PATH <- here::here("data", "season2_cache",
+
+# Committee QB config (uncertain rooms). Season-guarded: only rows whose season
+# matches the run season are applied, so 2026 overrides can never touch 2027.
+QB_COMMITTEES_PATH <- here::here("data", "ref", "qb_committees_2026.csv")
+# NAMESPACE GUARD  [2026-07-15]
+# R/30 and R/34 both defined OUTPUT_RDS_PATH, OUTPUT_CSV_PATH and SCHEMA_TAG at
+# top level with different values. R/42 sources R/34, so sourcing R/42 after R/30
+# silently repointed R/30's writer at the def/ST filename: project_team_volumes()
+# wrote 2026 team volumes to s2_week16_def_st_projections.rds and left
+# s2_week15_team_volumes.rds stale, which every downstream board then read.
+# Correctness must not depend on source order, so these are now R30_-prefixed.
+# R/34 keeps the unprefixed names; nothing else defines them, so the collision
+# is gone regardless of load order. R/29 already did this with R29_SCHEMA_TAG.
+R30_OUTPUT_RDS_PATH <- here::here("data", "season2_cache",
                               "s2_week15_team_volumes.rds")
-OUTPUT_CSV_PATH <- here::here("data", "season2_cache",
+R30_OUTPUT_CSV_PATH <- here::here("data", "season2_cache",
                               "s2_week15_team_volumes.csv")
 
-SCHEMA_TAG <- "s2_w15_team_vol_v2"
+R30_SCHEMA_TAG <- "s2_w15_team_vol_v2"
 
 # Active 2026 NFL teams. Used to filter the output to only active teams
 # (excludes historical codes like STL, OAK, SD that may appear in older pbp).
@@ -1592,6 +1605,7 @@ utils::globalVariables(c(
                "{n_below} below-threshold neutral, ",
                "{length(missing_teams)} unresolved (also neutral)"))
 
+  attr(qb_quality, "qb_stats_2025") <- qb_stats_2025
   qb_quality
 }
 
@@ -2327,6 +2341,177 @@ utils::globalVariables(c(
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
+# QB committee support (uncertain QB rooms)
+# ------------------------------------------------------------------------------
+
+#' Load the season-guarded QB committee config
+#'
+#' Flagged teams (uncertain QB rooms) get every listed QB projected as a
+#' full-time starter, so the board shows each candidate's ceiling. The CSV is
+#' hard-scoped to the run season: a 2026 row can only ever apply to a 2026 run.
+#'
+#' @param path Character. Path to the committee CSV.
+#' @param season Integer. Run season; only rows matching it are applied.
+#' @return Tibble (team, qb_id, committee_group) for this season, else empty.
+#' @keywords internal
+.load_qb_committees <- function(path = QB_COMMITTEES_PATH, season = SEASON) {
+
+  empty <- tibble::tibble(team = character(), qb_id = character(),
+                          committee_group = character())
+
+  if (!file.exists(path)) return(empty)
+
+  raw <- tryCatch(readr::read_csv(path, show_col_types = FALSE),
+                  error = function(e) NULL)
+  if (is.null(raw) || nrow(raw) == 0L) return(empty)
+
+  req <- c("season", "team", "qb_id", "committee_group")
+  if (length(setdiff(req, names(raw))) > 0L) {
+    warning(glue("QB committees CSV missing columns: ",
+                 "{paste(setdiff(req, names(raw)), collapse = ', ')}. Ignored."),
+            call. = FALSE)
+    return(empty)
+  }
+
+  out <- raw %>%
+    dplyr::mutate(.season = suppressWarnings(as.integer(.data$season))) %>%
+    dplyr::filter(.data$.season == as.integer(season)) %>%
+    dplyr::transmute(
+      team            = .normalize_team_codes(as.character(.data$team)),
+      qb_id           = as.character(.data$qb_id),
+      committee_group = as.character(.data$committee_group)
+    ) %>%
+    dplyr::filter(.data$team %in% ACTIVE_TEAMS_2026, !is.na(.data$qb_id)) %>%
+    dplyr::distinct(.data$team, .data$qb_id, .keep_all = TRUE)
+
+  if (nrow(out) > 0L) {
+    message(glue("  QB committees: {nrow(out)} candidate(s) across ",
+                 "{dplyr::n_distinct(out$team)} team(s) for season {season}"))
+  }
+  out
+}
+
+#' Score committee candidates on the league-starter z-scale
+#'
+#' Recovers the cpoe/epa distribution from the resolved-starter pool (so the
+#' scale is identical to .score_qb_starters and non-committee output is
+#' untouched), then z-scores each candidate. Candidates with fewer than
+#' min_dropbacks prior-season dropbacks (e.g. rookies) land neutral (0).
+#'
+#' @param committee Tibble from .load_qb_committees().
+#' @param qb_stats_2025 Per-qb_id prior-season stats attached to the quality
+#'   table (qb_cpoe_mean, qb_epa_per_db, n_dropbacks). May be NULL.
+#' @param main_quality The resolved-starter quality table (defines the pool).
+#' @param min_dropbacks Integer qualification threshold.
+#' @return committee with an added qb_quality_score column.
+#' @keywords internal
+.score_committee_candidates <- function(committee, qb_stats_2025, main_quality,
+                                        min_dropbacks = MIN_DROPBACKS_QB) {
+
+  if (nrow(committee) == 0L) {
+    return(committee %>% dplyr::mutate(qb_quality_score = numeric(0)))
+  }
+  if (is.null(qb_stats_2025) || nrow(qb_stats_2025) == 0L) {
+    message("  Committee scoring: no prior-season QB stats -- all neutral")
+    return(committee %>% dplyr::mutate(qb_quality_score = 0))
+  }
+
+  pool <- main_quality %>%
+    dplyr::select(.data$qb_id) %>%
+    dplyr::inner_join(qb_stats_2025, by = "qb_id") %>%
+    dplyr::filter(!is.na(.data$n_dropbacks), .data$n_dropbacks >= min_dropbacks)
+
+  cpoe_mean <- mean(pool$qb_cpoe_mean, na.rm = TRUE)
+  cpoe_sd   <- stats::sd(pool$qb_cpoe_mean, na.rm = TRUE)
+  epa_mean  <- mean(pool$qb_epa_per_db, na.rm = TRUE)
+  epa_sd    <- stats::sd(pool$qb_epa_per_db, na.rm = TRUE)
+  if (is.na(cpoe_mean)) cpoe_mean <- 0
+  if (is.na(epa_mean))  epa_mean  <- 0
+  if (is.na(cpoe_sd) || cpoe_sd <= 0) cpoe_sd <- 1
+  if (is.na(epa_sd)  || epa_sd  <= 0) epa_sd  <- 1
+
+  committee %>%
+    dplyr::left_join(
+      qb_stats_2025 %>% dplyr::select(.data$qb_id, .data$qb_cpoe_mean,
+                                      .data$qb_epa_per_db, .data$n_dropbacks),
+      by = "qb_id"
+    ) %>%
+    dplyr::mutate(
+      .qualifies = !is.na(.data$n_dropbacks) &
+        .data$n_dropbacks >= min_dropbacks,
+      .cpoe_z = dplyr::if_else(.data$.qualifies,
+                               (.data$qb_cpoe_mean - cpoe_mean) / cpoe_sd, 0),
+      .epa_z  = dplyr::if_else(.data$.qualifies,
+                               (.data$qb_epa_per_db - epa_mean) / epa_sd, 0),
+      qb_quality_score = dplyr::if_else(.data$.qualifies,
+                                        (.data$.cpoe_z + .data$.epa_z) / 2, 0)
+    ) %>%
+    dplyr::select(.data$team, .data$qb_id, .data$committee_group,
+                  .data$qb_quality_score)
+}
+
+#' Fan committee teams into one row per listed candidate (Option A)
+#'
+#' Replaces each committee team's single resolved-starter row with exactly the
+#' listed candidates. Each candidate's passing is the resolved starter's passing
+#' scaled by the ratio of quality adjustments; team volume and SOS are shared,
+#' so the ratio is exact and no re-run is needed. If a committee team's resolved
+#' starter is not on the list, a loud warning names him and he is dropped.
+#'
+#' @param output The finished per-team output (has qb_id, qb_quality_score,
+#'   projected_* columns, one row per team).
+#' @param committee_scored Tibble (team, qb_id, committee_group,
+#'   qb_quality_score) from .score_committee_candidates().
+#' @return output with committee teams fanned and a committee_group column.
+#' @keywords internal
+.append_committee_qb_rows <- function(output, committee_scored) {
+
+  output <- output %>% dplyr::mutate(committee_group = NA_character_)
+  if (nrow(committee_scored) == 0L) return(output)
+
+  comm_teams <- unique(committee_scored$team)
+
+  for (tm in comm_teams) {
+    resolved <- output$qb_id[output$team == tm]
+    listed   <- committee_scored$qb_id[committee_scored$team == tm]
+    miss <- setdiff(resolved[!is.na(resolved)], listed)
+    if (length(miss) > 0L) {
+      warning(glue("Committee team {tm}: R/30-resolved starter(s) ",
+                   "{paste(miss, collapse = ', ')} not in the committee list; ",
+                   "dropped (Option A)."), call. = FALSE)
+    }
+  }
+
+  keep <- output %>% dplyr::filter(!.data$team %in% comm_teams)
+  base <- output %>%
+    dplyr::filter(.data$team %in% comm_teams) %>%
+    dplyr::select(-committee_group) %>%
+    dplyr::rename(start_qb_id = qb_id, start_q = qb_quality_score)
+
+  eff <- QB_EFFICIENCY_SENSITIVITY
+  vol <- QB_VOLUME_SENSITIVITY
+
+  fanned <- committee_scored %>%
+    dplyr::rename(cand_q = qb_quality_score) %>%
+    dplyr::left_join(base, by = "team") %>%
+    dplyr::mutate(
+      ratio_eff  = (1 + .data$cand_q * eff) / (1 + .data$start_q * eff),
+      ratio_pass = (1 + .data$cand_q * vol) / (1 + .data$start_q * vol),
+      ratio_rush = (2 - (1 + .data$cand_q * vol)) /
+                   (2 - (1 + .data$start_q * vol)),
+      qb_quality_score      = .data$cand_q,
+      projected_pass_pg     = .data$projected_pass_pg * .data$ratio_pass,
+      projected_rush_pg     = .data$projected_rush_pg * .data$ratio_rush,
+      projected_pass_yds_pg = .data$projected_pass_yds_pg * .data$ratio_eff,
+      projected_pass_tds_pg = .data$projected_pass_tds_pg * .data$ratio_eff
+    ) %>%
+    dplyr::select(dplyr::any_of(names(output)))
+
+  dplyr::bind_rows(keep, fanned) %>%
+    dplyr::arrange(.data$team, dplyr::desc(.data$qb_quality_score))
+}
+
+# ------------------------------------------------------------------------------
 # project_team_volumes
 # ------------------------------------------------------------------------------
 
@@ -2479,7 +2664,16 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   output <- projected %>%
     dplyr::mutate(
       season     = SEASON,
-      schema_tag = SCHEMA_TAG
+      schema_tag = R30_SCHEMA_TAG
+    ) %>%
+    # Carry the resolved 2026 starter gsis into the output. .compute_qb_quality
+    # _index() resolves it (STEP 5) but .apply_qb_quality_adjustment() only
+    # pulled qb_quality_score across, so qb_id was computed and then dropped
+    # before output. Downstream R/32 uses qb_id as a QB1 starter consistency
+    # check. One row per team, so this join does not fan out.
+    dplyr::left_join(
+      qb_quality %>% dplyr::select(.data$team, .data$qb_id),
+      by = "team"
     ) %>%
     dplyr::select(
       .data$team, .data$season, .data$games_observed,
@@ -2491,7 +2685,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
       .data$coach_pass_pg, .data$coach_rush_pg, .data$coach_proe,
       .data$blended_pass_pg, .data$blended_rush_pg,
       .data$blended_plays_pg, .data$blended_proe,
-      .data$qb_quality_score,
+      .data$qb_quality_score, .data$qb_id,
       .data$pass_sos_factor, .data$rush_sos_factor,
       .data$projected_pass_pg, .data$projected_rush_pg,
       .data$projected_plays_pg,
@@ -2501,13 +2695,23 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
     ) %>%
     dplyr::arrange(.data$team)
 
+  # Committee QB rooms: fan flagged teams into one row per listed candidate,
+  # each valued as a full-time starter (adds committee_group; NA elsewhere).
+  committee <- .load_qb_committees(season = SEASON)
+  committee_scored <- .score_committee_candidates(
+    committee      = committee,
+    qb_stats_2025  = attr(qb_quality, "qb_stats_2025"),
+    main_quality   = qb_quality
+  )
+  output <- .append_committee_qb_rows(output, committee_scored)
+
   # Save outputs
   if (save_output) {
-    dir.create(dirname(OUTPUT_RDS_PATH), recursive = TRUE, showWarnings = FALSE)
-    saveRDS(output, OUTPUT_RDS_PATH)
-    readr::write_csv(output, OUTPUT_CSV_PATH)
-    message(glue("\n  Saved: {OUTPUT_RDS_PATH}"))
-    message(glue("  Saved: {OUTPUT_CSV_PATH}"))
+    dir.create(dirname(R30_OUTPUT_RDS_PATH), recursive = TRUE, showWarnings = FALSE)
+    saveRDS(output, R30_OUTPUT_RDS_PATH)
+    readr::write_csv(output, R30_OUTPUT_CSV_PATH)
+    message(glue("\n  Saved: {R30_OUTPUT_RDS_PATH}"))
+    message(glue("  Saved: {R30_OUTPUT_CSV_PATH}"))
   }
 
   # KEY INSIGHTS (computed from output, never hardcoded)

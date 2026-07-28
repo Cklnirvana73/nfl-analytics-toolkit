@@ -26,8 +26,10 @@
 # NEW PARAMETERS vs SEASON 1
 # ---------------------------
 #   first_down_points    : Points per first down earned (rush or receiving)
-#   long_td_bonus        : Bonus points for TDs over long_td_threshold yards
-#   long_td_threshold    : Yardage threshold for long TD bonus (default 40)
+#   long_td_tiers        : list(pass=, rush=, rec=), each a NAMED numeric vector
+#                          keyed on yardage threshold, e.g. c("40" = 2, "50" = 4).
+#                          Highest matching tier wins (not cumulative). >= semantics.
+#                          NULL, or a missing component, means no bonus.
 #   hundred_yard_bonus   : Bonus for 100+ rushing or receiving yards in a game
 #   superflex_pass_td    : Passing TD value for superflex leagues (4 or 6)
 #   two_point_conversion : Points for a successful 2-point conversion
@@ -97,6 +99,44 @@ TWO_PT_SUCCESS_VALUE <- "success"
 # Minimum plays to consider a player active in a game (sanity check)
 MIN_PLAYS_FOR_APPEARANCE <- 1L
 
+# ------------------------------------------------------------------------------
+# DK_BEST_BALL_SCORING
+# ------------------------------------------------------------------------------
+# DraftKings Best Ball, DK's DFS classic scoring (verified 2026-07-11):
+#   full PPR; 0.04 / pass yd; 4 / pass TD; -1 INT; -1 fumble lost;
+#   0.1 / rush yd; 6 / rush TD; 0.1 / rec yd; 6 / rec TD;
+#   +3 at 100 rush yds (game); +3 at 100 rec yds (game); +3 at 300 pass yds (game).
+# No long-TD bonus, so long_td_tiers = NULL.
+#
+# [2026-07-16] MOVED HERE from R/45:61 and R/46:203, where it was DUAL-DEFINED.
+# Both copies were identical, so source order never produced a wrong board, but
+# it was a coin flip: whichever file sourced last silently won. That went from
+# harmless to live the moment R/17's signature changed, because R/45's copy
+# still carried the retired long_td_bonus / long_td_threshold and R/46's did
+# not, so the surviving definition decided whether a board built or threw
+# unused-argument. Same bug class as DEFAULT_SCORING_SETTINGS being defined in
+# both R/29 and R/32.
+#
+# It lives in R/17 because R/17 is the only leaf in the chain (it sources
+# nothing), because every consumer already sources it to reach
+# calculate_fantasy_points_ext(), and because this list is not really config: it
+# is a list of R/17's OWN parameter names, which is exactly why it broke in two
+# places at once. R/42 looked like the conceptual home, but R/42 pulls in R/19
+# and R/34, which would drag the Sleeper API into a backtest harness.
+#
+# Any league config in R/17's schema (e.g. from R/42) can be passed instead.
+DK_BEST_BALL_SCORING <- list(
+  pass_yd = 0.04, pass_td = 4, pass_int = -1, pick6_penalty = 0,
+  rush_yd = 0.1, rush_td = 6,
+  rec_yd = 0.1, rec_td = 6, ppr = 1, fumbles = -1,
+  use_tiered_ppr = FALSE, te_premium = FALSE, rush_att_bonus = 0,
+  first_down_points = 0, long_td_tiers = NULL,
+  hundred_yard_bonus = 3, superflex_pass_td = 0, two_point_conversion = 2,
+  sack_penalty = 0, tiered_rec_tiers = NULL,
+  bonus_pass_yd_300 = 3, bonus_pass_yd_400 = 0,
+  bonus_rec_yd_200 = 0, bonus_rush_yd_200 = 0, pass_2pt = 0
+)
+
 # ==============================================================================
 # SECTION 2: MAIN FUNCTION
 # ==============================================================================
@@ -146,12 +186,17 @@ MIN_PLAYS_FOR_APPEARANCE <- 1L
 #'   via rush or reception (NOT pass completions that happen to gain a first
 #'   down -- only the rusher/receiver earns this). Common Sleeper value: 0.5.
 #'   Default 0.
-#' @param long_td_bonus Numeric. Bonus points for a touchdown play that exceeds
-#'   long_td_threshold yards. Applied on top of standard TD points.
-#'   Common Sleeper value: 2.0. Default 0.
-#' @param long_td_threshold Integer. Yardage threshold for long_td_bonus.
-#'   Play yardage must be STRICTLY GREATER THAN this value.
-#'   Common Sleeper values: 25, 40, 50. Default 40.
+#' @param long_td_tiers Named list with optional components \code{pass},
+#'   \code{rush}, \code{rec}. Each is a NAMED numeric vector whose names are
+#'   yardage thresholds and whose values are the bonus, e.g.
+#'   \code{c("40" = 2, "50" = 4)}. A TD play earns the bonus of the HIGHEST
+#'   threshold it meets, not the sum: under that example a 55-yard TD pays 4,
+#'   not 6. Comparison is \code{>=}. Applied on top of standard TD points.
+#'   NULL (default) or an absent component means no long-TD bonus.
+#'
+#'   Replaces long_td_bonus / long_td_threshold [2026-07-16]. Those could not
+#'   express per-stat-type or multi-tier bonuses, and used \code{>} semantics
+#'   which forced callers to pass threshold = 49 to mean "50 or more".
 #' @param hundred_yard_bonus Numeric. Bonus for reaching 100 rushing or
 #'   100 receiving yards in a single game. Applied once per player per game
 #'   per category. Common Sleeper value: 3.0. Default 0.
@@ -267,8 +312,7 @@ MIN_PLAYS_FOR_APPEARANCE <- 1L
 #'   roster_data         = roster,
 #'   season              = 2024L,
 #'   first_down_points   = 0.5,
-#'   long_td_bonus       = 2.0,
-#'   long_td_threshold   = 40L,
+#'   long_td_tiers       = list(rec = c("40" = 2), rush = c("40" = 2)),
 #'   hundred_yard_bonus  = 3.0,
 #'   two_point_conversion = 2.0,
 #'   sack_penalty        = -1.0
@@ -303,7 +347,8 @@ MIN_PLAYS_FOR_APPEARANCE <- 1L
 #'   systems     = list(
 #'     Default = list(),
 #'     Sleeper = list(first_down_points = 0.5, hundred_yard_bonus = 3.0,
-#'                    long_td_bonus = 2.0, two_point_conversion = 2.0)
+#'                    long_td_tiers = list(rec = c("40" = 2)),
+#'                    two_point_conversion = 2.0)
 #'   )
 #' )
 #' }
@@ -336,8 +381,7 @@ calculate_fantasy_points_ext <- function(
   rush_att_bonus       = 0.25,
   # --- New Season 2 parameters (default to 0 = no effect) ---
   first_down_points    = 0,
-  long_td_bonus        = 0,
-  long_td_threshold    = 40L,
+  long_td_tiers        = NULL,
   hundred_yard_bonus   = 0,
   superflex_pass_td    = 0,
   two_point_conversion = 0,
@@ -383,7 +427,7 @@ calculate_fantasy_points_ext <- function(
     pick6_penalty = pick6_penalty, rush_yd = rush_yd, rush_td = rush_td,
     rec_yd = rec_yd, rec_td = rec_td, ppr = ppr, fumbles = fumbles,
     rush_att_bonus = rush_att_bonus, first_down_points = first_down_points,
-    long_td_bonus = long_td_bonus, long_td_threshold = long_td_threshold,
+    long_td_tiers = long_td_tiers,
     hundred_yard_bonus = hundred_yard_bonus, superflex_pass_td = superflex_pass_td,
     two_point_conversion = two_point_conversion, sack_penalty = sack_penalty,
     tiered_rec_tiers = tiered_rec_tiers,
@@ -486,6 +530,7 @@ calculate_fantasy_points_ext <- function(
     pick6_penalty     = pick6_penalty,
     sack_penalty      = sack_penalty,
     fumbles           = fumbles,
+    long_td_tiers     = long_td_tiers,
     bonus_pass_yd_300 = bonus_pass_yd_300,
     bonus_pass_yd_400 = bonus_pass_yd_400
   )
@@ -499,8 +544,7 @@ calculate_fantasy_points_ext <- function(
     rush_att_bonus    = rush_att_bonus,
     fumbles           = fumbles,
     first_down_points = first_down_points,
-    long_td_bonus     = long_td_bonus,
-    long_td_threshold = long_td_threshold,
+    long_td_tiers     = long_td_tiers,
     hundred_yard_bonus = hundred_yard_bonus,
     bonus_rush_yd_200  = bonus_rush_yd_200
   )
@@ -517,8 +561,7 @@ calculate_fantasy_points_ext <- function(
     te_premium        = te_premium,
     position_lookup   = position_lookup,
     first_down_points = first_down_points,
-    long_td_bonus     = long_td_bonus,
-    long_td_threshold  = long_td_threshold,
+    long_td_tiers     = long_td_tiers,
     hundred_yard_bonus = hundred_yard_bonus,
     tiered_rec_tiers   = tiered_rec_tiers,
     bonus_rec_yd_200   = bonus_rec_yd_200
@@ -705,9 +748,104 @@ calculate_fantasy_points_ext <- function(
 #'   pass_fantasy_points.
 #'
 #' @keywords internal
+# ------------------------------------------------------------------------------
+# .long_td_pts  -- shared long-TD tier engine
+# ------------------------------------------------------------------------------
+#' Long-TD bonus points for a vector of plays, highest matching tier wins.
+#'
+#' @param yards Numeric vector. Play yardage (rushing_yards, receiving_yards,
+#'   or passing_yards depending on the component).
+#' @param is_td Vector coercible to integer. 1/TRUE on touchdown plays.
+#' @param tiers NAMED numeric vector, names are yardage thresholds, e.g.
+#'   \code{c("40" = 2, "50" = 4)}. NULL or length 0 returns all zeros.
+#'
+#' @details
+#' Semantics are \code{>=} and NOT cumulative. Under c("40"=2, "50"=4) a
+#' 55-yard TD pays 4, a 45-yard TD pays 2, a 39-yard TD pays 0. This matches
+#' Sleeper, which treats rec_td_40p / rec_td_50p as separate tiers where the
+#' highest applicable one is credited.
+#'
+#' The predecessor (long_td_bonus + long_td_threshold) used \code{>}, which is
+#' why R/19 passed threshold = 49 to mean "50 or more". That hack is retired.
+#'
+#' @return Numeric vector, same length as yards.
+#' @keywords internal
+.long_td_pts <- function(yards, is_td, tiers) {
+  n_out <- length(yards)
+  if (is.null(tiers) || length(tiers) == 0L) return(rep(0, n_out))
+
+  thr <- suppressWarnings(as.numeric(names(tiers)))
+  if (any(is.na(thr))) {
+    stop("long_td_tiers names must parse as numeric yardage thresholds.", call. = FALSE)
+  }
+  ord <- order(thr, decreasing = TRUE)
+  thr <- thr[ord]
+  val <- as.numeric(tiers)[ord]
+
+  y  <- dplyr::coalesce(as.numeric(yards), 0)
+  td <- dplyr::coalesce(as.integer(is_td), 0L) == 1L
+
+  out     <- rep(0, n_out)
+  matched <- rep(FALSE, n_out)
+  for (i in seq_along(thr)) {
+    hit <- !matched & td & (y >= thr[i])
+    out[hit] <- val[i]
+    matched  <- matched | hit
+  }
+  out
+}
+
+
+#' Validate a long_td_tiers specification.
+#'
+#' @param x The candidate long_td_tiers value.
+#' @param name Character. Parameter name for error text.
+#' @return Character vector of errors, empty if valid.
+#' @keywords internal
+.validate_long_td_tiers <- function(x, name = "long_td_tiers") {
+  if (is.null(x)) return(character(0))
+  if (!is.list(x)) {
+    return(glue::glue(
+      "{name} must be NULL or a named list with components pass/rush/rec, ",
+      "each a named numeric vector such as c(\"40\" = 2, \"50\" = 4)."
+    ))
+  }
+  errs <- character(0)
+  ok_names <- c("pass", "rush", "rec")
+  bad <- setdiff(names(x), ok_names)
+  if (length(bad) > 0L) {
+    errs <- c(errs, glue::glue(
+      "{name} has unknown components: {paste(bad, collapse = ', ')}. ",
+      "Allowed: {paste(ok_names, collapse = ', ')}."
+    ))
+  }
+  for (comp in intersect(names(x), ok_names)) {
+    v <- x[[comp]]
+    if (is.null(v) || length(v) == 0L) next
+    if (!is.numeric(v)) {
+      errs <- c(errs, glue::glue("{name}${comp} must be numeric.")); next
+    }
+    if (is.null(names(v)) || any(!nzchar(names(v)))) {
+      errs <- c(errs, glue::glue(
+        "{name}${comp} must be NAMED; names are yardage thresholds, ",
+        "e.g. c(\"40\" = 2, \"50\" = 4)."
+      )); next
+    }
+    thr <- suppressWarnings(as.numeric(names(v)))
+    if (any(is.na(thr))) {
+      errs <- c(errs, glue::glue("{name}${comp} names must parse as numbers."))
+    } else {
+      if (any(thr < 0)) errs <- c(errs, glue::glue("{name}${comp} thresholds must be >= 0."))
+      if (anyDuplicated(thr) > 0L) errs <- c(errs, glue::glue("{name}${comp} has duplicate thresholds."))
+    }
+  }
+  errs
+}
+
+
 .build_ext_passing_fantasy <- function(
   pbp, pass_yd, pass_td, pass_int, pick6_penalty, sack_penalty, fumbles,
-  bonus_pass_yd_300 = 0, bonus_pass_yd_400 = 0
+  long_td_tiers = NULL, bonus_pass_yd_300 = 0, bonus_pass_yd_400 = 0
 ) {
 
   # Guard: coalesce optional columns to 0 before use
@@ -724,10 +862,31 @@ calculate_fantasy_points_ext <- function(
   has_return_td <- "return_touchdown" %in% names(pbp)
 
   # ---- Pass plays: pass_attempt OR sack, excluding spikes/two-points ----
+  #
+  # play_type filter added [2026-07-15]. Previously this component had none,
+  # while .build_ext_rushing_fantasy() did (play_type %in% c("run")). That
+  # inconsistency let plays outside the offensive universe produce player-game
+  # rows: across 2010-2025, 28 no_play, 2 punt and 1 field_goal rows carry
+  # pass_attempt or sack. They are worth ~0 points (the passes are incomplete),
+  # but they create player-games. A blocked punt in 2016_17_JAX_IND, on which
+  # punter P.McAfee was thrown an incomplete pass, gave him a third game here
+  # while build_player_season_panel() saw two -- that panel filters to
+  # play_type %in% c("pass","run") up front (R/16:844-849).
+  #
+  # Verified before adding: in 2016 all 1,172 sacks are play_type == "pass",
+  # and pass_attempt == 1 appears only under pass (20,294), qb_spike (71),
+  # no_play (4) and punt (1). So this filter drops no real pass plays and no
+  # sacks. qb_spike is already excluded by name below.
+  #
+  # Two-point conversions are NOT affected: .build_two_point_fantasy() reads
+  # pbp_filtered independently (R/17:526), so the 6-in-113 two-point plays that
+  # nflfastR tags no_play still score. That is why this filter lives inside the
+  # component rather than on the function's input.
   pass_plays <- pbp %>%
     dplyr::filter(
       !is.na(passer_player_id),
       !is.na(passer_player_name),
+      play_type %in% c("pass", "run"),
       (
         dplyr::coalesce(pass_attempt, 0L) == 1L |
         dplyr::coalesce(sack, 0L) == 1L
@@ -739,6 +898,20 @@ calculate_fantasy_points_ext <- function(
   if (nrow(pass_plays) == 0) {
     return(.empty_passing_component())
   }
+
+  # Long passing TD bonus, play level [2026-07-16].
+  # Sleeper sends pass_td_40p / pass_td_50p. Before this the passing component
+  # took no long-TD parameter at all, so a QB's long-TD credit was silently
+  # dropped even for leagues that scored it. Same play the receiver earns
+  # rec_td_*; both are credited independently, which is Sleeper's behaviour.
+  pass_plays <- pass_plays %>%
+    dplyr::mutate(
+      long_td_pts_play = .long_td_pts(
+        yards = passing_yards,
+        is_td = pass_touchdown,
+        tiers = long_td_tiers[["pass"]]
+      )
+    )
 
   pass_agg <- pass_plays %>%
     dplyr::group_by(
@@ -773,6 +946,7 @@ calculate_fantasy_points_ext <- function(
         passer_player_id == fumbled_1_player_id,
         na.rm = TRUE
       )),
+      long_td_pass_pts = sum(long_td_pts_play, na.rm = TRUE),
 
       .groups = "drop"
     ) %>%
@@ -783,7 +957,8 @@ calculate_fantasy_points_ext <- function(
         (pass_ints       * pass_int) +
         (pick6_count     * pick6_penalty) +
         (sacks_taken     * sack_penalty) +
-        (pass_fumbles_lost * fumbles),
+        (pass_fumbles_lost * fumbles) +
+        long_td_pass_pts,
       # Passing yardage milestone bonuses (cumulative: 400+ also earns 300+ bonus)
       pass_milestone_pts =
         dplyr::if_else(pass_yards >= 300, bonus_pass_yd_300, 0) +
@@ -792,7 +967,7 @@ calculate_fantasy_points_ext <- function(
     dplyr::select(
       season, week, game_id, player_id, player_name, team, position,
       pass_yards, pass_tds, pass_ints, sacks_taken,
-      pass_fantasy_points, pass_milestone_pts
+      pass_fantasy_points, pass_milestone_pts, long_td_pass_pts
     )
 
   return(pass_agg)
@@ -806,7 +981,7 @@ calculate_fantasy_points_ext <- function(
     team = character(), position = character(),
     pass_yards = numeric(), pass_tds = integer(), pass_ints = integer(),
     sacks_taken = integer(), pass_fantasy_points = numeric(),
-    pass_milestone_pts = numeric()
+    pass_milestone_pts = numeric(), long_td_pass_pts = numeric()
   )
 }
 
@@ -824,8 +999,8 @@ calculate_fantasy_points_ext <- function(
 #' @param pbp Filtered play-by-play tibble
 #' @param rush_yd,rush_td,rush_att_bonus,fumbles Numeric. Scoring parameters.
 #' @param first_down_points Numeric. Bonus per first down.
-#' @param long_td_bonus Numeric. Bonus for long TDs.
-#' @param long_td_threshold Integer. Yardage threshold for long TD bonus.
+#' @param long_td_tiers Named list(pass=, rush=, rec=). See
+#'   calculate_fantasy_points_ext(). Only the rush component is read here.
 #' @param hundred_yard_bonus Numeric. Bonus for 100+ rushing yards in a game.
 #'
 #' @return Tibble with columns: season, week, game_id, player_id, player_name,
@@ -839,7 +1014,7 @@ calculate_fantasy_points_ext <- function(
 #' @keywords internal
 .build_ext_rushing_fantasy <- function(
   pbp, rush_yd, rush_td, rush_att_bonus, fumbles,
-  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus,
+  first_down_points, long_td_tiers, hundred_yard_bonus,
   bonus_rush_yd_200 = 0
 ) {
 
@@ -873,13 +1048,18 @@ calculate_fantasy_points_ext <- function(
     return(.empty_rushing_component())
   }
 
-  # Determine if rush was a long TD (rushing_yards > threshold AND rush_touchdown)
+  # Long rushing TD bonus, play level [2026-07-16].
+  # Was a single >-threshold flag times one bonus. Now a tier lookup so a
+  # league scoring rush_td_40p = 2 and rush_td_50p = 4 gets both, with the
+  # highest matching tier credited. See .long_td_pts().
   rush_plays <- rush_plays %>%
     dplyr::mutate(
-      is_long_rush_td = (
-        dplyr::coalesce(rush_touchdown, 0L) == 1L &
-        dplyr::coalesce(rushing_yards, 0)  > long_td_threshold
-      )
+      long_td_pts_play = .long_td_pts(
+        yards = rushing_yards,
+        is_td = rush_touchdown,
+        tiers = long_td_tiers[["rush"]]
+      ),
+      is_long_rush_td = long_td_pts_play > 0
     )
 
   rush_agg <- rush_plays %>%
@@ -909,6 +1089,7 @@ calculate_fantasy_points_ext <- function(
 
       # Long TD count (for bonus)
       long_rush_tds = as.integer(sum(is_long_rush_td, na.rm = TRUE)),
+      long_td_rush_pts_sum = sum(long_td_pts_play, na.rm = TRUE),
 
       .groups = "drop"
     ) %>%
@@ -924,7 +1105,7 @@ calculate_fantasy_points_ext <- function(
       rush_first_down_pts = rush_first_downs * first_down_points,
 
       # Long TD bonus (rushing)
-      long_td_rush_pts = long_rush_tds * long_td_bonus,
+      long_td_rush_pts = long_td_rush_pts_sum,
 
       # Yardage milestone bonus (cumulative: 200+ yards also earns 100-yard bonus)
       hundred_yard_rush_pts =
@@ -972,7 +1153,7 @@ calculate_fantasy_points_ext <- function(
 #' @param use_tiered_ppr Logical. Use tiered reception scoring.
 #' @param te_premium Logical. Add TE premium per reception.
 #' @param position_lookup Optional tibble with player_id, position columns.
-#' @param first_down_points,long_td_bonus,long_td_threshold,hundred_yard_bonus
+#' @param first_down_points,long_td_tiers,hundred_yard_bonus
 #'   Numeric. New Season 2 parameters.
 #'
 #' @return Tibble with columns for receiving fantasy points and raw stats.
@@ -981,7 +1162,7 @@ calculate_fantasy_points_ext <- function(
 .build_ext_receiving_fantasy <- function(
   pbp, rec_yd, rec_td, ppr, fumbles,
   use_tiered_ppr, te_premium, position_lookup,
-  first_down_points, long_td_bonus, long_td_threshold, hundred_yard_bonus,
+  first_down_points, long_td_tiers, hundred_yard_bonus,
   tiered_rec_tiers = NULL, bonus_rec_yd_200 = 0
 ) {
 
@@ -993,10 +1174,17 @@ calculate_fantasy_points_ext <- function(
   # Filter to completed receptions and targets (complete_pass for receptions,
   # pass_attempt for targets). Exclude two-point attempts and incomplete passes
   # for yardage but keep targets for counting.
+  # play_type filter added [2026-07-15]. See the equivalent note in
+  # .build_ext_passing_fantasy(). This component previously had no play_type
+  # filter while .build_ext_rushing_fantasy() did, which is how an incomplete
+  # pass thrown to a punter on a blocked punt (play_type == "punt") produced a
+  # receiving player-game row. Two-point plays are unaffected: they are excluded
+  # here by two_pt_vec and scored separately by .build_two_point_fantasy().
   target_plays <- pbp %>%
     dplyr::filter(
       !is.na(receiver_player_id),
       !is.na(receiver_player_name),
+      play_type %in% c("pass", "run"),
       dplyr::coalesce(pass_attempt, 0L) == 1L,
       two_pt_vec == 0L
     )
@@ -1018,10 +1206,12 @@ calculate_fantasy_points_ext <- function(
   target_plays <- target_plays %>%
     dplyr::mutate(
       is_reception  = dplyr::coalesce(complete_pass, 0L) == 1L,
-      is_long_rec_td = (
-        dplyr::coalesce(pass_touchdown, 0L) == 1L &
-        dplyr::coalesce(receiving_yards, 0) > long_td_threshold
+      long_td_pts_play = .long_td_pts(
+        yards = receiving_yards,
+        is_td = pass_touchdown,
+        tiers = long_td_tiers[["rec"]]
       ),
+      is_long_rec_td = long_td_pts_play > 0,
       # Tiered PPR: per-play reception value using active_tiers
       # (either from tiered_rec_tiers param or TIERED_PPR_BREAKS default)
       tiered_ppr_pts = dplyr::case_when(
@@ -1063,6 +1253,7 @@ calculate_fantasy_points_ext <- function(
         na.rm = TRUE
       )),
       long_rec_tds     = as.integer(sum(is_long_rec_td, na.rm = TRUE)),
+      long_td_rec_pts_sum = sum(long_td_pts_play, na.rm = TRUE),
       tiered_ppr_total = sum(tiered_ppr_pts, na.rm = TRUE),
 
       .groups = "drop"
@@ -1084,7 +1275,7 @@ calculate_fantasy_points_ext <- function(
       rec_first_down_pts = rec_first_downs * first_down_points,
 
       # Long TD bonus (receiving)
-      long_td_rec_pts = long_rec_tds * long_td_bonus,
+      long_td_rec_pts = long_td_rec_pts_sum,
 
       # Yardage milestone bonus (cumulative: 200+ yards also earns 100-yard bonus)
       hundred_yard_rec_pts =
@@ -1314,7 +1505,7 @@ calculate_fantasy_points_ext <- function(
 #' \dontrun{
 #' result <- validate_ext_scoring_params(
 #'   pass_yd = 0.04, pass_td = 6, pass_int = -2,
-#'   long_td_threshold = 40L
+#'   long_td_tiers = list(rec = c("40" = 2, "50" = 4))
 #' )
 #' if (!result$valid) stop(paste(result$errors, collapse = "\n"))
 #' }
@@ -1325,7 +1516,7 @@ validate_ext_scoring_params <- function(
   rush_yd = 0.1, rush_td = 6,
   rec_yd = 0.1, rec_td = 6, ppr = 1, fumbles = -2,
   rush_att_bonus = 0.25,
-  first_down_points = 0, long_td_bonus = 0, long_td_threshold = 40L,
+  first_down_points = 0, long_td_tiers = NULL,
   hundred_yard_bonus = 0, superflex_pass_td = 0,
   two_point_conversion = 0, sack_penalty = 0,
   tiered_rec_tiers  = NULL,
@@ -1358,8 +1549,6 @@ validate_ext_scoring_params <- function(
 
   # Season 2 parameters
   assert_numeric_scalar(first_down_points,    "first_down_points")
-  assert_numeric_scalar(long_td_bonus,        "long_td_bonus")
-  assert_numeric_scalar(long_td_threshold,    "long_td_threshold")
   assert_numeric_scalar(hundred_yard_bonus,   "hundred_yard_bonus")
   assert_numeric_scalar(superflex_pass_td,    "superflex_pass_td")
   assert_numeric_scalar(two_point_conversion, "two_point_conversion")
@@ -1391,11 +1580,19 @@ validate_ext_scoring_params <- function(
     warnings <- c(warnings,
       "sack_penalty is positive -- sacks will award points to QB. Verify intent.")
   }
-  if (is.numeric(long_td_threshold) && long_td_threshold < 10) {
-    warnings <- c(warnings, glue(
-      "long_td_threshold = {long_td_threshold} is very low. ",
-      "Most short passes will trigger the bonus."
-    ))
+  ltd_errs <- .validate_long_td_tiers(long_td_tiers, "long_td_tiers")
+  if (length(ltd_errs) > 0L) errors <- c(errors, ltd_errs)
+
+  for (.comp in intersect(names(long_td_tiers), c("pass", "rush", "rec"))) {
+    .v <- long_td_tiers[[.comp]]
+    if (is.null(.v) || length(.v) == 0L || is.null(names(.v))) next
+    .thr <- suppressWarnings(as.numeric(names(.v)))
+    if (!any(is.na(.thr)) && any(.thr < 10)) {
+      warnings <- c(warnings, glue(
+        "long_td_tiers${.comp} has a threshold under 10 yards. ",
+        "Most short plays will trigger the bonus."
+      ))
+    }
   }
   if (is.numeric(superflex_pass_td) && superflex_pass_td != 0 &&
       is.numeric(pass_td) && superflex_pass_td == pass_td) {
@@ -1449,7 +1646,8 @@ validate_ext_scoring_params <- function(
 #'   systems     = list(
 #'     Default  = list(),
 #'     Sleeper  = list(first_down_points = 0.5, hundred_yard_bonus = 3.0,
-#'                     long_td_bonus = 2.0, two_point_conversion = 2.0),
+#'                     long_td_tiers = list(rec = c("40" = 2)),
+#'                     two_point_conversion = 2.0),
 #'     Superflex = list(superflex_pass_td = 6.0, first_down_points = 0.5)
 #'   )
 #' )
@@ -1580,8 +1778,7 @@ get_ext_scoring_defaults <- function(show_new_only = FALSE) {
 
   season2_defaults <- list(
     first_down_points    = 0,
-    long_td_bonus        = 0,
-    long_td_threshold    = 40L,
+    long_td_tiers        = NULL,
     hundred_yard_bonus   = 0,
     superflex_pass_td    = 0,
     two_point_conversion = 0,

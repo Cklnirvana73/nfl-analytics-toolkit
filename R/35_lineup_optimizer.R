@@ -151,11 +151,15 @@ SCHEMA_TAG_LINEUP <- "s2_w16_lineup_v1"
 LINEUP_OFFENSE_POSITIONS <- c("QB", "RB", "WR", "TE")
 
 # Slot eligibility: which lineup slots each position may legally fill.
+# Includes Sleeper's restricted flex variants (REC_FLEX = WR/TE,
+# WRRB_FLEX = RB/WR) and K, so no position with a required slot is silently
+# dropped by the solver.
 SLOT_ELIGIBILITY <- list(
   QB  = c("QB", "SUPER_FLEX"),
-  RB  = c("RB", "FLEX", "SUPER_FLEX"),
-  WR  = c("WR", "FLEX", "SUPER_FLEX"),
-  TE  = c("TE", "FLEX", "SUPER_FLEX"),
+  RB  = c("RB", "FLEX", "WRRB_FLEX", "SUPER_FLEX"),
+  WR  = c("WR", "FLEX", "REC_FLEX", "WRRB_FLEX", "SUPER_FLEX"),
+  TE  = c("TE", "FLEX", "REC_FLEX", "SUPER_FLEX"),
+  K   = c("K"),
   DEF = c("DEF")
 )
 
@@ -810,6 +814,23 @@ compute_def_matchup_factors <- function(seasons = SEASON - 1L,
 }
 
 # ------------------------------------------------------------------------------
+# .norm_team_code
+# ------------------------------------------------------------------------------
+
+# Team-code aliases across data sources (nflverse vs Sleeper), applied before
+# comparing DEF identities (e.g. nflverse "LA" vs Sleeper "LAR").
+TEAM_CODE_ALIASES <- c(LA = "LAR", JAC = "JAX", WSH = "WAS",
+                       OAK = "LV", SD = "LAC", STL = "LAR")
+
+#' Normalize a team abbreviation for cross-source comparison. Vectorized.
+#' @keywords internal
+.norm_team_code <- function(code) {
+  code <- toupper(trimws(as.character(code)))
+  alias <- unname(TEAM_CODE_ALIASES[code])
+  dplyr::coalesce(alias, code)
+}
+
+# ------------------------------------------------------------------------------
 # assemble_player_pool
 # ------------------------------------------------------------------------------
 
@@ -904,16 +925,34 @@ assemble_player_pool <- function(source, reconciled, vorp, def_proj,
     dplyr::pull(name_key)
   user_gsis <- source$user_roster_gsis
 
+  # DEF membership: Sleeper stores a team defense's player_id as the team
+  # abbreviation itself (e.g. "NE", position "DEF") with no gsis and no
+  # matchable full name, so neither the gsis path nor the name-key path above
+  # can ever hit a rostered DEF. Resolve DEFs by normalized team code instead.
+  def_rows <- roster_named %>%
+    dplyr::filter(dplyr::coalesce(.data$sp_pos, "") == "DEF" |
+                    grepl("^[A-Z]{2,3}$", .data$player_id))
+  all_def_teams  <- unique(.norm_team_code(def_rows$player_id))
+  user_def_teams <- if (is.na(user_rid)) character(0) else
+    unique(.norm_team_code(
+      def_rows$player_id[def_rows$roster_id == user_rid]
+    ))
+
   pool %>%
     dplyr::mutate(
       pool_key       = paste(.norm_name(.data$player_name),
                              toupper(.data$position)),
+      def_team_key   = dplyr::if_else(.data$position == "DEF",
+                                      .norm_team_code(.data$team),
+                                      NA_character_),
       on_user_roster = .data$nfl_gsis_id %in% user_gsis |
-                         .data$pool_key %in% user_key,
+                         .data$pool_key %in% user_key |
+                         .data$def_team_key %in% user_def_teams,
       is_available   = !(.data$nfl_gsis_id %in% all_rostered_gsis |
-                           .data$pool_key %in% all_rostered_key)
+                           .data$pool_key %in% all_rostered_key |
+                           .data$def_team_key %in% all_def_teams)
     ) %>%
-    dplyr::select(-pool_key)
+    dplyr::select(-pool_key, -def_team_key)
 }
 
 # ------------------------------------------------------------------------------
@@ -1085,7 +1124,11 @@ compute_player_values <- function(pool,
     WR         = as.numeric(st$WR %||% 0),
     TE         = as.numeric(st$TE %||% 0),
     FLEX       = as.numeric(source$config$flex %||% 0),
+    REC_FLEX   = as.numeric(source$config$rec_flex %||% 0),
+    WRRB_FLEX  = as.numeric(source$config$wrrb_flex %||% 0),
     SUPER_FLEX = as.numeric(source$config$superflex %||% 0),
+    # K/DEF counts come from the raw roster_positions (R/33 config drops them).
+    K          = as.numeric(sum(source$roster_positions == "K", na.rm = TRUE)),
     DEF        = as.numeric(source$def_slots %||% 0)
   )
   caps[caps > 0]
@@ -1120,6 +1163,19 @@ compute_player_values <- function(pool,
                       slots)
     for (s in elig) cols[[length(cols) + 1L]] <- c(i = i, s = match(s, slots))
   }
+
+  # A required slot with zero eligible candidates (e.g. K when the pool carries
+  # no kicker projections) cannot be filled -- say so loudly instead of
+  # silently returning a short lineup.
+  covered_slots <- unique(vapply(cols, function(cc) as.integer(cc[["s"]]),
+                                 integer(1)))
+  uncovered <- slots[!seq_along(slots) %in% covered_slots]
+  if (length(uncovered) > 0L) {
+    warning(glue("No eligible candidates for required lineup slot(s): ",
+                 "{paste(uncovered, collapse = ', ')} -- ",
+                 "returned lineup will be short."), call. = FALSE)
+  }
+
   if (length(cols) == 0L) {
     return(tibble::tibble(nfl_gsis_id = character(), slot = character()))
   }
@@ -1170,14 +1226,16 @@ compute_player_values <- function(pool,
 #' Confidence flag per started slot
 #'
 #' Offense: compares the starter's 80% interval to the best benched alternative
-#' eligible for the same slot. Non-overlapping (starter lower >= alt upper) is
-#' "confident"; overlapping is "close"; no alternative is "no_alt". DEF uses a
-#' fixed PPG gap against the next-best available defense.
+#' eligible for the same slot, with both interval bounds scaled by the same
+#' matchup factor applied to each player's mean, so the comparison happens on
+#' the matchup-adjusted scale throughout. Non-overlapping (starter lower >=
+#' alt upper) is "confident"; overlapping is "close"; no alternative is
+#' "no_alt". DEF uses a fixed PPG gap against the next-best available defense.
 #'
 #' @param starters Tibble of started players with slot, position, lower_80,
-#'   upper_80, adj_proj.
+#'   upper_80, matchup_factor, adj_proj.
 #' @param alternatives Tibble of non-started eligible players (bench + available
-#'   for DEF) with position, lower_80, upper_80, adj_proj.
+#'   for DEF) with position, lower_80, upper_80, matchup_factor, adj_proj.
 #' @param def_gap_threshold Numeric PPG gap for the DEF flag.
 #' @return starters with confidence_flag added.
 #' @keywords internal
@@ -1202,9 +1260,13 @@ compute_player_values <- function(pool,
       dplyr::filter(.data$position %in% elig_pos)
     if (nrow(alt) == 0L) return("no_alt")
     best_idx <- which.max(alt$adj_proj)
-    alt_upper <- alt$upper_80[best_idx]
-    if (is.na(row$lower_80) || is.na(alt_upper)) return("close")
-    if (row$lower_80 >= alt_upper) "confident" else "close"
+    # Scale both interval bounds by the same matchup factor applied to the
+    # means, so the interval test is consistent with the adj_proj selection.
+    alt_upper <- alt$upper_80[best_idx] *
+      dplyr::coalesce(alt$matchup_factor[best_idx], 1)
+    s_lower <- row$lower_80 * dplyr::coalesce(row$matchup_factor, 1)
+    if (is.na(s_lower) || is.na(alt_upper)) return("close")
+    if (s_lower >= alt_upper) "confident" else "close"
   }
 
   flags <- vapply(seq_len(nrow(starters)),
@@ -1256,24 +1318,12 @@ optimize_lineup <- function(source, reconciled, vorp, def_proj,
   pool <- assemble_player_pool(source, reconciled, vorp, def_proj,
                                roll3 = roll3, roll3_weight = roll3_weight)
 
-  # Restrict to the user's roster: offense by gsis, DEF by team membership.
-  user_def_teams <- source$rosters_resolved %>%
-    dplyr::filter(roster_id == as.integer(source$user_roster_id)) %>%
-    dplyr::pull(player_id)
-  # DEF pseudo-ids are "DEF_<team>"; we keep any DEF whose team's gsis-less
-  # Sleeper slot is on the user roster is non-trivial, so we keep all DEF on the
-  # roster by matching the projected team to the user's rostered DEF where the
-  # Sleeper player_id position is DEF. Simpler and robust: keep DEF rows whose
-  # team appears among the user's rostered Sleeper DEF entries.
-  user_def_team_codes <- source$players %>%
-    dplyr::filter(.data$position == "DEF",
-                  .data$sleeper_player_id %in% user_def_teams) %>%
-    dplyr::pull(.data$team)
-
+  # Restrict to the user's roster. on_user_roster covers offense (gsis and
+  # name-key paths) and DEF (Sleeper stores a DEF's player_id as the team
+  # abbreviation; assemble_player_pool resolves DEF membership by normalized
+  # team code).
   roster_pool <- pool %>%
-    dplyr::filter(.data$on_user_roster |
-                    (.data$position == "DEF" &
-                       .data$team %in% user_def_team_codes))
+    dplyr::filter(.data$on_user_roster)
 
   # Availability gate: both out_for_season and out_week cannot start this week.
   vals <- compute_player_values(roster_pool, format = "redraft",
@@ -1519,15 +1569,28 @@ suggest_waiver_adds <- function(source, reconciled, vorp, def_proj,
 
   baseline   <- lineup_points(user_gsis)
 
-  # Candidate available players (offense). Prefilter to those who could plausibly
-  # crack the lineup: projection above the current worst starter at an eligible
-  # slot. This prunes hundreds of free agents to a handful before full solves.
-  starters_now <- pool %>%
-    dplyr::filter(.data$nfl_gsis_id %in% user_gsis,
-                  !.data$availability_status %in%
+  # Baseline optimal lineup, solved once and reused for both the candidate
+  # prefilter and the drop candidate.
+  base_set <- pool %>% dplyr::filter(.data$nfl_gsis_id %in% user_gsis)
+  base_startable <- base_set %>%
+    dplyr::filter(!.data$availability_status %in%
                     c("out_for_season", "out_week"))
-  worst_start <- if (nrow(starters_now) == 0L) -Inf else
-    min(starters_now$base_proj, na.rm = TRUE)
+  base_adj <- .apply_matchup(base_startable, week_matchups, dvp, def_factors)
+  base_assign <- .solve_lineup_ip(
+    base_adj %>% dplyr::transmute(nfl_gsis_id, position,
+                                  opt_value = .data$adj_proj),
+    slot_caps
+  )
+
+  # Candidate available players (offense). Prefilter to those who could
+  # plausibly crack the lineup: projection above the weakest player in the
+  # baseline OPTIMAL lineup (not the weakest rostered startable, which is
+  # usually a deep bench stash and prunes almost nothing). This trims hundreds
+  # of free agents to a handful before the per-candidate full solves.
+  optimal_starters <- base_startable %>%
+    dplyr::filter(.data$nfl_gsis_id %in% base_assign$nfl_gsis_id)
+  worst_start <- if (nrow(optimal_starters) == 0L) -Inf else
+    min(optimal_starters$base_proj, na.rm = TRUE)
 
   candidates <- pool %>%
     dplyr::filter(.data$is_available,
@@ -1545,16 +1608,6 @@ suggest_waiver_adds <- function(source, reconciled, vorp, def_proj,
 
   # Drop candidate: lowest format-value roster player NOT in the current optimal
   # lineup (bench), falling back to lowest overall if the bench is empty.
-  base_set <- pool %>% dplyr::filter(.data$nfl_gsis_id %in% user_gsis)
-  base_startable <- base_set %>%
-    dplyr::filter(!.data$availability_status %in%
-                    c("out_for_season", "out_week"))
-  base_adj <- .apply_matchup(base_startable, week_matchups, dvp, def_factors)
-  base_assign <- .solve_lineup_ip(
-    base_adj %>% dplyr::transmute(nfl_gsis_id, position,
-                                  opt_value = .data$adj_proj),
-    slot_caps
-  )
   drop_pool <- base_set %>%
     dplyr::filter(!.data$nfl_gsis_id %in% base_assign$nfl_gsis_id)
   if (nrow(drop_pool) == 0L) drop_pool <- base_set

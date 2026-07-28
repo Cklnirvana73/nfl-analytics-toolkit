@@ -286,8 +286,22 @@ prepare_model_features <- function(feature_matrix,
   # --- Step 3: Determine each player's team-week coverage ---
   # A player's coverage = weeks their team played while they were on that team.
   # For traded players, use the team recorded in the feature matrix per week.
+  # IDENTITY KEYS NEVER INCLUDE player_name: pbp spells some players' names
+  # differently across games (e.g. "Chig Okonkwo" vs "Chigoziem Okonkwo").
+  # Grouping the spine by name splits one player_id into two spines, whose
+  # expanded week ranges then duplicate every player-week downstream. One
+  # canonical display name per player_id is resolved here and re-attached
+  # after the spine is built.
+  canonical_names <- fm %>%
+    filter(!is.na(player_name)) %>%
+    count(player_id, player_name, name = ".n_name") %>%
+    group_by(player_id) %>%
+    slice_max(.n_name, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(player_id, player_name)
+
   player_team_map <- fm %>%
-    select(player_id, player_name, position_group, season, team, week) %>%
+    select(player_id, position_group, season, team, week) %>%
     distinct()
 
   # Full player-position-season-team-week spine.
@@ -295,7 +309,7 @@ prepare_model_features <- function(feature_matrix,
   # so a player's week 1-8 in 2024 does not bleed into their 2025 schedule.
   player_spine <- player_team_map %>%
     left_join(team_weeks, by = c("season", "team", "week")) %>%
-    group_by(player_id, player_name, position_group, season, team) %>%
+    group_by(player_id, position_group, season, team) %>%
     group_modify(function(df, keys) {
       team_wks <- team_weeks %>%
         filter(team == keys$team[1], season == keys$season[1]) %>%
@@ -306,7 +320,8 @@ prepare_model_features <- function(feature_matrix,
       relevant_wks <- intersect(team_wks, player_wks)
       tibble(week = relevant_wks)
     }) %>%
-    ungroup()
+    ungroup() %>%
+    left_join(canonical_names, by = "player_id")
 
   # --- Step 4: Left join feature matrix onto full spine ---
   # Weeks where player appeared: all features populated
@@ -371,6 +386,27 @@ prepare_model_features <- function(feature_matrix,
            -.team_games_through_now, -.games_played_through_now) %>%
     ungroup()
 
+  # --- Step 5b: Enforce one row per player-position-week ---
+  # A player with non-contiguous stints (team A -> team B -> team A, e.g.
+  # journeyman QBs and practice-squad moves) gets OVERLAPPING team spines:
+  # team A's spine spans min(week):max(week) of his A appearances, which
+  # crosses his team-B weeks. His real team-B row then coexists with a
+  # phantom team-A "absence" row for the same week, duplicating the
+  # player-week grain and corrupting every downstream join and paired test.
+  # Resolution: the real (non-absence) row always wins; when only absence
+  # rows exist for a week, keep exactly one (deterministic by team).
+  .n_before <- nrow(full_matrix)
+  full_matrix <- full_matrix %>%
+    group_by(player_id, position_group, season, week) %>%
+    arrange(is_absence_week, team, .by_group = TRUE) %>%
+    slice(1L) %>%
+    ungroup()
+  .n_dropped <- .n_before - nrow(full_matrix)
+  if (.n_dropped > 0) {
+    message(glue("  Removed {.n_dropped} overlapping-spine duplicate row(s) ",
+                 "(phantom absence weeks from non-contiguous team stints)."))
+  }
+
   # --- Step 6: Compute PPR fantasy points per player-week ---
   # PPR scoring applied to raw play-level data for the same season.
   # Join to feature matrix by player_id + position_group + week.
@@ -384,51 +420,96 @@ prepare_model_features <- function(feature_matrix,
       qb_spike == 0
     )
 
-  # Passer PPR: passing yards * 0.04, pass TDs * 4, interceptions * -2
-  passer_ppr <- pbp_season %>%
+  # Per-player-week scoring components. Fantasy production is player-level:
+  # a QB's rushing and an RB's receiving count toward their weekly PPR total,
+  # so components are computed once per player-week and then combined per
+  # position group below. Each component includes the fumble-lost penalty
+  # (-2 per fumble lost by the ball-carrier on that component's plays) and
+  # 2-pt conversions (+2 per two_point_conv_result == "success").
+
+  # Passing component: pass yards * 0.04, pass TDs * 4, INTs * -2
+  pass_stats <- pbp_season %>%
     filter(!is.na(passer_player_id)) %>%
     group_by(season, week, player_id = passer_player_id) %>%
     summarise(
-      pass_yards  = sum(passing_yards, na.rm = TRUE),
-      pass_tds    = sum(pass_touchdown == 1, na.rm = TRUE),
+      pass_yards    = sum(passing_yards, na.rm = TRUE),
+      pass_tds      = sum(pass_touchdown == 1, na.rm = TRUE),
       interceptions = sum(interception == 1, na.rm = TRUE),
+      # Fumbles on non-completed pass plays (strip sacks, aborted snaps)
+      # attributed to the passer; completed-pass fumbles go to the receiver.
+      pass_fumbles_lost = sum(fumble_lost == 1 & coalesce(complete_pass, 0) != 1,
+                              na.rm = TRUE),
+      pass_two_pt   = sum(two_point_conv_result == "success", na.rm = TRUE),
       .groups = "drop"
     ) %>%
     mutate(
-      ppr_points = pass_yards * 0.04 + pass_tds * 4 - interceptions * 2,
+      pass_points = pass_yards * 0.04 + pass_tds * 4 - interceptions * 2 -
+        pass_fumbles_lost * 2 + pass_two_pt * 2
+    )
+
+  # Rushing component: rush yards * 0.1, rush TDs * 6 (includes QB scrambles
+  # and designed runs -- rusher_player_id is the QB on those plays)
+  rush_stats <- pbp_season %>%
+    filter(play_type == "run", !is.na(rusher_player_id)) %>%
+    group_by(season, week, player_id = rusher_player_id) %>%
+    summarise(
+      rush_yards        = sum(rushing_yards, na.rm = TRUE),
+      rush_tds          = sum(rush_touchdown == 1, na.rm = TRUE),
+      rush_fumbles_lost = sum(fumble_lost == 1, na.rm = TRUE),
+      rush_two_pt       = sum(two_point_conv_result == "success", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rush_points = rush_yards * 0.1 + rush_tds * 6 -
+        rush_fumbles_lost * 2 + rush_two_pt * 2
+    )
+
+  # Receiving component: receptions * 1, rec yards * 0.1, rec TDs * 6.
+  # Receiving TDs are pass TDs where this player is the receiver --
+  # return_touchdown (defensive/return scores) must NOT be counted here.
+  rec_stats <- pbp_season %>%
+    filter(play_type == "pass", !is.na(receiver_player_id)) %>%
+    group_by(season, week, player_id = receiver_player_id) %>%
+    summarise(
+      receptions       = sum(complete_pass == 1, na.rm = TRUE),
+      rec_yards        = sum(receiving_yards[complete_pass == 1], na.rm = TRUE),
+      rec_tds          = sum(pass_touchdown == 1 & complete_pass == 1, na.rm = TRUE),
+      rec_fumbles_lost = sum(fumble_lost == 1 & complete_pass == 1, na.rm = TRUE),
+      rec_two_pt       = sum(two_point_conv_result == "success", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rec_points = receptions * 1 + rec_yards * 0.1 + rec_tds * 6 -
+        rec_fumbles_lost * 2 + rec_two_pt * 2
+    )
+
+  # Passer group target: passing production PLUS the QB's own rushing
+  # production (scrambles and designed runs).
+  passer_ppr <- pass_stats %>%
+    left_join(rush_stats %>% select(season, week, player_id, rush_points),
+              by = c("season", "week", "player_id")) %>%
+    mutate(
+      ppr_points     = pass_points + coalesce(rush_points, 0),
       position_group = "passer"
     )
 
-  # Rusher PPR: rush yards * 0.1, rush TDs * 6, receptions * 1, rec yards * 0.1
-  # Rushing receivers (RBs who catch passes) counted in receiver group
-  rusher_ppr <- pbp_season %>%
-    filter(play_type == "run", !is.na(rusher_player_id),
-           # Exclude QB scrambles from rusher PPR -- already in passer group
-           coalesce(qb_scramble, 0) == 0) %>%
-    group_by(season, week, player_id = rusher_player_id) %>%
-    summarise(
-      rush_yards = sum(rushing_yards, na.rm = TRUE),
-      rush_tds   = sum(rush_touchdown == 1, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
+  # Rusher group target: rushing production PLUS the player's receiving
+  # production (receptions, receiving yards, receiving TDs).
+  rusher_ppr <- rush_stats %>%
+    left_join(rec_stats %>% select(season, week, player_id, rec_points),
+              by = c("season", "week", "player_id")) %>%
     mutate(
-      ppr_points = rush_yards * 0.1 + rush_tds * 6,
+      ppr_points     = rush_points + coalesce(rec_points, 0),
       position_group = "rusher"
     )
 
-  # Receiver PPR: receptions * 1, rec yards * 0.1, rec TDs * 6
-  receiver_ppr <- pbp_season %>%
-    filter(play_type == "pass", !is.na(receiver_player_id),
-           complete_pass == 1) %>%
-    group_by(season, week, player_id = receiver_player_id) %>%
-    summarise(
-      receptions = n(),
-      rec_yards  = sum(receiving_yards, na.rm = TRUE),
-      rec_tds    = sum(return_touchdown == 1 | pass_touchdown == 1, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
+  # Receiver group target: receiving production PLUS the player's rushing
+  # production (jet sweeps, pass-catching RBs' carries).
+  receiver_ppr <- rec_stats %>%
+    left_join(rush_stats %>% select(season, week, player_id, rush_points),
+              by = c("season", "week", "player_id")) %>%
     mutate(
-      ppr_points = receptions * 1 + rec_yards * 0.1 + rec_tds * 6,
+      ppr_points     = rec_points + coalesce(rush_points, 0),
       position_group = "receiver"
     )
 
@@ -448,6 +529,29 @@ prepare_model_features <- function(feature_matrix,
       # Absent weeks have no PPR points by definition
       ppr_points_this_week = ifelse(is_absence_week, NA_real_, ppr_points_this_week)
     )
+
+  # --- Step 6b: Trailing fantasy production features ---
+  # Boom weeks are TD- and reception-volume-driven, which EPA aggregates
+  # undersell. Lagged before rolling so week N uses weeks <= N-1 only.
+  # ppr_best_prior3 (best recent week) is the player's demonstrated ceiling.
+  full_matrix <- full_matrix %>%
+    group_by(player_id, position_group, season, team) %>%
+    arrange(week, .by_group = TRUE) %>%
+    mutate(
+      .ppr_lag = lag(ppr_points_this_week),
+      ppr_roll3 = as.numeric(zoo::rollapplyr(
+        .ppr_lag, 3,
+        function(x) { x <- x[!is.na(x)]; if (length(x) == 0) NA_real_ else mean(x) },
+        partial = TRUE, fill = NA
+      )),
+      ppr_best_prior3 = as.numeric(zoo::rollapplyr(
+        .ppr_lag, 3,
+        function(x) { x <- x[!is.na(x)]; if (length(x) == 0) NA_real_ else max(x) },
+        partial = TRUE, fill = NA
+      ))
+    ) %>%
+    select(-.ppr_lag) %>%
+    ungroup()
 
   # --- Step 7: Build next-week prediction target ---
   # ppr_points_next_week = the PPR points in the FOLLOWING week.
@@ -481,6 +585,10 @@ prepare_model_features <- function(feature_matrix,
         coalesce(opponent_tier, "unknown"),
         levels = c("elite", "above_avg", "average", "below_avg", "poor", "unknown")
       ),
+      next_opp_tier = factor(
+        coalesce(next_opp_tier, "unknown"),
+        levels = c("elite", "above_avg", "average", "below_avg", "poor", "unknown")
+      ),
       position_group = factor(position_group,
                               levels = c("passer", "rusher", "receiver")),
       role_stability_flag = as.integer(role_stability_flag)
@@ -503,6 +611,13 @@ prepare_model_features <- function(feature_matrix,
       # Opponent features (Layer 6)
       opp_adjusted_epa_prior, schedule_difficulty_rank,
       opp_adj_games_prior, opponent_style, opponent_tier,
+      # Next-week matchup + Vegas game environment (target-week context).
+      # These previously existed in the feature matrix but were dropped here,
+      # so no model ever saw them.
+      next_opponent, next_opp_def_epa_allowed, next_opp_tier,
+      next_team_spread, next_game_total, next_implied_total,
+      # Trailing fantasy production (boom signal: recent output + ceiling)
+      ppr_roll3, ppr_best_prior3,
       # Role continuity features
       weeks_played, weeks_since_role_change, role_stability_flag,
       # Target variable
@@ -637,8 +752,6 @@ train_fantasy_model <- function(ml_data,
     }
   }
 
-  set.seed(seed)
-
   # Features to exclude from the model matrix (identifiers and targets)
   id_cols <- c(
     "season", "week", "player_id", "player_name", "team", "opponent",
@@ -647,8 +760,14 @@ train_fantasy_model <- function(ml_data,
 
   results <- list()
 
-  for (pos in positions) {
+  for (pos_idx in seq_along(positions)) {
+    pos <- positions[pos_idx]
     message(glue("\n--- Training model: position = {pos} ---"))
+
+    # Seed per position (seed + position index) so each position's run is
+    # independently reproducible regardless of which positions are requested
+    # or in what order earlier positions consumed random numbers.
+    set.seed(seed + pos_idx)
 
     # Filter to this position, training rows only
     # Absent weeks excluded (no target), non-target rows excluded
@@ -1267,7 +1386,7 @@ evaluate_model <- function(model_result, ml_data, position) {
   test_preds <- predict(fitted_wf, new_data = test_data) %>%
     rename(predicted_ppr = .pred) %>%
     mutate(predicted_ppr = pmax(predicted_ppr, 0)) %>%
-    bind_cols(test_data %>% select(player_id, player_name, week,
+    bind_cols(test_data %>% select(player_id, player_name, position_group, week,
                                    ppr_points_next_week, ppr_points_this_week,
                                    epa_season_to_date))
 
@@ -1292,14 +1411,19 @@ evaluate_model <- function(model_result, ml_data, position) {
   )
 
   # --- Baseline 2: Season-to-date average ---
-  # Join season-avg from training data per player
+  # Join season-avg from training data per player.
+  # NOTE: under a multi-season split (train = prior seasons, test = holdout
+  # season) this is a PRIOR-SEASON average, not a season-to-date average of
+  # the test season.
   season_avg_train <- train_data %>%
     group_by(player_id, position_group) %>%
     summarise(season_avg_ppr = mean(ppr_points_this_week, na.rm = TRUE),
               .groups = "drop")
 
   baseline_sa <- test_preds %>%
-    left_join(season_avg_train, by = c("player_id")) %>%
+    left_join(season_avg_train,
+              by = c("player_id", "position_group"),
+              relationship = "many-to-one") %>%
     filter(!is.na(season_avg_ppr)) %>%
     rename(baseline_pred = season_avg_ppr)
 

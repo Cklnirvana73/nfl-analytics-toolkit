@@ -273,7 +273,12 @@ train_model_suite <- function(
                         # accidental activation when def_styles is added.
                         # Fix via expanding-window classify_defensive_style()
                         # before re-enabling. See docs/Week11_Leakage_Audit.txt.
-                        "opponent_style", "opponent_tier")
+                        "opponent_style", "opponent_tier",
+                        # next_opp_tier: same full-season leakage as
+                        # opponent_tier. next_opponent: 32-team identifier --
+                        # matchup strength enters via next_opp_def_epa_allowed
+                        # (expanding, leakage-safe), not 32 one-hot dummies.
+                        "next_opponent", "next_opp_tier")
 
   # Keep availability features -- they are legitimate predictors, not leakage
   # (they are computed from history up to current week, not the next week)
@@ -296,12 +301,13 @@ train_model_suite <- function(
   # ---- Build temporal CV folds (week-level, expanding window) ---------------
   # Each fold trains on all earlier weeks, validates on the next single week.
   # n_folds determines how many validation weeks are used within train_weeks.
+  # Validation weeks are the LAST n_folds weeks present in the training data.
   # Example with n_folds=5, train_weeks=1:14:
-  #   Fold 1: train weeks 1-10, validate week 11
-  #   Fold 2: train weeks 1-11, validate week 12
+  #   Fold 1: train weeks 1-9,  validate week 10
+  #   Fold 2: train weeks 1-10, validate week 11
   #   ...
-  #   Fold 5: train weeks 1-14, validate week 15  <-- just outside train_weeks
-  # This is intentional: the last fold validates against the earliest test week.
+  #   Fold 5: train weeks 1-13, validate week 14
+  # All folds stay inside train_weeks -- test weeks are never used for CV.
 
   all_train_weeks <- sort(unique(train_data$week))
   fold_val_weeks  <- tail(all_train_weeks, n_folds)  # last n_folds weeks as val
@@ -562,8 +568,8 @@ train_model_suite <- function(
 #'     \item \code{metrics_table}  Tibble. One row per model. Columns:
 #'       model (chr), rmse (dbl), mae (dbl), rsq (dbl), n_test (int).
 #'     \item \code{weekly_errors}  Tibble. Per-week per-model absolute error.
-#'       Columns: week (int), model (chr), abs_error (dbl), actual (dbl),
-#'       predicted (dbl), player_id (chr).
+#'       Columns: season (int), week (int), model (chr), abs_error (dbl),
+#'       actual (dbl), player_id (chr).
 #'     \item \code{wilcoxon_tests} Tibble. Pairwise Wilcoxon results.
 #'       Columns: comparison (chr), p_value (dbl), significant (lgl),
 #'       better_model (chr).
@@ -667,19 +673,45 @@ compare_models <- function(
   )
 
   if (baselines) {
-    # Persistence baseline: predict last week's actual score
+    grand_mean_ppr <- mean(suite_list$train$ppr_points_next_week, na.rm = TRUE)
+
+    # Per-player mean PPR over the training window. Used to impute the
+    # persistence baseline and as the season-average baseline (falling back
+    # to the grand training mean for players unseen in training).
+    player_mean_vec <- rep(NA_real_, length(actual))
+    train_raw <- suite_list$train_raw
+    if (!is.null(train_raw) &&
+        "player_id" %in% names(test_raw) &&
+        all(c("player_id", "ppr_points_next_week") %in% names(train_raw))) {
+      player_train_means <- train_raw %>%
+        dplyr::group_by(player_id) %>%
+        dplyr::summarise(
+          player_mean_ppr = mean(ppr_points_next_week, na.rm = TRUE),
+          .groups = "drop"
+        )
+      player_mean_vec <- player_train_means$player_mean_ppr[
+        match(test_raw$player_id, player_train_means$player_id)
+      ]
+    }
+
+    # Persistence baseline: predict last week's actual score.
     if ("ppr_points_this_week" %in% names(test_raw)) {
-      persist_pred <- pmax(test_raw$ppr_points_this_week, 0, na.rm = TRUE)
-      persist_pred[is.na(persist_pred)] <- mean(actual, na.rm = TRUE)
+      # Impute NA BEFORE clipping: pmax(..., na.rm = TRUE) silently converts
+      # NA to 0, so the old mean-imputation step never fired and the
+      # persistence baseline was understated.
+      persist_pred <- dplyr::coalesce(
+        test_raw$ppr_points_this_week, player_mean_vec, grand_mean_ppr
+      )
+      persist_pred <- pmax(persist_pred, 0)
       metrics_table <- dplyr::bind_rows(
         metrics_table,
         compute_metrics(persist_pred, "persistence_baseline")
       )
     }
 
-    # Season-average baseline: mean of all training actuals
-    season_avg    <- mean(suite_list$train$ppr_points_next_week, na.rm = TRUE)
-    season_pred   <- rep(season_avg, length(actual))
+    # Season-average baseline: per-player training mean, grand training mean
+    # for players unseen in training.
+    season_pred   <- dplyr::coalesce(player_mean_vec, grand_mean_ppr)
     metrics_table <- dplyr::bind_rows(
       metrics_table,
       compute_metrics(season_pred, "season_avg_baseline")
@@ -691,8 +723,37 @@ compare_models <- function(
 
   # ---- Per-week absolute errors (for Wilcoxon tests) -----------------------
 
+  # Duplicate guard: the paired Wilcoxon tests require exactly one row per
+  # player-week. Duplicates here mean an upstream join fanned out (the known
+  # cause: player_name used as an identity key while pbp spells names
+  # inconsistently). Fail loudly with the offending keys instead of letting
+  # pivot_wider produce list-cols and wilcox.test throw "'x' must be numeric".
+  # The key must include season: with multi-season training data the same
+  # player legitimately appears in week 15 of 2023, 2024, and 2025.
+  .dup_keys <- tibble::tibble(
+    player_id = test_raw$player_id,
+    season    = test_raw$season,
+    week      = test_raw$week
+  ) %>%
+    dplyr::count(player_id, season, week) %>%
+    dplyr::filter(n > 1L)
+  if (nrow(.dup_keys) > 0L) {
+    stop(glue(
+      "compare_models(): {nrow(.dup_keys)} duplicated player-season-week ",
+      "key(s) in the test set ",
+      "(e.g. {paste(utils::head(unique(.dup_keys$player_id), 3), collapse = ', ')}). ",
+      "An upstream join fanned out -- rebuild ml_data (force_rerun = TRUE) ",
+      "and fix the feature-matrix grain before comparing models."
+    ), call. = FALSE)
+  }
+
+  # season is part of the pairing identity: without it, pivot_wider collapses
+  # rows from different seasons that share (player_id, week, actual) -- e.g.
+  # a backup QB with actual = 0 in week 16 of two seasons -- into list-cols,
+  # which then crashes wilcox.test with "'x' must be numeric".
   weekly_errors <- tibble::tibble(
     player_id  = test_raw$player_id,
+    season     = test_raw$season,
     week       = test_raw$week,
     actual     = actual,
     xgboost    = abs(actual - xgb_pred),
@@ -1202,10 +1263,30 @@ select_features <- function(
   )
 
   if (!is.null(en_engine)) {
-    # glmnet returns a matrix of coefficients; extract at the best lambda
-    best_lambda <- en_engine$lambda[which.min(en_engine$dev.ratio < 1)]
-    en_coef_raw <- as.matrix(stats::coef(en_engine,
-                                          s = en_engine$lambda[1]))
+    # glmnet returns a full regularization path; coefficients must be pulled
+    # at the lambda actually selected. Prefer the tuned penalty stored in the
+    # parsnip spec (the value used for predictions); fall back to lambda.min
+    # for cv.glmnet objects, then to the largest dev.ratio on the path.
+    # (Previously coef() was pulled at lambda[1] -- the maximum penalty,
+    # i.e. a near-null model with ~all-zero coefficients.)
+    best_lambda <- tryCatch({
+      spec_pen <- rlang::eval_tidy(
+        workflows::extract_spec_parsnip(suite_list$en_fit)$args$penalty
+      )
+      if (is.numeric(spec_pen) && length(spec_pen) == 1L && !is.na(spec_pen)) {
+        spec_pen
+      } else {
+        NULL
+      }
+    }, error = function(e) NULL)
+    if (is.null(best_lambda)) {
+      best_lambda <- if (!is.null(en_engine$lambda.min)) {
+        en_engine$lambda.min
+      } else {
+        en_engine$lambda[which.max(en_engine$dev.ratio)]
+      }
+    }
+    en_coef_raw <- as.matrix(stats::coef(en_engine, s = best_lambda))
     en_coef_df  <- tibble::tibble(
       feature       = rownames(en_coef_raw),
       importance_en = abs(as.numeric(en_coef_raw[, 1]))
@@ -1217,6 +1298,37 @@ select_features <- function(
       importance_en = NA_real_
     )
   }
+
+  # ---- Map baked (one-hot) feature names back to raw feature names ----------
+  # The tree/EN importances are reported on baked dummy names (e.g.
+  # opponent_style_pass_funnel) while feature_cols holds raw names
+  # (opponent_style). Without this mapping, dummy-encoded features silently
+  # fail the importance join below and drop out of consensus_rank.
+  # Longest raw-name prefix before the dummy separator wins; names already in
+  # feature_cols pass through unchanged; importances aggregate by raw name.
+  map_to_raw <- function(imp_df, value_col) {
+    if (nrow(imp_df) == 0L) return(imp_df)
+    raw_of <- vapply(imp_df$feature, function(nm) {
+      if (nm %in% feature_cols) return(nm)
+      cands <- feature_cols[startsWith(nm, paste0(feature_cols, "_"))]
+      if (length(cands) == 0L) return(nm)
+      cands[which.max(nchar(cands))]
+    }, character(1))
+    imp_df %>%
+      dplyr::mutate(feature = unname(raw_of)) %>%
+      dplyr::group_by(feature) %>%
+      dplyr::summarise(
+        dplyr::across(
+          dplyr::all_of(value_col),
+          ~ if (all(is.na(.x))) NA_real_ else sum(.x, na.rm = TRUE)
+        ),
+        .groups = "drop"
+      )
+  }
+
+  xgb_imp    <- map_to_raw(xgb_imp,    "importance_xgb")
+  rf_imp     <- map_to_raw(rf_imp,     "importance_rf")
+  en_coef_df <- map_to_raw(en_coef_df, "importance_en")
 
   # ---- Join all three importance sources ------------------------------------
 
@@ -1488,41 +1600,51 @@ run_full_pipeline <- function(
     pbp <- dplyr::bind_rows(pbp_list)
     rm(pbp_list); gc()
 
-    message("Step 2/5: Computing opponent adjustments...")
+    message("Steps 2-3/5: Opponent adjustments + feature matrix (per season)...")
+    # compile_feature_matrix() accepts a SINGLE season, so it must be looped
+    # over train_seasons and row-bound. (Previously only predict_season was
+    # compiled, so prepare_model_features(seasons = train_seasons) below never
+    # actually received multi-season rows and multi-season training silently
+    # degenerated to a single season.) One season is built at a time to keep
+    # memory bounded.
+    #
     # opp_adjusted activates the expanding-window opponent adjustment inside
-    # compile_feature_matrix(). Without it, opp_adjusted_epa_prior,
-    # schedule_difficulty_rank, and opp_adj_games_prior are all NA.
+    # compile_feature_matrix() (through_week = w-1 per row; leakage-safe).
+    # Without it, opp_adjusted_epa_prior, schedule_difficulty_rank, and
+    # opp_adj_games_prior are all NA.
     # def_styles is intentionally excluded -- full-season leakage identified
     # in Week 11 audit. See docs/Week11_Leakage_Audit.txt.
-    opp_adjusted <- tryCatch(
-      calculate_opponent_adjustments(
-        pbp_data     = pbp,
-        season       = predict_season,
-        week_min     = 1L,
-        week_max     = 22L,
-        min_plays    = 20L,
-        min_def_plays = 100L
-      ),
-      error = function(e) {
-        message(glue("  calculate_opponent_adjustments failed: {conditionMessage(e)}. ",
-                     "Proceeding with opp_adjusted = NULL -- opponent features will be NA."))
-        NULL
+    features <- dplyr::bind_rows(lapply(train_seasons, function(s) {
+      message(glue("  Season {s}: computing opponent adjustments..."))
+      opp_adjusted_s <- tryCatch(
+        calculate_opponent_adjustments(
+          pbp_data      = pbp,
+          season        = s,
+          week_min      = 1L,
+          week_max      = 22L,
+          min_plays     = 20L,
+          min_def_plays = 100L
+        ),
+        error = function(e) {
+          message(glue("  Season {s}: calculate_opponent_adjustments failed: ",
+                       "{conditionMessage(e)}. Proceeding with opp_adjusted = NULL ",
+                       "-- opponent features will be NA."))
+          NULL
+        }
+      )
+      if (!is.null(opp_adjusted_s)) {
+        message(glue("  Season {s}: opponent adjustments computed: ",
+                     "{nrow(opp_adjusted_s)} player-position rows."))
       }
-    )
-    if (!is.null(opp_adjusted)) {
-      message(glue("  Opponent adjustments computed: {nrow(opp_adjusted)} player-position rows."))
-    }
 
-    message("Step 3/5: Compiling feature matrix...")
-    # compile_feature_matrix uses opp_adjusted to run an expanding per-week
-    # opponent adjustment (through_week = w-1 per row). This is leakage-safe.
-    # def_styles = NULL: opponent_style / opponent_tier excluded (leakage, see audit).
-    features <- compile_feature_matrix(
-      pbp_data     = pbp,
-      opp_adjusted = opp_adjusted,
-      def_styles   = NULL,
-      season       = predict_season
-    )
+      message(glue("  Season {s}: compiling feature matrix..."))
+      compile_feature_matrix(
+        pbp_data     = pbp,
+        opp_adjusted = opp_adjusted_s,
+        def_styles   = NULL,
+        season       = s
+      )
+    }))
 
     message("Step 4/5: Building ML-ready data...")
     ml_data <- prepare_model_features(features, pbp, seasons = train_seasons)

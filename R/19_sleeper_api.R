@@ -146,8 +146,11 @@ SLEEPER_DIRECT_MAP <- list(
 #   bonus_rec_yd_100   -> hundred_yard_bonus (receiving component)
 #   bonus_rush_yd_100  -> hundred_yard_bonus (rushing component; merged with rec)
 #   bonus_fd_rb / _wr / _te / _qb -> first_down_points (merged across positions)
-#   bonus_rec_td_50p   -> long_td_bonus, long_td_threshold = 49L (>49 = 50+)
-#   bonus_rush_td_50p  -> long_td_bonus (merged with receiving; same threshold)
+#   rec_td_40p/50p, rush_td_40p/50p, pass_td_40p/50p -> long_td_tiers
+#     (per stat type, per threshold; highest matching tier wins, >= semantics)
+#   rec_2pt / rush_2pt -> two_point_conversion (max if they differ; R/17 has
+#     one scorer value. Sleeper does NOT send two_pt_conv.)
+#   pass_int_td        -> pick6_penalty (additive on top of pass_int)
 #   roster SUPER_FLEX  -> superflex_pass_td flag (detected at league level)
 
 # Sleeper fields known to exist but having no mapping in our function.
@@ -158,16 +161,23 @@ SLEEPER_KNOWN_UNSUPPORTED <- c(
   "def_sack", "def_int", "pts_allow_0", "pts_allow_1_6",
   # Kicker scoring
   "xpmiss", "fgm", "fgm_0_19", "fgm_20_29", "fgm_30_39", "fgm_40_49",
-  # Pick-6 (Sleeper has pass_int_td for this; mapped to a single INT penalty)
-  "pass_int_td",
-  # Incomplete pass penalty
+  # Incomplete pass penalty (no R/17 parameter, no pbp attribution built)
   "pass_inc",
-  # Bonuses that vary by position in a way our function cannot distinguish
-  "bonus_rec_rb", "bonus_rec_wr",
-  # Scorer-specific 2PT fields (two_pt_conv already covers scorer;
-  # rush_2pt/rec_2pt only needed if league differentiates scorer role)
-  "rush_2pt", "rec_2pt"
+  # Position-specific reception bonuses. R/17's ppr/tiered_rec_tiers apply to
+  # all pass catchers; te_premium is the only position-aware hook. An
+  # RB-premium or WR-premium league is NOT currently expressible. Known gap.
+  "bonus_rec_rb", "bonus_rec_wr"
 )
+#
+# REMOVED from this list [2026-07-16], audited across 7 live leagues:
+#   pass_int_td  -- R/17 has had pick6_penalty in its signature all along.
+#                   The comment claimed it was "mapped to a single INT
+#                   penalty". It was not mapped at all. Now wired, STEP 6c.
+#   rec_2pt      -- the comment claimed two_pt_conv covered these. Sleeper
+#   rush_2pt        sends two_pt_conv in 0 of 7 leagues and rec_2pt/rush_2pt
+#                   in 7 of 7. SLEEPER_DIRECT_MAP's two_pt_conv entry has
+#                   never fired; the value only ever arrived from a downstream
+#                   default that happened to match. Now wired, STEP 6b.
 
 
 # ==============================================================================
@@ -188,61 +198,97 @@ SLEEPER_KNOWN_UNSUPPORTED <- c(
 #' @return Parsed R list from the Sleeper JSON response.
 #'   Returns NULL (with warning) on HTTP errors or timeouts.
 #'
+#' @details
+#' Rate limiting: sleeps 0.15s before every request so loops stay well under
+#' Sleeper's ~1,000 requests/hour guidance. On HTTP 429 or 5xx responses the
+#' request is retried up to 3 times with exponential backoff (1s, 2s, 4s),
+#' honoring a Retry-After header when Sleeper sends one.
+#'
 #' @keywords internal
 .sleeper_get <- function(endpoint, timeout_sec = 30L) {
 
   url <- paste0(SLEEPER_BASE_URL, endpoint)
 
-  response <- tryCatch(
-    httr::GET(url, httr::timeout(timeout_sec)),
-    error = function(e) {
-      warning(glue("Sleeper API request failed: {e$message}\nURL: {url}"),
-              call. = FALSE)
+  max_retries <- 3L
+
+  for (attempt in seq_len(max_retries + 1L)) {
+
+    # Small default throttle before every request (rate limiting).
+    Sys.sleep(0.15)
+
+    response <- tryCatch(
+      httr::GET(url, httr::timeout(timeout_sec)),
+      error = function(e) {
+        warning(glue("Sleeper API request failed: {e$message}\nURL: {url}"),
+                call. = FALSE)
+        return(NULL)
+      }
+    )
+
+    if (is.null(response)) {
       return(NULL)
     }
-  )
 
-  if (is.null(response)) {
-    return(NULL)
-  }
+    status <- httr::status_code(response)
 
-  status <- httr::status_code(response)
+    # Retry transient failures (429 rate limit, 5xx server errors) with
+    # exponential backoff. Honor a Retry-After header when present.
+    if ((status == 429L || status >= 500L) && attempt <= max_retries) {
+      retry_after <- suppressWarnings(
+        as.numeric(httr::headers(response)[["retry-after"]] %||% NA_real_)
+      )
+      wait_sec <- if (!is.na(retry_after) && retry_after > 0) {
+        retry_after
+      } else {
+        2 ^ (attempt - 1L)  # 1s, 2s, 4s
+      }
+      message(glue(
+        "Sleeper API returned HTTP {status}; retrying in {wait_sec}s ",
+        "(attempt {attempt} of {max_retries})..."
+      ))
+      Sys.sleep(wait_sec)
+      next
+    }
 
-  if (status == 404L) {
-    warning(glue(
-      "Sleeper API returned 404 (Not Found) for:\n  {url}\n",
-      "Check that the league_id or endpoint path is correct."
-    ), call. = FALSE)
-    return(NULL)
-  }
-
-  if (status == 429L) {
-    warning(glue(
-      "Sleeper API returned 429 (Rate Limited).\n",
-      "Wait a few minutes before retrying. No API key is needed but requests\n",
-      "should stay under approximately 1,000 per hour."
-    ), call. = FALSE)
-    return(NULL)
-  }
-
-  if (status != 200L) {
-    warning(glue(
-      "Sleeper API returned HTTP {status} for:\n  {url}"
-    ), call. = FALSE)
-    return(NULL)
-  }
-
-  parsed <- tryCatch(
-    httr::content(response, as = "parsed", type = "application/json",
-                  encoding = "UTF-8"),
-    error = function(e) {
-      warning(glue("Failed to parse Sleeper API response: {e$message}"),
-              call. = FALSE)
+    if (status == 404L) {
+      warning(glue(
+        "Sleeper API returned 404 (Not Found) for:\n  {url}\n",
+        "Check that the league_id or endpoint path is correct."
+      ), call. = FALSE)
       return(NULL)
     }
-  )
 
-  return(parsed)
+    if (status == 429L) {
+      warning(glue(
+        "Sleeper API returned 429 (Rate Limited) after {max_retries} retries.\n",
+        "Wait a few minutes before retrying. No API key is needed but requests\n",
+        "should stay under approximately 1,000 per hour."
+      ), call. = FALSE)
+      return(NULL)
+    }
+
+    if (status != 200L) {
+      warning(glue(
+        "Sleeper API returned HTTP {status} for:\n  {url}"
+      ), call. = FALSE)
+      return(NULL)
+    }
+
+    parsed <- tryCatch(
+      httr::content(response, as = "parsed", type = "application/json",
+                    encoding = "UTF-8"),
+      error = function(e) {
+        warning(glue("Failed to parse Sleeper API response: {e$message}"),
+                call. = FALSE)
+        return(NULL)
+      }
+    )
+
+    return(parsed)
+  }
+
+  # Unreachable in practice (the loop always returns), kept for safety.
+  return(NULL)
 }
 
 
@@ -763,35 +809,117 @@ get_sleeper_matchups <- function(league_id, week) {
     }
   }
 
-  # --- STEP 6: long_td_bonus ---
-  # Sleeper uses bonus_rec_td_50p (receiving TDs of 50+ yards) and
-  # bonus_rush_td_50p (rushing TDs of 50+ yards).
-  # Our function: long_td_bonus + long_td_threshold.
-  # Threshold: 49L (strictly greater than 49 = 50+ yards).
-  rec_ltd  <- as.numeric(scoring_settings[["bonus_rec_td_50p"]] %||% 0)
-  rush_ltd <- as.numeric(scoring_settings[["bonus_rush_td_50p"]] %||% 0)
+  # --- STEP 6: long_td_tiers ---
+  #
+  # [2026-07-16] REWRITTEN. This handler previously keyed on bonus_rec_td_50p
+  # and bonus_rush_td_50p. Audited across 7 live leagues: those fields appear
+  # 0 times. Sleeper sends rec_td_40p/rec_td_50p, rush_td_40p/rush_td_50p and
+  # pass_td_40p/pass_td_50p. The handler had never fired, for any league, and
+  # logged itself as derived_no_sleeper_source into an unread warning wall.
+  #
+  # It also merged receiving and rushing into ONE long_td_bonus with ONE
+  # threshold, which cannot express a 2-tier structure. XFL Rejects scores
+  # 40+ at 2 and 50+ at 4 on all three stat types: six values into one slot.
+  #
+  # R/17 now takes long_td_tiers = list(pass=, rush=, rec=), each a named
+  # numeric vector keyed on yardage threshold, >= semantics, highest matching
+  # tier wins. Nothing is merged and nothing is dropped.
+  ltd_spec <- list(
+    pass = c("40" = "pass_td_40p", "50" = "pass_td_50p"),
+    rush = c("40" = "rush_td_40p", "50" = "rush_td_50p"),
+    rec  = c("40" = "rec_td_40p",  "50" = "rec_td_50p")
+  )
 
-  if (rec_ltd > 0 || rush_ltd > 0) {
-    ltd_val <- max(rec_ltd, rush_ltd)
-    params[["long_td_bonus"]]     <- ltd_val
-    params[["long_td_threshold"]] <- 49L  # strictly greater than 49 = 50+ yards
-
-    note_ltd <- if (rec_ltd != rush_ltd && rec_ltd > 0 && rush_ltd > 0) {
-      glue(
-        "Sleeper has different long TD bonuses: receiving={rec_ltd}, rushing={rush_ltd}. ",
-        "Using max ({ltd_val}) with threshold = 49 (covers 50+ yards)."
-      )
-    } else {
-      "Sleeper 50+ yard TD bonus mapped to long_td_bonus with long_td_threshold = 49."
+  ltd     <- list()
+  ltd_src <- character(0)
+  for (.comp in names(ltd_spec)) {
+    .fields <- ltd_spec[[.comp]]
+    .vals   <- vapply(.fields, function(f) as.numeric(scoring_settings[[f]] %||% 0), numeric(1))
+    names(.vals) <- names(.fields)
+    .keep <- .vals != 0
+    if (any(.keep)) {
+      ltd[[.comp]] <- .vals[.keep]
+      ltd_src <- c(ltd_src, sprintf("%s=%s", .fields[.keep], .vals[.keep]))
     }
+  }
+
+  if (length(ltd) > 0L) {
+    params[["long_td_tiers"]] <- ltd
     log_rows[[length(log_rows) + 1L]] <- list(
-      sleeper_field = "bonus_rec_td_50p / bonus_rush_td_50p",
-      sleeper_value = glue("rec={rec_ltd}, rush={rush_ltd}"),
-      our_param     = "long_td_bonus (threshold=49)",
-      our_value     = ltd_val,
-      status        = if (rec_ltd != rush_ltd && rec_ltd > 0 && rush_ltd > 0)
-        "mapped_derived_warning" else "mapped_derived",
-      note          = note_ltd
+      sleeper_field = paste(unlist(ltd_spec, use.names = FALSE), collapse = "/"),
+      sleeper_value = paste(ltd_src, collapse = ", "),
+      our_param     = "long_td_tiers",
+      our_value     = paste(vapply(names(ltd), function(k) sprintf(
+        "%s:{%s}", k, paste(names(ltd[[k]]), ltd[[k]], sep = "+", collapse = ",")
+      ), character(1)), collapse = " | "),
+      status        = "mapped_derived",
+      note          = "Per stat type, per threshold. Highest matching tier wins, >= semantics."
+    )
+  }
+
+  # --- STEP 6b: two_point_conversion (rec_2pt / rush_2pt) ---
+  #
+  # [2026-07-16] NEW. Both fields were in SLEEPER_KNOWN_UNSUPPORTED on the
+  # stated premise that two_pt_conv already covered the scorer. Sleeper does
+  # not send two_pt_conv. It sends rec_2pt and rush_2pt, non-zero in 7 of 7
+  # audited leagues.
+  #
+  # REMAINING MERGE, disclosed: R/17's .build_two_point_fantasy() takes one
+  # two_point_conversion for the scorer regardless of whether the score came
+  # on a run or a catch. All 7 audited leagues set rec_2pt == rush_2pt, so
+  # this is lossless today. It warns when they differ. Splitting them needs an
+  # R/17 signature change and is logged as a known gap, not done here.
+  .rec2  <- scoring_settings[["rec_2pt"]]
+  .rush2 <- scoring_settings[["rush_2pt"]]
+  if (!is.null(.rec2) || !is.null(.rush2)) {
+    .r2 <- if (is.null(.rec2))  NA_real_ else as.numeric(.rec2)
+    .u2 <- if (is.null(.rush2)) NA_real_ else as.numeric(.rush2)
+    .present <- c(.r2, .u2)
+    .present <- .present[!is.na(.present)]
+    if (length(.present) > 0L) {
+      .tp <- max(.present)
+      .differ <- length(unique(.present)) > 1L
+      params[["two_point_conversion"]] <- .tp
+      log_rows[[length(log_rows) + 1L]] <- list(
+        sleeper_field = "rec_2pt / rush_2pt",
+        sleeper_value = glue("rec={.r2}, rush={.u2}"),
+        our_param     = "two_point_conversion",
+        our_value     = .tp,
+        status        = if (.differ) "mapped_derived_warning" else "mapped_derived",
+        note          = if (.differ) glue(
+          "Sleeper scores receiving 2PT at {.r2} and rushing 2PT at {.u2}. ",
+          "R/17 has one two_point_conversion for both. Using max ({.tp}). ",
+          "Points for the lower one are OVERSTATED."
+        ) else "Scorer 2PT credit. rec_2pt and rush_2pt agree."
+      )
+      if (.differ) {
+        warning(glue(
+          "League scores rec_2pt ({.r2}) and rush_2pt ({.u2}) differently. ",
+          "R/17 supports one two_point_conversion; using max ({.tp})."
+        ), call. = FALSE)
+      }
+    }
+  }
+
+  # --- STEP 6c: pick6_penalty (pass_int_td) ---
+  #
+  # [2026-07-16] NEW. This was in SLEEPER_KNOWN_UNSUPPORTED with the note
+  # "mapped to a single INT penalty". It was not mapped at all, and R/17 has
+  # had pick6_penalty in its signature the whole time, applied in
+  # .build_ext_passing_fantasy() as (pick6_count * pick6_penalty) ADDITIVE on
+  # top of (pass_ints * pass_int). Sleeper's pass_int_td is additive too, so
+  # the values transfer directly.
+  .p6 <- scoring_settings[["pass_int_td"]]
+  if (!is.null(.p6)) {
+    .p6v <- as.numeric(.p6)
+    params[["pick6_penalty"]] <- .p6v
+    log_rows[[length(log_rows) + 1L]] <- list(
+      sleeper_field = "pass_int_td",
+      sleeper_value = .p6v,
+      our_param     = "pick6_penalty",
+      our_value     = .p6v,
+      status        = "mapped_direct",
+      note          = "Additional QB penalty when an INT is returned for a TD. Applied on top of pass_int."
     )
   }
 
@@ -885,7 +1013,18 @@ get_sleeper_matchups <- function(league_id, week) {
   all_known    <- c(names(SLEEPER_DIRECT_MAP), SLEEPER_KNOWN_UNSUPPORTED,
                     "bonus_rec_te", "bonus_rec_yd_100", "bonus_rush_yd_100",
                     "pass_sack", "bonus_fd_rb", "bonus_fd_wr", "bonus_fd_te",
-                    "bonus_fd_qb", "bonus_rec_td_50p", "bonus_rush_td_50p",
+                    "bonus_fd_qb",
+                    # Long TD tiers handled in STEP 6 [2026-07-16].
+                    # Was "bonus_rec_td_50p", "bonus_rush_td_50p", which
+                    # Sleeper never sends, so the six real fields below were
+                    # reported unmapped on every run.
+                    "pass_td_40p", "pass_td_50p",
+                    "rush_td_40p", "rush_td_50p",
+                    "rec_td_40p",  "rec_td_50p",
+                    # Scorer 2PT handled in STEP 6b [2026-07-16]
+                    "rec_2pt", "rush_2pt",
+                    # Pick-6 handled in STEP 6c [2026-07-16]
+                    "pass_int_td",
                     # Tiered reception fields handled in STEP 8b
                     "rec_0_4", "rec_5_9", "rec_10_19",
                     "rec_20_29", "rec_30_39", "rec_40p")
@@ -893,14 +1032,28 @@ get_sleeper_matchups <- function(league_id, week) {
 
   for (rf in remaining) {
     raw_val <- scoring_settings[[rf]]
-    if (!is.null(raw_val) && !is.na(as.numeric(raw_val)) && as.numeric(raw_val) != 0) {
+    if (is.null(raw_val)) next
+    # Guard: as.numeric() on a string field warns and yields NA, which used
+    # to silently drop the field from the unmapped log. Coerce quietly and
+    # keep non-numeric fields in the log with their raw value.
+    num_val <- if (is.numeric(raw_val)) {
+      as.numeric(raw_val)
+    } else if (is.character(raw_val)) {
+      suppressWarnings(as.numeric(raw_val))
+    } else {
+      NA_real_
+    }
+    is_nonzero_numeric <- !is.na(num_val) && num_val != 0
+    is_string_field    <- is.na(num_val) && is.character(raw_val)
+    if (is_nonzero_numeric || is_string_field) {
+      val_str <- if (!is.na(num_val)) format(num_val) else as.character(raw_val)[1]
       log_rows[[length(log_rows) + 1L]] <- list(
         sleeper_field = rf,
-        sleeper_value = as.numeric(raw_val),
+        sleeper_value = val_str,
         our_param     = NA_character_,
         our_value     = NA_real_,
         status        = "unmapped",
-        note          = glue("'{rf}' = {as.numeric(raw_val)}: no mapping in calculate_fantasy_points_ext().")
+        note          = glue("'{rf}' = {val_str}: no mapping in calculate_fantasy_points_ext().")
       )
     }
   }
@@ -959,13 +1112,13 @@ get_sleeper_matchups <- function(league_id, week) {
 #' @details
 #' **Parameter coverage:** All Season 1 and Season 2 parameters of
 #' calculate_fantasy_points_ext() are either mapped from Sleeper settings or
-#' set to appropriate defaults. The one exception is pick6_penalty -- Sleeper
-#' does not expose this separately from pass_int, so it remains at the default
-#' of -4 (total pick-6 cost = pass_int + pick6_penalty = -6).
+#' set to appropriate defaults. pick6_penalty is mapped from Sleeper's
+#' pass_int_td field (STEP 6c); if the league does not set pass_int_td, the
+#' function default applies.
 #'
-#' **Tiered PPR:** Our function's tiered PPR is a custom extension not present
-#' in Sleeper. Map always sets use_tiered_ppr = FALSE. If you want tiered PPR,
-#' modify params$use_tiered_ppr manually after calling this function.
+#' **Tiered PPR:** use_tiered_ppr defaults to FALSE (STEP 8), but if the league
+#' sets any of Sleeper's per-yardage reception fields (rec_0_4 ... rec_40p),
+#' STEP 8b maps them to tiered_rec_tiers and sets use_tiered_ppr = TRUE.
 #'
 #' **100-yard bonus:** Sleeper can set different bonuses for rushing and receiving
 #' 100-yard games. Our function applies one value to both. If they differ, the
@@ -1116,21 +1269,36 @@ map_sleeper_scoring <- function(league_id) {
 #' @description
 #' Internal. Fetches all NFL players from Sleeper's /players/nfl endpoint
 #' and caches as RDS. The response is large (~5MB JSON, ~4,000+ players).
-#' Only re-fetches if force_refresh = TRUE.
+#' Re-fetches if force_refresh = TRUE or if the cache file is older than
+#' max_age_hours. The cache carries daily-changing fields (injury_status,
+#' depth_chart_order), so an unbounded cache would silently serve stale
+#' injury/depth-chart data to R/31 and R/35.
 #'
 #' The player objects include gsis_id which maps directly to nflfastR player_id,
 #' enabling high-confidence reconciliation without fuzzy matching for most players.
 #'
 #' @param force_refresh Logical. Force re-download even if cache exists. Default FALSE.
+#' @param max_age_hours Numeric. Maximum cache age in hours before the cache is
+#'   considered stale and re-fetched. Default 24 (injury_status and
+#'   depth_chart_order change daily).
 #' @return A tibble with Sleeper player profile data.
 #' @keywords internal
-.get_sleeper_players <- function(force_refresh = FALSE) {
+.get_sleeper_players <- function(force_refresh = FALSE, max_age_hours = 24) {
 
   if (!force_refresh && file.exists(SLEEPER_PLAYERS_CACHE)) {
-    message("Loading Sleeper player database from cache...")
-    players <- readRDS(SLEEPER_PLAYERS_CACHE)
-    message(glue("  {format(nrow(players), big.mark=',')} players loaded from cache."))
-    return(players)
+    cache_age_hours <- as.numeric(
+      difftime(Sys.time(), file.mtime(SLEEPER_PLAYERS_CACHE), units = "hours")
+    )
+    if (cache_age_hours <= max_age_hours) {
+      message("Loading Sleeper player database from cache...")
+      players <- readRDS(SLEEPER_PLAYERS_CACHE)
+      message(glue("  {format(nrow(players), big.mark=',')} players loaded from cache."))
+      return(players)
+    }
+    message(glue(
+      "  Sleeper player cache is {round(cache_age_hours, 1)}h old ",
+      "(max_age_hours = {max_age_hours}); refreshing..."
+    ))
   }
 
   message("Fetching Sleeper NFL player database (large request, ~5MB)...")
@@ -1161,7 +1329,13 @@ map_sleeper_scoring <- function(league_id) {
         # fetch was slimmed; NA when Sleeper has no value for the player.
         injury_status     = p$injury_status %||% NA_character_,
         depth_chart_order = as.integer(p$depth_chart_order %||% NA_integer_),
-        gsis_id           = p$gsis_id    %||% NA_character_,
+        gsis_id           = {
+          # Sleeper's gsis_id strings carry a leading space; trim so gsis-keyed
+          # joins in R/29, R/31, R/35 match nflfastR ids. Empty -> NA so a blank
+          # never masquerades as a value.
+          .g <- trimws(p$gsis_id %||% NA_character_)
+          if (is.na(.g) || nchar(.g) == 0L) NA_character_ else .g
+        },
         years_exp         = as.integer(p$years_exp %||% NA_integer_)
       )
     }
@@ -1199,17 +1373,24 @@ map_sleeper_scoring <- function(league_id) {
 #'
 #' @param force_refresh Logical. Force re-download even if cache exists.
 #'   Default FALSE.
+#' @param max_age_hours Numeric. Maximum cache age in hours before re-fetching.
+#'   Passed through to [.get_sleeper_players()]. Default 24.
 #' @return A tibble with all columns from [.get_sleeper_players()] plus
 #'   nfl_gsis_id, player_name, and is_free_agent.
 #' @seealso [.get_sleeper_players()], match_sleeper_players
 #' @export
-get_all_sleeper_players <- function(force_refresh = FALSE) {
-  players <- .get_sleeper_players(force_refresh = force_refresh)
+get_all_sleeper_players <- function(force_refresh = FALSE, max_age_hours = 24) {
+  players <- .get_sleeper_players(force_refresh = force_refresh,
+                                  max_age_hours = max_age_hours)
 
   # Normalize to the downstream consumer contract. Base assignment (not a
   # dplyr mutate) so this never depends on dplyr being attached and keeps the
-  # original Sleeper columns available to any other caller.
-  players$nfl_gsis_id   <- players$gsis_id
+  # original Sleeper columns available to any other caller. nfl_gsis_id is
+  # trimmed and empty-to-NA here as well as at fetch, so a cache built before
+  # the fetch-side trim still yields clean, joinable ids.
+  .clean_gsis <- trimws(players$gsis_id)
+  .clean_gsis[is.na(.clean_gsis) | nchar(.clean_gsis) == 0L] <- NA_character_
+  players$nfl_gsis_id   <- .clean_gsis
   players$player_name   <- players$full_name
   players$is_free_agent <- is.na(players$team)
 
@@ -1363,14 +1544,30 @@ match_sleeper_players <- function(sleeper_player_ids,
 
   name_matched <- tibble::tibble()
   if (nrow(remaining_2) > 0L) {
+    # The gsis side must be unique on (name_norm, pos_std) or the left_join
+    # fans out: suffix stripping in .normalize_player_name() collapses
+    # Jr./Sr. pairs onto the same normalized name. Keep the first row per
+    # key and warn with the collision count.
+    name_lookup <- nflfastr_lookup %>%
+      dplyr::select(matched_gsis = gsis_id, nflfastr_name = full_name,
+                    name_norm, pos_std)
+    n_collisions <- sum(duplicated(name_lookup[, c("name_norm", "pos_std")]))
+    if (n_collisions > 0L) {
+      warning(glue(
+        "{n_collisions} nflreadr roster row(s) share a normalized ",
+        "(name, position) key with another player (e.g. Jr./Sr. pairs after ",
+        "suffix stripping). Keeping the first row per key for exact-name matching."
+      ), call. = FALSE)
+      name_lookup <- name_lookup %>%
+        dplyr::distinct(name_norm, pos_std, .keep_all = TRUE)
+    }
+
     name_matched <- remaining_2 %>%
-      dplyr::left_join(
-        nflfastr_lookup %>%
-          dplyr::select(matched_gsis = gsis_id, nflfastr_name = full_name,
-                        name_norm, pos_std),
-        by = c("name_norm", "pos_std")
-      ) %>%
+      dplyr::left_join(name_lookup, by = c("name_norm", "pos_std")) %>%
       dplyr::filter(!is.na(matched_gsis)) %>%
+      # Belt-and-braces: guarantee one output row per Sleeper player even if
+      # the lookup dedup above ever changes.
+      dplyr::distinct(sleeper_player_id, .keep_all = TRUE) %>%
       dplyr::mutate(
         gsis_id          = matched_gsis,
         match_method     = "exact_name",
@@ -1422,11 +1619,12 @@ match_sleeper_players <- function(sleeper_player_ids,
         ))
       }
 
-      # If multiple fuzzy hits, take the one with the closest string distance
+      # If multiple fuzzy hits, take the one with the smallest edit distance
+      # (utils::adist), not the closest string LENGTH -- length ties are
+      # meaningless between different names of the same length.
       hit_candidates <- candidates[hits, ]
-      distances <- stringr::str_length(hit_candidates$name_norm) -
-        stringr::str_length(s_name)
-      best_idx <- which.min(abs(distances))
+      distances <- as.numeric(utils::adist(s_name, hit_candidates$name_norm))
+      best_idx <- which.min(distances)
       best     <- hit_candidates[best_idx, ]
 
       tibble::tibble(
@@ -1501,7 +1699,16 @@ match_sleeper_players <- function(sleeper_player_ids,
 
   # --- Match rate summary ---
   n_matched    <- sum(result$match_method != "unmatched", na.rm = TRUE)
-  match_rate   <- n_matched / n_input
+
+  # K and DEF have no gsis_id linkage by construction (DEF are team units;
+  # Sleeper does not carry gsis for them), so including them in the
+  # denominator trips the 90% warning on perfectly clean runs. Rate is
+  # computed over eligible (non-K/DEF) players only.
+  eligible     <- result %>%
+    dplyr::filter(!sleeper_position %in% c("K", "DEF"))
+  n_eligible   <- nrow(eligible)
+  n_matched_el <- sum(eligible$match_method != "unmatched", na.rm = TRUE)
+  match_rate   <- if (n_eligible > 0L) n_matched_el / n_eligible else 1
 
   # Position-level summary
   pos_summary <- result %>%
@@ -1512,7 +1719,8 @@ match_sleeper_players <- function(sleeper_player_ids,
 
   message(glue(
     "\n  Match summary: {n_matched}/{n_input} players matched ",
-    "({round(match_rate * 100, 1)}%)\n",
+    "({n_matched_el}/{n_eligible} = {round(match_rate * 100, 1)}% ",
+    "excluding K/DEF)\n",
     "  by method -- ",
     "GSIS: {sum(result$match_method=='gsis')}, ",
     "Exact: {sum(result$match_method=='exact_name')}, ",
@@ -1525,8 +1733,8 @@ match_sleeper_players <- function(sleeper_player_ids,
       dplyr::filter(match_method == "unmatched") %>%
       dplyr::pull(sleeper_name)
     warning(glue(
-      "Player match rate {round(match_rate*100,1)}% is below the warning threshold ",
-      "({MATCH_RATE_WARNING_THRESHOLD*100}%).\n",
+      "Player match rate {round(match_rate*100,1)}% (K/DEF excluded) is below ",
+      "the warning threshold ({MATCH_RATE_WARNING_THRESHOLD*100}%).\n",
       "Unmatched players: {paste(head(unmatched_players, 10), collapse=', ')}",
       if (length(unmatched_players) > 10L)
         glue(" ... and {length(unmatched_players)-10} more") else ""

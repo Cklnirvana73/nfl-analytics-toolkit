@@ -200,13 +200,7 @@ calculate_epa_trends <- function(pbp_data,
   weekly_epa <- player_plays %>%
     group_by(player_id, season, week, game_id, posteam) %>%
     summarise(
-      # Capture player name from most common appearance
-      player_name = {
-        pass_name <- first(na.omit(passer_player_id))
-        rush_name <- first(na.omit(rusher_player_id))
-        # Use the description-based name approach
-        NA_character_
-      },
+      # player_name is joined afterwards from the play-level names
       plays = n(),
       weekly_epa = sum(epa, na.rm = TRUE),
       epa_per_play = mean(epa, na.rm = TRUE),
@@ -229,9 +223,8 @@ calculate_epa_trends <- function(pbp_data,
     group_by(player_id) %>%
     summarise(player_name = first(name), .groups = "drop")
 
-  # Join names and drop the placeholder
+  # Join names
   weekly_epa <- weekly_epa %>%
-    select(-player_name) %>%
     left_join(player_names, by = "player_id")
 
   # Filter to games where player had meaningful involvement
@@ -247,16 +240,17 @@ calculate_epa_trends <- function(pbp_data,
   # CALCULATE EPA TRENDS (LAGGED - NO LEAKAGE)
   # ==========================================================================
 
-  # Helper: OLS slope of y over x = 1:n
-  calc_slope <- function(vals) {
-    n <- length(vals)
-    non_na <- sum(!is.na(vals))
-    if (non_na < 3) return(NA_real_)  # Need 3+ points for meaningful slope
-    x <- seq_len(n)
-    valid <- !is.na(vals)
-    if (sum(valid) < 3) return(NA_real_)
-    fit <- lm(vals[valid] ~ x[valid])
-    coef(fit)[2]
+  # Helper: closed-form OLS slope of y on x, slope = cov(x, y) / var(x).
+  # x is the actual game-week number, so the slope is in units of EPA/play
+  # per game-week (byes and missed weeks are spaced correctly, unlike an
+  # appearance index).
+  calc_slope <- function(x, y) {
+    valid <- !is.na(x) & !is.na(y)
+    if (sum(valid) < 3) return(NA_real_)  # Need 3+ points for meaningful slope
+    x <- x[valid]
+    y <- y[valid]
+    if (var(x) == 0) return(NA_real_)
+    cov(x, y) / var(x)
   }
 
   for (w in trend_windows) {
@@ -271,15 +265,17 @@ calculate_epa_trends <- function(pbp_data,
       mutate(
         .row_num = row_number(),
 
-        # Lagged EPA per play (exclude current game)
+        # Lagged EPA per play and its game-week (exclude current game)
         .lagged_epa = lag(epa_per_play, n = 1),
+        .lagged_week = lag(week, n = 1),
 
-        # Rolling slope over previous w games
+        # Rolling slope over previous w games (per game-week, using actual
+        # week numbers as x)
         !!trend_col := {
           zoo::rollapply(
-            .lagged_epa,
+            seq_len(n()),
             width = w,
-            FUN = calc_slope,
+            FUN = function(i) calc_slope(.lagged_week[i], .lagged_epa[i]),
             align = "right",
             fill = NA,
             partial = FALSE
@@ -305,7 +301,7 @@ calculate_epa_trends <- function(pbp_data,
         !!trend_col := ifelse(.row_num <= w, NA_real_, !!sym(trend_col)),
         !!level_col := ifelse(.row_num <= w, NA_real_, !!sym(level_col))
       ) %>%
-      select(-.row_num, -.lagged_epa) %>%
+      select(-.row_num, -.lagged_epa, -.lagged_week) %>%
       ungroup()
 
     valid_trends <- sum(!is.na(weekly_epa[[trend_col]]))
@@ -551,8 +547,8 @@ get_situational_splits <- function(pbp_data,
 #' @param filter_garbage_time Logical. Exclude garbage time. Default: TRUE
 #'
 #' @return Tibble with one row per metric containing:
-#'   metric (chr), autocorrelation (dbl: week-to-week Pearson r),
-#'   split_half_r (dbl: odd/even week correlation),
+#'   metric (chr), autocorrelation (dbl: week-to-week Pearson r, within season),
+#'   split_half_r (dbl: odd/even week correlation, Spearman-Brown corrected),
 #'   n_players (int: sample size), stability_tier (chr: "high", "moderate",
 #'   "low", "unstable").
 #'
@@ -571,8 +567,11 @@ get_situational_splits <- function(pbp_data,
 #' findings: volume predicts volume, but EPA adds no incremental validity.
 #'
 #' **Methodology:**
-#' - Autocorrelation: cor(metric_week_n, metric_week_n+1) across all players
-#' - Split-half: cor(mean_odd_weeks, mean_even_weeks) across players
+#' - Autocorrelation: cor(metric_week_n, metric_week_n+1) across all players.
+#'   Week pairs are formed within (player, season) only -- the last week of
+#'   one season is never paired with week 1 of the next.
+#' - Split-half: cor(mean_odd_weeks, mean_even_weeks) across players, then
+#'   Spearman-Brown corrected to full-length reliability: r_sb = 2r / (1 + r)
 #' - Both use Pearson r with pairwise complete observations
 #'
 #' @examples
@@ -724,9 +723,11 @@ calculate_stability_metrics <- function(pbp_data,
     }
 
     # Week-to-week autocorrelation
+    # Grouped by player AND season so lead() never pairs the last week of one
+    # season with week 1 of the next
     paired <- qualified %>%
       arrange(player_id, season, week) %>%
-      group_by(player_id) %>%
+      group_by(player_id, season) %>%
       mutate(next_val = lead(!!sym(metric_col))) %>%
       ungroup() %>%
       filter(!is.na(!!sym(metric_col)), !is.na(next_val))
@@ -746,9 +747,17 @@ calculate_stability_metrics <- function(pbp_data,
       tidyr::pivot_wider(names_from = half, values_from = mean_val) %>%
       filter(!is.na(odd), !is.na(even))
 
-    split_r <- if (nrow(split_data) >= 5) {
+    split_r_raw <- if (nrow(split_data) >= 5) {
       suppressWarnings(cor(split_data$odd, split_data$even,
                            use = "pairwise.complete.obs"))
+    } else {
+      NA_real_
+    }
+
+    # Spearman-Brown correction: the odd/even correlation reflects half-length
+    # samples, so step it up to full-length reliability: r_sb = 2r / (1 + r)
+    split_r <- if (!is.na(split_r_raw)) {
+      (2 * split_r_raw) / (1 + split_r_raw)
     } else {
       NA_real_
     }

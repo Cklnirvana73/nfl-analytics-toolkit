@@ -198,14 +198,14 @@ utils::globalVariables(c(
 
   target <- tolower(division)
 
-  pbp_filtered <- pbp[
-    (pbp$pos_team == pbp$home &
-       tolower(pbp$home_team_division) == target) |
-      (pbp$pos_team == pbp$away &
-         tolower(pbp$away_team_division) == target),
-    ,
-    drop = FALSE
-  ]
+  keep <- (pbp$pos_team == pbp$home &
+             tolower(pbp$home_team_division) == target) |
+    (pbp$pos_team == pbp$away &
+       tolower(pbp$away_team_division) == target)
+
+  # which() drops NA conditions (pos_team is NA on kickoffs/timeouts); a raw
+  # logical subscript containing NA would INSERT all-NA rows in base R.
+  pbp_filtered <- pbp[which(keep), , drop = FALSE]
 
   pbp_filtered
 }
@@ -390,6 +390,21 @@ load_multi_season_cfb_pbp <- function(seasons = CFB_SEASON_RANGE_DEFAULT,
                    "version {CFB_SCHEMA_NORM_VERSION}"))
     }
 
+    # Deduplicate at cache-write time. cfbfastR's upstream source contains
+    # duplicate game_id + id_play rows (e.g. 2024 raw download: 113,209
+    # duplicates of 276,267 rows). Doing this once here means readers get
+    # clean data without per-call dedup warnings.
+    if (all(c("game_id", "id_play") %in% names(pbp_norm))) {
+      n_before_dedup <- nrow(pbp_norm)
+      pbp_norm <- pbp_norm[!duplicated(pbp_norm[, c("game_id", "id_play")]),
+                           , drop = FALSE]
+      n_removed <- n_before_dedup - nrow(pbp_norm)
+      if (n_removed > 0L && verbose) {
+        message(glue("  Removed {format(n_removed, big.mark = ',')} duplicate ",
+                     "game_id + id_play rows (cfbfastR upstream issue) before caching."))
+      }
+    }
+
     # Cache to disk
     saveRDS(pbp_norm, cache_file)
     if (verbose) message(glue("  Cached: {cache_file}"))
@@ -491,6 +506,52 @@ normalize_cfb_schema <- function(pbp, season) {
   missing_optional <- setdiff(CFB_OPTIONAL_COLUMNS, names(pbp))
   for (col in missing_optional) {
     pbp[[col]] <- NA
+  }
+
+  # --- Repair player names broken by the cfbfastR v2 schema migration ---
+  # The v2 data release populates structured *_player columns
+  # (reception_player, incompletion_player, target_player, completion_player,
+  # interception_thrown_player, ...) but leaves the legacy *_player_name fields
+  # carrying raw play-text on affected seasons (observed: 2025). Unrepaired,
+  # each distinct play string mints a phantom one-play player in downstream
+  # aggregation. Repair ONLY rows whose legacy name matches the play-text
+  # signature, sourcing the real name from the structured columns; recovered
+  # names follow the same full-name format as the clean rows. Rows with no
+  # structured name become NA (better than a phantom). Clean rows and clean
+  # seasons (no name matches the pattern) are left byte-identical, so 2014-2024
+  # are untouched. Generic by pattern, so it self-heals future affected seasons.
+  # rusher_player_name is unaffected upstream and is left alone.
+  .name_junk_pat <- "thrown to|caught at|QB hurried|broken up|#"
+  .coalesce_present <- function(df, cols) {
+    cols <- cols[cols %in% names(df)]
+    if (length(cols) == 0L) return(rep(NA_character_, nrow(df)))
+    do.call(dplyr::coalesce, lapply(cols, function(cc) as.character(df[[cc]])))
+  }
+
+  if ("receiver_player_name" %in% names(pbp)) {
+    junk <- grepl(.name_junk_pat, pbp$receiver_player_name)
+    junk[is.na(junk)] <- FALSE
+    if (any(junk)) {
+      canon <- .coalesce_present(
+        pbp, c("reception_player", "incompletion_player", "target_player")
+      )
+      pbp$receiver_player_name[junk] <- canon[junk]
+    }
+  }
+
+  if ("passer_player_name" %in% names(pbp)) {
+    junk <- grepl(.name_junk_pat, pbp$passer_player_name)
+    junk[is.na(junk)] <- FALSE
+    if (any(junk)) {
+      # No structured incompletion-passer field exists in the v2 set, so plain
+      # 2025 incompletions resolve to NA (option A). QB uses the base variant
+      # downstream; flagged for a carry-forward recovery only if a QB line looks
+      # off.
+      canon <- .coalesce_present(
+        pbp, c("completion_player", "interception_thrown_player")
+      )
+      pbp$passer_player_name[junk] <- canon[junk]
+    }
   }
 
   # --- Minimal type coercions ---
@@ -859,26 +920,23 @@ load_normalized_cfb_season <- function(season,
 
   pbp <- readRDS(cache_file)
 
-  # --- Deduplication guard ---
-  # cfbfastR's upstream data source contains duplicate game_id + id_play rows
-  # across all seasons. Confirmed via direct load_cfb_pbp() inspection:
-  # 2024 raw download contains 113,209 duplicates out of 276,267 total rows.
-  # Root cause is upstream in cfbfastR's sportsdataverse data pipeline, not
-  # in the local cache. force_reload = TRUE downloads the same duplicated
-  # source and does NOT resolve this. Deduplication is applied at read time
-  # on every load so all callers receive clean data automatically.
+  # --- Deduplication guard (read-side safety net) ---
+  # Primary dedup now happens once at cache-write time in
+  # load_multi_season_cfb_pbp(). This read-side pass only fires for caches
+  # written before that change (or if the upstream duplication pattern ever
+  # changes) and reports via message() -- not warning() -- so loops over
+  # seasons do not generate warning spam.
   # id_play is the cfbfastR play identifier; game_id scopes it to a game.
   if (all(c("game_id", "id_play") %in% names(pbp))) {
     n_before_dedup <- nrow(pbp)
     pbp <- pbp[!duplicated(pbp[, c("game_id", "id_play")]), , drop = FALSE]
     n_removed <- n_before_dedup - nrow(pbp)
     if (n_removed > 0L) {
-      warning(
+      message(
         glue("Season {season}: removed {format(n_removed, big.mark = ',')} ",
-             "duplicate game_id + id_play rows originating in cfbfastR upstream ",
-             "data. This is expected behavior -- force_reload = TRUE will not ",
-             "resolve it. Data returned from this call is deduplicated and clean."),
-        call. = FALSE
+             "duplicate game_id + id_play rows (pre-dedup cache; re-run ",
+             "load_multi_season_cfb_pbp(force_reload = TRUE) to rebuild a ",
+             "clean cache). Data returned from this call is deduplicated.")
       )
     }
   }

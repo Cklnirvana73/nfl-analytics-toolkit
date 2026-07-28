@@ -30,8 +30,9 @@
 # requires an iterative computation:
 #
 #   1. Allocate dedicated starter slots first (top N QB, top M RB, etc.)
-#   2. Allocate FLEX slots by sorting remaining RB/WR/TE by PPG and taking
-#      the top K combined
+#   2. Allocate flex slots, each type from its own eligible pool sorted by
+#      PPG: REC_FLEX (WR/TE) and WRRB_FLEX (RB/WR) first, then generic
+#      FLEX (RB/WR/TE)
 #   3. Allocate SUPERFLEX slots similarly, including QB
 #   4. Replacement PPG at each position = PPG of the next player below
 #      everyone who got a starter/flex/superflex slot
@@ -157,6 +158,12 @@ VORP_POSITIONS <- c("QB", "RB", "WR", "TE")
 # Positions eligible for standard FLEX
 FLEX_ELIGIBLE <- c("RB", "WR", "TE")
 
+# Sleeper's restricted flex variants each have their own eligibility:
+# REC_FLEX = WR/TE only, WRRB_FLEX = RB/WR only. Tracked separately from
+# generic FLEX so replacement levels reflect the actual eligible pools.
+REC_FLEX_ELIGIBLE  <- c("WR", "TE")
+WRRB_FLEX_ELIGIBLE <- c("RB", "WR")
+
 # Positions eligible for SUPER_FLEX
 SUPERFLEX_ELIGIBLE <- c("QB", "RB", "WR", "TE")
 
@@ -229,6 +236,10 @@ utils::globalVariables(c(
 #' @param starters Named list. Number of dedicated starter slots per
 #'   position: list(QB = 1, RB = 2, WR = 2, TE = 1). DEF/K/etc. ignored.
 #' @param flex Integer. Number of FLEX slots (RB/WR/TE eligible). Default 1.
+#' @param rec_flex Integer. Number of REC_FLEX slots (WR/TE eligible).
+#'   Default 0.
+#' @param wrrb_flex Integer. Number of WRRB_FLEX slots (RB/WR eligible).
+#'   Default 0.
 #' @param superflex Integer. Number of SUPER_FLEX slots (QB/RB/WR/TE
 #'   eligible). Default 0.
 #' @param format Character. One of "standard", "half_ppr", "ppr",
@@ -243,6 +254,8 @@ build_league_config <- function(
     num_teams = 12L,
     starters = list(QB = 1L, RB = 2L, WR = 2L, TE = 1L),
     flex = 1L,
+    rec_flex = 0L,
+    wrrb_flex = 0L,
     superflex = 0L,
     format = "ppr",
     boom_weight = NULL,
@@ -274,6 +287,8 @@ build_league_config <- function(
     num_teams      = as.integer(num_teams),
     starters       = full_starters,
     flex           = as.integer(flex),
+    rec_flex       = as.integer(rec_flex),
+    wrrb_flex      = as.integer(wrrb_flex),
     superflex      = as.integer(superflex),
     format         = format,
     boom_weight    = bw,
@@ -299,34 +314,34 @@ build_league_config <- function(
 #' TAXI/K/DEF.
 #'
 #' @param roster_positions Character vector from Sleeper league meta.
-#' @return List: starters, flex, superflex counts.
+#' @return List: starters, flex, rec_flex, wrrb_flex, superflex counts.
 #' @keywords internal
 .parse_roster_positions <- function(roster_positions) {
 
   counts <- table(roster_positions)
 
+  .count_slot <- function(slot) {
+    n <- as.integer(counts[slot] %||% 0L)
+    if (is.na(n)) 0L else n
+  }
+
   starters <- list(
-    QB = as.integer(counts["QB"] %||% 0L),
-    RB = as.integer(counts["RB"] %||% 0L),
-    WR = as.integer(counts["WR"] %||% 0L),
-    TE = as.integer(counts["TE"] %||% 0L)
+    QB = .count_slot("QB"),
+    RB = .count_slot("RB"),
+    WR = .count_slot("WR"),
+    TE = .count_slot("TE")
   )
-  starters[is.na(starters)] <- 0L
 
-  # FLEX synonyms in Sleeper: "FLEX", "REC_FLEX", "WRRB_FLEX"
-  flex_count <- sum(c(
-    counts["FLEX"]      %||% 0L,
-    counts["REC_FLEX"]  %||% 0L,
-    counts["WRRB_FLEX"] %||% 0L
-  ), na.rm = TRUE)
-
-  superflex_count <- as.integer(counts["SUPER_FLEX"] %||% 0L)
-  if (is.na(superflex_count)) superflex_count <- 0L
-
+  # Each Sleeper flex variant is tracked with its own count because each has
+  # its own eligibility set (FLEX = RB/WR/TE, REC_FLEX = WR/TE,
+  # WRRB_FLEX = RB/WR). Pooling them into one generic flex would overstate
+  # the eligible pool for the restricted variants.
   list(
     starters  = starters,
-    flex      = as.integer(flex_count),
-    superflex = superflex_count
+    flex      = .count_slot("FLEX"),
+    rec_flex  = .count_slot("REC_FLEX"),
+    wrrb_flex = .count_slot("WRRB_FLEX"),
+    superflex = .count_slot("SUPER_FLEX")
   )
 }
 
@@ -402,6 +417,8 @@ build_config_from_sleeper <- function(
     num_teams      = meta$total_rosters,
     starters       = parsed$starters,
     flex           = parsed$flex,
+    rec_flex       = parsed$rec_flex,
+    wrrb_flex      = parsed$wrrb_flex,
     superflex      = parsed$superflex,
     format         = format_detected,
     boom_weight    = boom_weight,
@@ -465,8 +482,9 @@ build_configs_from_sleeper_user <- function(username,
 #' Iteratively determine replacement PPG for each position
 #'
 #' Implements the iterative flex algorithm. Allocates dedicated starter
-#' slots first, then FLEX from remaining RB/WR/TE, then SUPER_FLEX from
-#' remaining QB/RB/WR/TE. Replacement PPG at each position = PPG of the
+#' slots first, then each flex type from its own eligible pool (REC_FLEX =
+#' WR/TE, WRRB_FLEX = RB/WR, then generic FLEX = RB/WR/TE), then SUPER_FLEX
+#' from remaining QB/RB/WR/TE. Replacement PPG at each position = PPG of the
 #' next-best player below everyone allocated.
 #'
 #' @param projections Tibble. Must contain nfl_gsis_id, position, and
@@ -474,7 +492,8 @@ build_configs_from_sleeper_user <- function(username,
 #' @param config League_config list.
 #' @return Named list with two elements:
 #'   replacement_ppg: named numeric (QB, RB, WR, TE)
-#'   role_assignments: tibble with nfl_gsis_id, role (starter/flex/superflex/bench)
+#'   role_assignments: tibble with nfl_gsis_id, role
+#'   (starter/flex/rec_flex/wrrb_flex/superflex/bench)
 #' @keywords internal
 .compute_replacement_levels <- function(projections, config) {
 
@@ -496,16 +515,31 @@ build_configs_from_sleeper_user <- function(username,
     }
   }
 
-  # Step 2: FLEX -- best RB/WR/TE not yet starting
-  n_flex_total <- config$flex * config$num_teams
-  if (n_flex_total > 0L) {
-    flex_candidates <- proj %>%
-      dplyr::filter(.data$position %in% FLEX_ELIGIBLE,
-                     .data$role == "bench") %>%
-      dplyr::arrange(dplyr::desc(.data$r32_posterior_mu)) %>%
-      dplyr::slice_head(n = n_flex_total)
+  # Step 2: flex slots. Each flex type has its own eligibility set and is
+  # allocated from the best remaining eligible players. Restricted variants
+  # (REC_FLEX, WRRB_FLEX -- 2-position pools) go first so the generic FLEX
+  # (3-position pool) absorbs whoever the narrower slots could not take.
+  flex_specs <- list(
+    list(role = "rec_flex",  eligible = REC_FLEX_ELIGIBLE,
+         n = as.integer(config$rec_flex %||% 0L)),
+    list(role = "wrrb_flex", eligible = WRRB_FLEX_ELIGIBLE,
+         n = as.integer(config$wrrb_flex %||% 0L)),
+    list(role = "flex",      eligible = FLEX_ELIGIBLE,
+         n = as.integer(config$flex %||% 0L))
+  )
 
-    proj$role[proj$nfl_gsis_id %in% flex_candidates$nfl_gsis_id] <- "flex"
+  for (spec in flex_specs) {
+    n_slot_total <- spec$n * config$num_teams
+    if (n_slot_total > 0L) {
+      slot_candidates <- proj %>%
+        dplyr::filter(.data$position %in% spec$eligible,
+                       .data$role == "bench") %>%
+        dplyr::arrange(dplyr::desc(.data$r32_posterior_mu)) %>%
+        dplyr::slice_head(n = n_slot_total)
+
+      proj$role[proj$nfl_gsis_id %in% slot_candidates$nfl_gsis_id] <-
+        spec$role
+    }
   }
 
   # Step 3: SUPER_FLEX -- best QB/RB/WR/TE not yet starting/flexing
@@ -694,7 +728,8 @@ compute_multi_league_rankings <- function(projections,
                  "{cfg$num_teams}T, ",
                  "QB:{cfg$starters$QB}/RB:{cfg$starters$RB}/",
                  "WR:{cfg$starters$WR}/TE:{cfg$starters$TE}/",
-                 "FLEX:{cfg$flex}/SF:{cfg$superflex})"))
+                 "FLEX:{cfg$flex}/RECF:{cfg$rec_flex %||% 0L}/",
+                 "WRRBF:{cfg$wrrb_flex %||% 0L}/SF:{cfg$superflex})"))
 
     rankings <- compute_vorp_rankings(projections, cfg)
 
@@ -765,6 +800,8 @@ print.league_config <- function(x, ...) {
   cat(glue("  Starters:       QB={x$starters$QB} RB={x$starters$RB} ",
            "WR={x$starters$WR} TE={x$starters$TE}\n"))
   cat(glue("  FLEX slots:     {x$flex}\n"))
+  cat(glue("  REC_FLEX:       {x$rec_flex %||% 0L}\n"))
+  cat(glue("  WRRB_FLEX:      {x$wrrb_flex %||% 0L}\n"))
   cat(glue("  SUPER_FLEX:     {x$superflex}\n"))
   cat(glue("  Boom weight:    {x$boom_weight}\n"))
   cat(glue("  Bust weight:    {x$bust_weight}\n"))

@@ -359,6 +359,22 @@ split_wr_te_positions <- function(panel, verbose = TRUE) {
 #' Compute PPR Fantasy Points Per Game from Panel Stats
 #'
 #' @description
+#' DEPRECATED [2026-07-15]. Use \code{run_aging_curve_pipeline(scoring_settings
+#' = ...)}, which routes play-by-play through R/17 via R/16's
+#' \code{attach_scored_ppg()}.
+#'
+#' Retained ONLY so that the aging curves underlying the 2026-07-15 value boards
+#' can be reproduced exactly for A/B comparison against the scored path. Delete
+#' once that diff is complete.
+#'
+#' Why it is deprecated: the eight terms below are hardcoded. They happen to
+#' match DK Best Ball on every term the season panel can support, but the
+#' function is structurally scoring-blind. It cannot represent fumbles,
+#' pick-sixes, first downs, or two-point conversions (those columns are absent
+#' from the R/16 panel entirely), nor per-game threshold bonuses or tiered PPR
+#' (irreducibly game- or play-level), nor TE premium, rush attempt bonus, sack
+#' penalty, or superflex (implementable here, but never wired up).
+#'
 #' Calculates season-level PPR fantasy points per game directly from the
 #' player-season panel columns. This keeps R/23 self-contained without
 #' requiring a re-run of the play-level R/17 scoring engine.
@@ -418,7 +434,9 @@ compute_season_ppg <- function(panel, ppr_value = 1) {
       season_fp_ppr =
         dplyr::coalesce(passing_yards,       0) * 0.04  +
         dplyr::coalesce(pass_tds,            0) * 4     +
-        dplyr::coalesce(interceptions_thrown,0) * (-1)  +
+        # -2 per INT: aligned with the rest of the toolkit (R/24 PPR_INT,
+        # R/28), which scores interceptions at -2, not -1.
+        dplyr::coalesce(interceptions_thrown,0) * (-2)  +
         dplyr::coalesce(rushing_yards,       0) * 0.1   +
         dplyr::coalesce(rush_tds,            0) * 6     +
         dplyr::coalesce(receiving_yards,     0) * 0.1   +
@@ -462,7 +480,12 @@ compute_season_ppg <- function(panel, ppr_value = 1) {
 #'   appear in the panel (within their position group) for their transitions to
 #'   be included. Defaults to \code{MIN_CAREER_SEASONS} (4). Set to 1L to
 #'   disable. Mirrors the NFL rookie contract -- players who wash out before
-#'   4 seasons represent roster turnover, not aging trajectory.
+#'   4 seasons represent roster turnover, not aging trajectory. CAVEAT: this
+#'   is also a survivor-bias filter. Players who decline out of the league in
+#'   years 2-3 are dropped, yet their decline is genuine aging signal;
+#'   filtering them makes late-career aging look milder than it is. Re-running
+#'   with min_career_seasons = 1L is the recommended sensitivity analysis for
+#'   quantifying that bias.
 #' @param filter_low_volume Logical. If TRUE (default) and a \code{low_volume}
 #'   column is present, exclude low-volume player-seasons before computing
 #'   deltas. Low-volume rows are players with too few plays to produce
@@ -802,6 +825,10 @@ load_ngs_season_panel <- function(seasons = NGS_SEASONS, verbose = TRUE) {
 #'     \item{peak_age_quad}{Integer. Age with highest fitted value (quadratic).}
 #'     \item{peak_age_loess}{Integer. Age with highest fitted value (LOESS).}
 #'     \item{sparse_ages}{Integer vector. Ages below min_obs threshold.}
+#'     \item{baseline_age_used}{Integer. Age the cumulative curve was actually
+#'       anchored at. Equals baseline_age unless that age had no transitions,
+#'       in which case the nearest available age was used (and a message
+#'       emitted).}
 #'   }
 #'
 #' @seealso \code{\link{compute_age_deltas}}, \code{\link{run_aging_curve_pipeline}}
@@ -877,6 +904,18 @@ fit_aging_curves <- function(
     if (length(baseline_idx) == 0L) baseline_idx <- 1L
   }
 
+  # Record the anchor actually used. When baseline_age has no transitions in
+  # the data, the nearest-age fallback above re-anchors the curve; surface
+  # that instead of doing it silently.
+  baseline_age_used <- age_grid$age_at_season_start[baseline_idx]
+  if (!isTRUE(baseline_age_used == baseline_age)) {
+    message(glue(
+      "Position {position}: requested baseline_age {baseline_age} has no ",
+      "age transitions; curve re-anchored at nearest available age ",
+      "{baseline_age_used}."
+    ))
+  }
+
   n_ages          <- nrow(age_grid)
   cumulative_vals <- rep(NA_real_, n_ages)
   cumulative_vals[baseline_idx] <- 0
@@ -916,9 +955,17 @@ fit_aging_curves <- function(
     ))
   }
 
+  # Weight both fits by the number of observed transitions at each age so
+  # thin tails (few players) do not pull the curve as hard as well-populated
+  # ages. n_obs can be NA for an age with no transitions (e.g., the baseline
+  # anchor row); floor those at 1 so weights stay valid.
+  fit_data <- fit_data %>%
+    dplyr::mutate(fit_weight = dplyr::coalesce(as.numeric(n_obs), 1))
+
   # --- Quadratic fit ---
   quad_model <- tryCatch(
-    lm(cumulative_value ~ poly(age_at_season_start, 2, raw = FALSE), data = fit_data),
+    lm(cumulative_value ~ poly(age_at_season_start, 2, raw = FALSE),
+       data = fit_data, weights = fit_weight),
     error = function(e) {
       warning(glue("Quadratic fit failed for {position}: {conditionMessage(e)}"))
       NULL
@@ -929,9 +976,10 @@ fit_aging_curves <- function(
   loess_model <- tryCatch(
     loess(
       cumulative_value ~ age_at_season_start,
-      data   = fit_data,
-      span   = loess_span,
-      degree = 2L
+      data    = fit_data,
+      span    = loess_span,
+      degree  = 2L,
+      weights = fit_weight
     ),
     error = function(e) {
       warning(glue("LOESS fit failed for {position}: {conditionMessage(e)}"))
@@ -997,13 +1045,14 @@ fit_aging_curves <- function(
   } else { NA_integer_ }
 
   list(
-    position      = position,
-    age_summary   = age_summary,
-    curve_data    = age_grid,
-    quad_model    = quad_model,
-    peak_age_quad = peak_age_quad,
-    peak_age_loess= peak_age_loess,
-    sparse_ages   = sparse_ages
+    position          = position,
+    age_summary       = age_summary,
+    curve_data        = age_grid,
+    quad_model        = quad_model,
+    peak_age_quad     = peak_age_quad,
+    peak_age_loess    = peak_age_loess,
+    sparse_ages       = sparse_ages,
+    baseline_age_used = baseline_age_used
   )
 }
 
@@ -1720,6 +1769,13 @@ age ", peak_age)
 #' @param seasons Integer vector. Seasons to include. Default \code{PANEL_SEASONS}.
 #' @param cache_dir Character. Cache directory for R/16. Default \code{CACHE_DIR}.
 #' @param save_plots Logical. Save PNG files to output/plots/. Default TRUE.
+#' @param min_career_seasons Integer. Passed through to
+#'   \code{compute_age_deltas()}. Default \code{MIN_CAREER_SEASONS} (4).
+#'   NOTE: this default is a survivor-bias filter -- players who decline out
+#'   of the league in years 2-3 never accumulate 4 seasons, yet their decline
+#'   IS aging signal. Set to 1L for a sensitivity analysis of how much the
+#'   career-length filter flatters late-career aging, without editing the
+#'   toolkit constants.
 #' @param verbose Logical. Print progress messages. Default TRUE.
 #'
 #' @return A named list:
@@ -1759,7 +1815,9 @@ run_aging_curve_pipeline <- function(
     panel     = NULL,
     seasons   = PANEL_SEASONS,
     cache_dir = CACHE_DIR,
+    scoring_settings = NULL,
     save_plots= TRUE,
+    min_career_seasons = MIN_CAREER_SEASONS,
     verbose   = TRUE
 ) {
 
@@ -1815,11 +1873,60 @@ run_aging_curve_pipeline <- function(
   panel <- compute_player_ages(panel, verbose = verbose)
 
   # ------------------------------------------------------------------
-  # Step 3: Compute PPR points per game
+  # Step 3: Compute fantasy points per game
   # ------------------------------------------------------------------
-  if (verbose) message("\nStep 3: Computing PPR points per game...")
+  # Two paths [2026-07-15]:
+  #
+  #   scoring_settings = NULL  -> LEGACY. compute_season_ppg()'s eight
+  #     hardcoded terms. Retained so the curves underlying the 2026-07-15
+  #     value boards remain exactly reproducible for A/B comparison.
+  #     DEPRECATED. Delete once the scored path is validated.
+  #
+  #   scoring_settings = list(...) -> SCORED. Routes play-by-play through
+  #     R/17's engine via R/16's build_player_game_panel(), which supports
+  #     every term R/17 implements: fumbles, per-game threshold bonuses,
+  #     tiered PPR, TE premium, rush attempt bonus, sack penalty, superflex,
+  #     and first-down points. None of these are recoverable from the
+  #     season panel.
+  # ------------------------------------------------------------------
+  if (is.null(scoring_settings)) {
 
-  panel <- compute_season_ppg(panel, ppr_value = 1)
+    if (verbose) {
+      message("\nStep 3: Computing PPR points per game (LEGACY hardcode)...")
+      message(
+        "  NOTE: scoring_settings = NULL uses compute_season_ppg()'s hardcoded\n",
+        "  scale. This is deprecated and cannot represent fumbles, threshold\n",
+        "  bonuses, tiered PPR, TE premium, or first downs. Pass scoring_settings\n",
+        "  to score through R/17."
+      )
+    }
+
+    panel <- compute_season_ppg(panel, ppr_value = 1)
+
+  } else {
+
+    if (verbose) message("\nStep 3: Scoring play-by-play through R/17 (SCORED path)...")
+
+    if (!exists("attach_scored_ppg", mode = "function")) {
+      r16_path <- here::here("R", "16_player_season_panel.R")
+      if (!file.exists(r16_path)) {
+        stop(glue(
+          "R/16_player_season_panel.R not found at: {r16_path}\n",
+          "This file is required for attach_scored_ppg()."
+        ))
+      }
+      if (verbose) message("  Sourcing R/16_player_season_panel.R...")
+      source(r16_path)
+    }
+
+    panel <- attach_scored_ppg(
+      panel            = panel,
+      seasons          = seasons,
+      scoring_settings = scoring_settings,
+      cache_dir        = cache_dir,
+      verbose          = verbose
+    )
+  }
 
   if (verbose) {
     n_with_ppg <- sum(!is.na(panel$fp_per_game))
@@ -1851,7 +1958,7 @@ run_aging_curve_pipeline <- function(
     positions          = CURVE_POSITIONS,
     age_min            = AGE_MIN,
     age_max            = AGE_MAX,
-    min_career_seasons = MIN_CAREER_SEASONS,
+    min_career_seasons = min_career_seasons,
     filter_low_volume  = TRUE
   )
 
@@ -2113,3 +2220,538 @@ run_aging_curve_pipeline <- function(
 # Check sparse age buckets (ages with fewer than MIN_AGE_OBS transitions):
 #   results$curves_boxscore$QB$sparse_ages
 #   results$curves_boxscore$RB$sparse_ages
+
+
+# ==============================================================================
+# SECTION: OUT-OF-SAMPLE CURVE GATE  [2026-07-15]
+# ==============================================================================
+#
+# THE QUESTION
+# ------------
+# run_aging_curve_pipeline() can fit its curves two ways:
+#
+#   scoring_settings = NULL   LEGACY. compute_season_ppg()'s hardcoded PPR
+#                             scale. Scoring-blind: identical curves for every
+#                             league.
+#   scoring_settings = list() SCORED. Play-by-play through R/17, so the curves
+#                             measure the aging of THAT league's points.
+#
+# The scored curves are correct by construction: if you project a league's
+# points, a curve fit on that league's points is the target rather than a proxy.
+# But correctness is not the same as accuracy. Threshold bonuses are chunky and
+# high-variance, and a curve fit on a noisier target can generalize worse. The
+# scoring-blind hardcode may be accidentally smoothing.
+#
+# That is an empirical question and this is what settles it, per league.
+#
+# THE DESIGN
+# ----------
+# Temporal expanding window. For each test season t, fit both curves on
+# transitions completing STRICTLY BEFORE t, then predict season t. Nothing the
+# curve saw at fit time comes from t or later.
+#
+# Three arms, all starting from the SAME league-scored baseline, so the only
+# thing that varies is which curve's delta is added:
+#
+#   null     pred = ppg[t-1]
+#   legacy   pred = ppg[t-1] + legacy_curve(age)      <- PPR-scale delta
+#   scored   pred = ppg[t-1] + scored_curve(age)      <- league-scale delta
+#   actual   ppg[t] under the league's scoring
+#
+# The legacy arm deliberately adds a PPR-scale delta to a league-scale baseline.
+# That is not a flaw in the test, it is what R/29 does in production today, so
+# the test replicates the real usage rather than an idealized one.
+#
+# THE NULL ARM IS THE POINT. If both curves lose to "assume no change", the
+# aging adjustment itself is the finding and which curve wins is moot. The same
+# control retired the veteran talent multiplier and the coach prior.
+#
+# UNCERTAINTY
+# -----------
+# Player-clustered bootstrap. A player contributes up to one row per test
+# season; treating those as independent manufactures significance. Resampling
+# players rather than rows is what collapsed the apparent NGS RB edge.
+#
+# KNOWN LIMITATION: SURVIVORSHIP
+# ------------------------------
+# compute_age_deltas() applies MIN_CAREER_SEASONS using career length measured
+# across the WHOLE panel. Computed once and split by season, the 2016 fold
+# therefore contains only players who turned out to have long careers, which is
+# information from after 2016.
+#
+# This inflates every arm's absolute accuracy. It does NOT bias the comparison:
+# all three arms are scored on the identical row set, so the RANKING is sound
+# while the absolute RMSE is optimistic. Read the deltas between arms, not the
+# levels. Fixing it means recomputing career length per fold and is a separate
+# item.
+#
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# Internal: year-over-year delta implied by a fitted curve, at given ages
+# ------------------------------------------------------------------------------
+# CRITICAL [2026-07-15]. fit_aging_curves() does NOT fit its LOESS on mean_delta.
+# It fits on cumulative_value (R/23:947), a reconstructed production LEVEL
+# anchored at 0 on AGE_BASELINE. So fitted_loess is a level, not a delta, and
+# adding it to a per-game average is meaningless. The first version of this gate
+# did exactly that and reported that both aging curves were significantly worse
+# than no adjustment at every position. That result was entirely an artifact.
+#
+# cumulative_value is built as cumulative[i] = cumulative[i-1] + mean_delta[i]
+# (R/23:903), so by construction:
+#
+#     C(a) - C(a-1) = mean_delta(a)
+#
+# The year-over-year delta for a player arriving at age a is therefore the
+# DIFFERENCE of the fitted curve between a-1 and a. Transitions are consecutive
+# seasons by construction in compute_age_deltas(), so age always advances by
+# exactly 1 and this is well defined.
+#
+# fit_aging_curves() returns quad_model but not the loess model object, so the
+# level lookup is a table read rather than predict(). Ages are integers, so it
+# is exact wherever the training fold had coverage. Ages it did not cover fall
+# back to the NEAREST covered age; dropping them instead would change the test
+# sample between arms. Carry count is returned so it is reported, not hidden.
+# ------------------------------------------------------------------------------
+.lookup_curve_delta <- function(curve, ages, metric = c("loess", "quad")) {
+
+  metric <- match.arg(metric)
+  col    <- if (metric == "loess") "fitted_loess" else "fitted_quad"
+
+  na_out <- list(delta = rep(NA_real_, length(ages)), n_carried = NA_integer_)
+
+  if (is.null(curve) || is.null(curve$curve_data) ||
+      !col %in% names(curve$curve_data)) {
+    return(na_out)
+  }
+
+  grid <- curve$curve_data %>%
+    dplyr::filter(!is.na(.data[[col]])) %>%
+    dplyr::arrange(age_at_season_start) %>%
+    dplyr::select(age_at_season_start, .fit = dplyr::all_of(col))
+
+  if (nrow(grid) < 2L) return(na_out)
+
+  # Level at an arbitrary age, nearest-age fallback outside coverage.
+  .level_at <- function(a) {
+    exact <- grid$.fit[match(a, grid$age_at_season_start)]
+    need  <- is.na(exact) & !is.na(a)
+    if (any(need)) {
+      nearest <- vapply(
+        a[need],
+        function(x) which.min(abs(grid$age_at_season_start - x)),
+        integer(1)
+      )
+      exact[need] <- grid$.fit[nearest]
+    }
+    list(v = exact, n_need = sum(need))
+  }
+
+  lv_now  <- .level_at(ages)
+  lv_prev <- .level_at(ages - 1L)
+
+  list(
+    delta     = lv_now$v - lv_prev$v,
+    n_carried = lv_now$n_need + lv_prev$n_need
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# Internal: panel with BOTH metrics attached, ages computed, positions split
+# ------------------------------------------------------------------------------
+.prepare_oos_panel <- function(panel,
+                               scoring_settings,
+                               seasons,
+                               cache_dir,
+                               game_cache_dir,
+                               verbose) {
+
+  if (verbose) message("\n  [1/4] Computing player ages...")
+  panel <- compute_player_ages(panel, verbose = FALSE)
+
+  if (verbose) message("  [2/4] Legacy metric (hardcoded PPR scale)...")
+  legacy_panel <- compute_season_ppg(panel, ppr_value = 1)
+
+  if (verbose) message("  [3/4] Scored metric (league scoring via R/17)...")
+  if (!exists("attach_scored_ppg", mode = "function")) {
+    r16_path <- here::here("R", "16_player_season_panel.R")
+    if (!file.exists(r16_path)) {
+      stop(glue("R/16_player_season_panel.R not found at: {r16_path}"))
+    }
+    source(r16_path)
+  }
+  scored_panel <- attach_scored_ppg(
+    panel            = panel,
+    seasons          = seasons,
+    scoring_settings = scoring_settings,
+    cache_dir        = cache_dir,
+    game_cache_dir   = game_cache_dir,
+    verbose          = verbose
+  )
+
+  out <- legacy_panel %>%
+    dplyr::mutate(season = as.integer(season)) %>%
+    dplyr::select(player_id, season, fp_legacy = fp_per_game) %>%
+    dplyr::inner_join(
+      scored_panel %>%
+        dplyr::mutate(season = as.integer(season)) %>%
+        dplyr::select(-dplyr::any_of("fp_legacy")),
+      by = c("player_id", "season")
+    ) %>%
+    dplyr::rename(fp_scored = fp_per_game)
+
+  # Both metrics divide by the same games_played, so a row present in one and
+  # absent from the other means something upstream diverged. The inner_join
+  # above would hide that by silently dropping it.
+  if (nrow(out) != nrow(legacy_panel)) {
+    stop(glue(
+      ".prepare_oos_panel(): legacy panel has {nrow(legacy_panel)} rows but ",
+      "only {nrow(out)} survived the join to the scored panel. The two metrics ",
+      "should cover identical player-seasons. Investigate before proceeding."
+    ), call. = FALSE)
+  }
+
+  if (verbose) message("  [4/4] Splitting WR_TE into WR and TE...")
+  out <- split_wr_te_positions(out, verbose = FALSE)
+
+  out
+}
+
+
+# ------------------------------------------------------------------------------
+# Internal: one test season. Fit on season < t, predict t.
+# ------------------------------------------------------------------------------
+.aging_oos_fold <- function(deltas_legacy,
+                            deltas_scored,
+                            test_season,
+                            positions,
+                            curve_metric,
+                            min_train_transitions,
+                            verbose) {
+
+  train_legacy <- deltas_legacy %>% dplyr::filter(season < test_season)
+  train_scored <- deltas_scored %>% dplyr::filter(season < test_season)
+
+  # Test rows must be IDENTICAL across arms, so join the two delta frames and
+  # keep only transitions both represent. prev_scored is the shared baseline;
+  # metric_scored is the target. The legacy columns are not used to predict,
+  # only to confirm the row exists in both.
+  test <- deltas_scored %>%
+    dplyr::filter(season == test_season) %>%
+    dplyr::select(player_id, player_name, position_group, season,
+                  age_at_season_start,
+                  actual = metric_value, base = prev_metric_value) %>%
+    dplyr::semi_join(
+      deltas_legacy %>% dplyr::filter(season == test_season),
+      by = c("player_id", "season")
+    )
+
+  if (nrow(test) == 0L) return(NULL)
+
+  res <- purrr::map_dfr(positions, function(p) {
+
+    tr_l <- train_legacy %>% dplyr::filter(position_group == p)
+    tr_s <- train_scored %>% dplyr::filter(position_group == p)
+    te   <- test        %>% dplyr::filter(position_group == p)
+
+    if (nrow(te) == 0L) return(NULL)
+
+    if (nrow(tr_l) < min_train_transitions || nrow(tr_s) < min_train_transitions) {
+      if (verbose) message(glue(
+        "      {p}: only {min(nrow(tr_l), nrow(tr_s))} training transitions ",
+        "(< {min_train_transitions}). Fold skipped for this position."
+      ))
+      return(NULL)
+    }
+
+    curve_l <- suppressWarnings(fit_aging_curves(tr_l, position = p))
+    curve_s <- suppressWarnings(fit_aging_curves(tr_s, position = p))
+
+    if (is.null(curve_l) || is.null(curve_s)) return(NULL)
+
+    look_l <- .lookup_curve_delta(curve_l, te$age_at_season_start, curve_metric)
+    look_s <- .lookup_curve_delta(curve_s, te$age_at_season_start, curve_metric)
+
+    te %>%
+      dplyr::mutate(
+        pred_null   = base,
+        pred_legacy = base + look_l$delta,
+        pred_scored = base + look_s$delta,
+        n_train_legacy = nrow(tr_l),
+        n_train_scored = nrow(tr_s),
+        n_carried_legacy = look_l$n_carried,
+        n_carried_scored = look_s$n_carried
+      )
+  })
+
+  if (is.null(res) || nrow(res) == 0L) return(NULL)
+
+  # An arm with an NA prediction cannot be scored, and dropping the row from one
+  # arm only would break the like-for-like comparison. Drop from ALL arms or
+  # none.
+  res %>%
+    dplyr::filter(!is.na(actual), !is.na(pred_null),
+                  !is.na(pred_legacy), !is.na(pred_scored))
+}
+
+
+# ------------------------------------------------------------------------------
+# Internal: RMSE per position per arm on a given row set
+# ------------------------------------------------------------------------------
+.arm_rmse <- function(df) {
+  df %>%
+    dplyr::group_by(position_group) %>%
+    dplyr::summarise(
+      n           = dplyr::n(),
+      rmse_null   = sqrt(mean((actual - pred_null)^2)),
+      rmse_legacy = sqrt(mean((actual - pred_legacy)^2)),
+      rmse_scored = sqrt(mean((actual - pred_scored)^2)),
+      .groups = "drop"
+    )
+}
+
+
+#' Out-of-Sample Gate: Does Scoring-Aware Aging Beat the Scoring-Blind Hardcode?
+#'
+#' @description
+#' Settles, for a GIVEN league scoring, whether curves fit on that league's
+#' points predict next season better than curves fit on
+#' \code{compute_season_ppg()}'s hardcoded PPR scale, and whether either beats
+#' applying no aging adjustment at all.
+#'
+#' Temporal expanding window: for each test season, both curves are fit only on
+#' transitions completing strictly earlier, then used to predict that season.
+#' All three arms predict the same target from the same baseline on the same
+#' rows; only the added delta differs.
+#'
+#' @param panel Tibble. Output of \code{build_player_season_panel()}. Ages are
+#'   computed internally; do not pre-compute them.
+#' @param scoring_settings Named list in R/17's schema. REQUIRED. This is the
+#'   league being tested. There is no default: a default would invite the same
+#'   silent-wrong-scoring failure this gate exists to detect.
+#' @param test_seasons Integer vector. Seasons to predict. Default 2016:2025.
+#' @param positions Character vector. Default \code{CURVE_POSITIONS}.
+#' @param curve_metric "loess" (default) or "quad". Which fitted curve to read.
+#' @param min_train_transitions Integer. Minimum training transitions for a
+#'   position-fold to be fit at all. Default 100.
+#' @param n_boot Integer. Player-clustered bootstrap resamples. Default 1000.
+#'   Set 0 to skip.
+#' @param seed Integer. RNG seed for the bootstrap. Default 1234.
+#' @param cache_dir,game_cache_dir Passed to \code{attach_scored_ppg()}.
+#' @param verbose Logical.
+#'
+#' @return A named list:
+#'   \describe{
+#'     \item{predictions}{Tibble. One row per scored test transition, all arms.}
+#'     \item{rmse}{Tibble. RMSE per position per arm, pooled across folds.}
+#'     \item{by_season}{Tibble. RMSE per position per arm per test season.}
+#'     \item{boot}{Tibble or NULL. Bootstrap CIs on the RMSE differences.}
+#'     \item{carried}{Tibble. How often a curve delta was carried from a
+#'       neighbouring age because the training fold lacked that age.}
+#'     \item{scoring_settings}{The list that was tested.}
+#'   }
+#'
+#' @seealso \code{\link{run_aging_curve_pipeline}}, \code{\link{fit_aging_curves}}
+#'
+#' @export
+run_aging_curve_oos_gate <- function(
+    panel,
+    scoring_settings,
+    test_seasons          = 2016:2025,
+    positions             = CURVE_POSITIONS,
+    curve_metric          = c("loess", "quad"),
+    min_train_transitions = 100L,
+    n_boot                = 1000L,
+    seed                  = 1234L,
+    cache_dir             = CACHE_DIR,
+    game_cache_dir        = here::here("data", "season3_cache"),
+    verbose               = TRUE
+) {
+
+  curve_metric <- match.arg(curve_metric)
+
+  if (missing(scoring_settings) || is.null(scoring_settings)) {
+    stop(
+      "scoring_settings is required. This gate compares a league's own scoring ",
+      "against the scoring-blind PPR hardcode; there is no meaningful default.",
+      call. = FALSE
+    )
+  }
+  if (!is.data.frame(panel) || nrow(panel) == 0L) {
+    stop("panel must be a non-empty data frame from build_player_season_panel().")
+  }
+
+  panel_seasons <- sort(unique(as.integer(panel$season)))
+  bad <- setdiff(test_seasons, panel_seasons)
+  if (length(bad) > 0L) {
+    stop(glue(
+      "test_seasons not present in panel: {paste(bad, collapse = ', ')}"
+    ), call. = FALSE)
+  }
+  if (min(test_seasons) <= min(panel_seasons) + 1L) {
+    stop(glue(
+      "test_seasons starts at {min(test_seasons)} but the panel starts at ",
+      "{min(panel_seasons)}. The earliest fold would have no training data."
+    ), call. = FALSE)
+  }
+
+  if (verbose) {
+    message("\n========================================")
+    message("  Aging Curve OOS Gate")
+    message("========================================")
+    message(glue("Panel        : {min(panel_seasons)}-{max(panel_seasons)}"))
+    message(glue("Test seasons : {min(test_seasons)}-{max(test_seasons)}"))
+    message(glue("Curve metric : {curve_metric}"))
+    message(glue("Bootstrap    : {n_boot} player-clustered resamples"))
+  }
+
+  prepped <- .prepare_oos_panel(
+    panel            = panel,
+    scoring_settings = scoring_settings,
+    seasons          = panel_seasons,
+    cache_dir        = cache_dir,
+    game_cache_dir   = game_cache_dir,
+    verbose          = verbose
+  )
+
+  if (verbose) message("\n  Computing deltas for both metrics...")
+  deltas_legacy <- compute_age_deltas(prepped, metric_col = "fp_legacy",
+                                      positions = positions)
+  deltas_scored <- compute_age_deltas(prepped, metric_col = "fp_scored",
+                                      positions = positions)
+
+  if (verbose) {
+    message(glue(
+      "    legacy: {format(nrow(deltas_legacy), big.mark = ',')} transitions | ",
+      "scored: {format(nrow(deltas_scored), big.mark = ',')} transitions"
+    ))
+  }
+
+  if (verbose) message("\n  Running folds...")
+  folds <- purrr::map_dfr(sort(test_seasons), function(t) {
+    if (verbose) message(glue("    Test season {t} (train: < {t})..."))
+    .aging_oos_fold(
+      deltas_legacy         = deltas_legacy,
+      deltas_scored         = deltas_scored,
+      test_season           = t,
+      positions             = positions,
+      curve_metric          = curve_metric,
+      min_train_transitions = min_train_transitions,
+      verbose               = verbose
+    )
+  })
+
+  if (is.null(folds) || nrow(folds) == 0L) {
+    stop("No test rows survived. Check test_seasons and min_train_transitions.",
+         call. = FALSE)
+  }
+
+  rmse_pooled <- .arm_rmse(folds)
+
+  by_season <- folds %>%
+    dplyr::group_by(season, position_group) %>%
+    dplyr::summarise(
+      n           = dplyr::n(),
+      rmse_null   = sqrt(mean((actual - pred_null)^2)),
+      rmse_legacy = sqrt(mean((actual - pred_legacy)^2)),
+      rmse_scored = sqrt(mean((actual - pred_scored)^2)),
+      .groups = "drop"
+    )
+
+  carried <- folds %>%
+    dplyr::group_by(season, position_group) %>%
+    dplyr::summarise(
+      n_rows           = dplyr::n(),
+      n_carried_legacy = dplyr::first(n_carried_legacy),
+      n_carried_scored = dplyr::first(n_carried_scored),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(n_carried_legacy > 0 | n_carried_scored > 0)
+
+  # --------------------------------------------------------------------------
+  # Player-clustered bootstrap on the RMSE DIFFERENCES
+  # --------------------------------------------------------------------------
+  # Resample PLAYERS with replacement and take all of a sampled player's rows.
+  # A player appears in up to one row per test season and those rows are
+  # correlated; resampling rows would treat them as independent and shrink the
+  # interval until noise looks like signal.
+  # --------------------------------------------------------------------------
+  boot <- NULL
+  if (n_boot > 0L) {
+    if (verbose) message(glue("\n  Bootstrapping ({n_boot} resamples, clustered on player)..."))
+    set.seed(seed)
+
+    boot <- purrr::map_dfr(positions, function(p) {
+      dp <- folds %>% dplyr::filter(position_group == p)
+      if (nrow(dp) == 0L) return(NULL)
+
+      players <- unique(dp$player_id)
+      idx     <- split(seq_len(nrow(dp)), dp$player_id)
+
+      .rmse <- function(a, pr) sqrt(mean((a - pr)^2))
+
+      # Order is fixed explicitly rather than read off rownames(): vapply only
+      # carries names through when FUN.VALUE is named, and a NULL rowname here
+      # would silently produce a zero-row tibble.
+      cmp_names <- c("scored_minus_legacy", "scored_minus_null",
+                     "legacy_minus_null")
+
+      draws <- vapply(seq_len(n_boot), function(b) {
+        samp <- sample(players, length(players), replace = TRUE)
+        rows <- unlist(idx[samp], use.names = FALSE)
+        d    <- dp[rows, ]
+        r_s  <- .rmse(d$actual, d$pred_scored)
+        r_l  <- .rmse(d$actual, d$pred_legacy)
+        r_n  <- .rmse(d$actual, d$pred_null)
+        c(r_s - r_l, r_s - r_n, r_l - r_n)
+      }, FUN.VALUE = numeric(3))
+
+      r_s0 <- .rmse(dp$actual, dp$pred_scored)
+      r_l0 <- .rmse(dp$actual, dp$pred_legacy)
+      r_n0 <- .rmse(dp$actual, dp$pred_null)
+
+      tibble::tibble(
+        position   = p,
+        comparison = cmp_names,
+        point      = c(r_s0 - r_l0, r_s0 - r_n0, r_l0 - r_n0),
+        ci_lo      = apply(draws, 1, stats::quantile, probs = 0.025, na.rm = TRUE),
+        ci_hi      = apply(draws, 1, stats::quantile, probs = 0.975, na.rm = TRUE)
+      ) %>%
+        dplyr::mutate(crosses_zero = (ci_lo <= 0 & ci_hi >= 0))
+    })
+  }
+
+  if (verbose) {
+    message("\n--- POOLED RMSE (lower is better) ---")
+    print(as.data.frame(rmse_pooled), row.names = FALSE)
+
+    if (!is.null(boot)) {
+      message("\n--- RMSE DIFFERENCES (negative = first arm better) ---")
+      message("    CI crossing zero = no distinguishable difference.")
+      print(as.data.frame(boot), row.names = FALSE)
+    }
+
+    if (nrow(carried) > 0L) {
+      message(glue(
+        "\n  NOTE: curve deltas carried from a neighbouring age in ",
+        "{nrow(carried)} position-fold(s). See $carried."
+      ))
+    }
+
+    message("\n  REMINDER: MIN_CAREER_SEASONS is applied across the whole panel,")
+    message("  so absolute RMSE is optimistic (survivorship). All arms share the")
+    message("  identical rows, so the RANKING holds. Read differences, not levels.")
+    message("\n========================================\n")
+  }
+
+  list(
+    predictions      = folds,
+    rmse             = rmse_pooled,
+    by_season        = by_season,
+    boot             = boot,
+    carried          = carried,
+    scoring_settings = scoring_settings
+  )
+}
