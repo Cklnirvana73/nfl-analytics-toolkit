@@ -430,6 +430,50 @@ utils::globalVariables(c(
 
 
 # ------------------------------------------------------------------------------
+# .build_player_uid
+#
+# Deterministic, never-NA identity key for a player row.
+#
+# WHY THIS EXISTS
+# ---------------
+# nfl_gsis_id is the natural join key but it is NA for two distinct groups:
+# the incoming prospect cohort (no NFL identity assigned yet) and a small
+# number of drafted training players who never appeared on an NFL roster and
+# therefore never received a gsis. Keying on it anyway has two failure modes.
+# dplyr's default na_matches = "na" lets NA-keyed rows match EACH OTHER in a
+# Cartesian fan-out, and any consumer filtering !is.na(nfl_gsis_id) silently
+# drops those rows entirely. Both are silent: no error, just wrong numbers.
+#
+# player_uid removes both by guaranteeing a non-NA key on every row:
+#   - the real nfl_gsis_id wherever one exists
+#   - else a synthetic "rk_<normname>_<draft_year>_<position>"
+#
+# position is part of the synthetic key on purpose, so a genuinely
+# dual-position prospect splits into two unambiguous keys rather than one
+# ambiguous row.
+#
+# CONTRACT WITH R/39
+# ------------------
+# R/39 builds the same key for the rookie cohort and must stay byte-identical
+# to this. Both sides normalize through .normalize_player_name()'s logic
+# (lowercase, strip generational suffixes, strip to a-z). R/39 carries its own
+# copy of that normalizer because it is deliberately self-contained and sources
+# nothing; if either is ever changed, the other must change with it or the two
+# halves of the augmented predictions file will key differently.
+#
+# Vectorized: all four arguments are columns of equal length.
+# ------------------------------------------------------------------------------
+.build_player_uid <- function(nfl_gsis_id, cfb_player_name, draft_year,
+                              position) {
+  syn <- paste0(
+    "rk_", .normalize_player_name(cfb_player_name),
+    "_", draft_year, "_", position
+  )
+  ifelse(!is.na(nfl_gsis_id), as.character(nfl_gsis_id), syn)
+}
+
+
+# ------------------------------------------------------------------------------
 # .compute_team_pass_attempts
 #
 # Computes total team pass attempts per college team per season by summing
@@ -1632,8 +1676,13 @@ build_translation_features <- function(cfb_panel,
 #'       Final models fitted on all training data.}
 #'     \item{models_enriched}{Named list of 4 cv.glmnet objects.}
 #'     \item{loco_predictions}{tibble: player-level LOCO predictions with
-#'       columns nfl_gsis_id, draft_year, draft_position, ppr_per_game_y13,
-#'       pred_base, pred_enriched, is_hit.}
+#'       columns player_uid, nfl_gsis_id, cfb_player_name, draft_year,
+#'       draft_position, ppr_per_game_y13, pred_base, pred_enriched, is_hit,
+#'       peak_ppr_per_game, peak_career_year, the eight observed stat
+#'       components, and pred_base_/pred_enriched_ predictions for each.
+#'       player_uid is the never-NA downstream join key: use it rather than
+#'       nfl_gsis_id, which is NA for drafted players who never reached an NFL
+#'       roster.}
 #'     \item{loco_performance}{tibble: RMSE, MAE, R-squared per position per
 #'       model variant.}
 #'     \item{impute_medians}{Passed through from feature_matrix for use in
@@ -1885,7 +1934,20 @@ train_translation_model <- function(feature_matrix,
 
     loco_pred_list[[pos]] <- dplyr::bind_cols(
       tibble::tibble(
+        # Season 3 Wave A2 key fix: player_uid is built HERE, upstream, so
+        # every consumer of s2_week10_predictions.rds inherits a never-NA join
+        # key instead of each rebuilding one. Two drafted training players
+        # (2015 WR, 2020 QB) have no gsis because they never reached an NFL
+        # roster; keyed on nfl_gsis_id they collide NA-on-NA. cfb_player_name
+        # travels with them so the synthetic key can be constructed at all --
+        # the LOCO file previously carried no name, which is why R/39 could
+        # not build one on its own.
+        player_uid       = .build_player_uid(
+          train_df$nfl_gsis_id, train_df$cfb_player_name,
+          train_df$draft_year, pos
+        ),
         nfl_gsis_id      = train_df$nfl_gsis_id,
+        cfb_player_name  = train_df$cfb_player_name,
         draft_year       = train_df$draft_year,
         draft_position   = pos,
         ppr_per_game_y13 = y,
@@ -1910,6 +1972,35 @@ train_translation_model <- function(feature_matrix,
   }
 
   loco_predictions <- dplyr::bind_rows(loco_pred_list)
+
+  # player_uid is the downstream join key and must be unique within this frame.
+  # A duplicate means two rows will fan out on any join keyed to it, which is
+  # the exact failure the key exists to prevent. Surface it here, by name,
+  # rather than letting it propagate into R/39's augmented file and R/29's
+  # priors where the cause is much harder to see.
+  dup_uid <- unique(
+    loco_predictions$player_uid[duplicated(loco_predictions$player_uid)]
+  )
+  if (length(dup_uid) > 0L) {
+    dup_rows <- loco_predictions %>%
+      dplyr::filter(player_uid %in% dup_uid) %>%
+      dplyr::select(player_uid, cfb_player_name, draft_position, draft_year)
+    warning(glue(
+      "{length(dup_uid)} duplicated player_uid(s) in loco_predictions. ",
+      "Two distinct players are sharing one key; joins on player_uid will ",
+      "fan out. Offending rows printed below."
+    ), call. = FALSE)
+    print(as.data.frame(dup_rows))
+  }
+
+  n_na_uid <- sum(is.na(loco_predictions$player_uid))
+  if (n_na_uid > 0L) {
+    warning(glue(
+      "{n_na_uid} NA player_uid(s) in loco_predictions. player_uid is ",
+      "never-NA by construction, so this means cfb_player_name was also NA ",
+      "for a gsis-less row. Inspect the crosswalk for that player."
+    ), call. = FALSE)
+  }
 
   # Quick LOCO performance table
   loco_performance <- loco_predictions %>%

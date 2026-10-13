@@ -25,8 +25,12 @@
 # priors and blends at 85% R/31 weight (because score_final_fallback means
 # R/29 had nothing to anchor on). Final: ~7 PPG. Drops from WR31 to WR60ish.
 #
-# BLEND WEIGHT BY R/29 PRIOR SOURCE (RB/WR/TE)
+# BLEND WEIGHT BY R/29 PRIOR SOURCE (RB only, as of 2026-08-09)
 # ----------------------------------
+# WR and TE now take a flat position weight from
+# BLEND_POSITION_WEIGHT_OVERRIDE (WR 0.10, TE 0.05) and IGNORE the table below.
+# See that constant for the forward-chained evidence. RB still uses the table.
+#
 # Higher weight on R/31 when R/29 has less reliable input data. Live values in
 # BLEND_WEIGHTS_BY_PRIOR_SOURCE:
 #   veteran_history_only         = 0.275 (R/45 in-sample sweep; re-derivation pending)
@@ -108,11 +112,25 @@
 #   r32_posterior_mu            dbl   Final reconciled projection (QB1 blended
 #                                      toward the anchor; QB2/QB3 depth-scaled)
 #   r32_delta_from_r29          dbl   r32_posterior_mu - r29_posterior_mu
-#   r32_projection_lower_80     dbl   Shifted to new posterior
-#   r32_projection_upper_80     dbl   Shifted to new posterior
-#   r32_projection_lower_95     dbl   Shifted to new posterior
-#   r32_projection_upper_95     dbl   Shifted to new posterior
-#   schema_tag                  chr   "s2_w15_reconciled_v3"
+#   r32_posterior_sigma         dbl   tau on the R/32 posterior. PROPAGATED
+#                                      through the volume blend rather than
+#                                      copied from r29_posterior_sigma. See
+#                                      BLEND_SIGMA_VOL_MODE. [2026-08-10]
+#                                      Also scaled by qb_discount_factor when
+#                                      the depth discount is applied to mu (a
+#                                      playing-time discount SCALES both mean
+#                                      and spread), which is currently OFF; see
+#                                      QB_DEPTH_DISCOUNT_APPLY_TO_MU.
+#   r32_projection_lower_80     dbl   Shifted for RB/WR/TE; SCALED by the depth
+#   r32_projection_upper_80     dbl    factor for discounted QBs. The header
+#   r32_projection_lower_95     dbl    previously said all four were shifted,
+#   r32_projection_upper_95     dbl    which was wrong for the QB branch and
+#                                      made preserved width look like a bug.
+#   r29_boom_probability        dbl   R/29's tail prob against r29_posterior_mu
+#   r29_bust_probability        dbl   Retained for audit only. Do NOT consume.
+#   boom_probability            dbl   RECOMPUTED against r32_posterior_mu and
+#   bust_probability            dbl    r32_posterior_sigma. [2026-07-30]
+#   schema_tag                  chr   "s2_w15_reconciled_v5"
 #
 # SOURCE DEPENDENCIES
 # -------------------
@@ -217,6 +235,13 @@ source(here::here("R", "31_player_volume_allocation.R"))
 # loaded; fails loudly rather than drifting if R/29 cannot load.
 if (!exists("compute_prior_weight")) {
   source(here::here("R", "29_projection_engine.R"))
+}
+
+# R/53 supplies pidr_build_authority() / pidr_resolve(), which reconcile the
+# placeholder gsis ids R/29 inherits from the draft table against the real
+# ids R/31 carries from the depth chart. Evidence at STEP 2 below.
+if (!exists("pidr_resolve")) {
+  source(here::here("R", "53_player_identity.R"))
 }
 
 # ------------------------------------------------------------------------------
@@ -496,6 +521,12 @@ SACK_ADJUSTMENT <- 0.935
 BLEND_WEIGHTS_BY_PRIOR_SOURCE <- c(
   "veteran_history_only"         = 0.275,  # R/45 in-sample sweep; re-derivation pending
   "phased_out_history_only"      = 0.325,  # R/45 in-sample sweep; re-derivation pending
+  # [2026-09-18] phaseout_stale_history was never keyed here and fell through
+  # to DEFAULT_R31_WEIGHT (0.50) with no message. Same family as
+  # phased_out_history_only (history, no translation; only the window is
+  # older), so it takes that value. JUDGMENT-SET; R/45 never swept this key.
+  # Only RB reaches this table (WR/TE are position-overridden above).
+  "phaseout_stale_history"       = 0.325,
   "translation_active"           = 0.50,   # provisional; phase-2 re-fit pending
   "translation_capped_rookie"    = 0.50,   # provisional; phase-2 re-fit pending
   "phaseout_no_history_fallback" = 0.50,   # provisional; no clean backtest yet
@@ -504,6 +535,50 @@ BLEND_WEIGHTS_BY_PRIOR_SOURCE <- c(
 
 # Fallback weight for any unrecognized prior_source value
 DEFAULT_R31_WEIGHT <- 0.50
+
+# ------------------------------------------------------------------------------
+# POSITION-LEVEL BLEND WEIGHT OVERRIDE  [2026-08-09]
+# ------------------------------------------------------------------------------
+# For the positions named here, the prior_source table above is BYPASSED and the
+# flat weight below is used instead. Positions absent from this vector keep the
+# prior_source table unchanged.
+#
+# EVIDENCE. Forward-chained across 7 holdout seasons (2018-2025, 2020 excluded):
+# the blend weight was fitted on all seasons BEFORE the test season and scored
+# on the test season, so no weight was ever chosen on the rows it was judged on.
+#
+#   out-of-sample mean MAE          seasons the fitted weight
+#            live    fitted          beat the live weight
+#   WR       2.77     2.68                6 of 6
+#   TE       2.59     2.45                6 of 6
+#   RB       3.91     3.94                3 of 6
+#
+# The fitted weight is stable at WR and TE and unstable at RB:
+#   WR  0.10 0.05 0.05 0.10 0.10 0.10   sd 0.026
+#   TE  0.15 0.00 0.00 0.00 0.05 0.05   sd 0.058
+#   RB  0.45 0.30 0.15 0.30 0.35 0.35   sd 0.098
+#
+# RB IS DELIBERATELY ABSENT. Its fitted weight is worse than the live weight on
+# average and wins only half the time, and it swings 30 points year to year.
+# There is no evidence to move it, and changing it for the sake of a tidy
+# symmetric design would be a preference, not a finding.
+#
+# prior_source ADDS NOTHING ONCE POSITION IS KNOWN. A position x prior_source
+# table was fitted the same way and lost to position alone in 6 of 6 seasons at
+# WR and 5 of 6 at TE. That is what fitting noise looks like, so the source
+# structure is bypassed rather than scaled.
+#
+# CAVEAT: the gains are small, 0.09 PPG of MAE at WR and 0.14 at TE. They are
+# consistent rather than large. The mechanism matters more than the size: the
+# volume estimate was dragging receivers and tight ends toward the middle, which
+# feeds the spread compression measured across all seven seasons.
+#
+# Set BLEND_POSITION_WEIGHT_OVERRIDE to an empty named numeric to neutralize
+# and fall back entirely to the prior_source table.
+BLEND_POSITION_WEIGHT_OVERRIDE <- c(
+  "WR" = 0.10,
+  "TE" = 0.05
+)
 
 # Positions reconciled in v1 (QB excluded by design)
 RECON_POSITIONS <- c("RB", "WR", "TE")
@@ -525,7 +600,7 @@ OUTPUT_CSV_PATH_RECON <- here::here(
   "data", "season2_cache", "s2_week15_reconciled_projections.csv"
 )
 
-SCHEMA_TAG_RECON <- "s2_w15_reconciled_v3"
+SCHEMA_TAG_RECON <- "s2_w15_reconciled_v6"   # v6: phaseout_stale_history keyed in both blend tables; R/29 ytd_obs_weight/ytd_weight_mode pass through [2026-09-18]
 
 # QB depth discount multipliers by depth_position from R/31.
 # Backup QBs inherit starter-level R/29 projections because R/29 uses
@@ -544,6 +619,42 @@ QB_DEPTH_DISCOUNT_MULT <- c(
 QB_DEPTH_DISCOUNT_DEFAULT_MULT <- 0.05  # depth_position outside QB1/QB2/QB3
 
 # ------------------------------------------------------------------------------
+# THE DISCOUNT IS NO LONGER APPLIED TO r32_posterior_mu.  [2026-08-09]
+# ------------------------------------------------------------------------------
+# UNITS ERROR, measured on the 2018-2025 temporal holdout.
+#
+# r32_posterior_mu is scored against fp_per_game = points / GAMES PLAYED. A
+# backup who starts six games and scores 20 in each has a realized PPG of 20.
+# Multiplying by 0.15 answers a different question -- expected contribution
+# across a season including the games he does not play -- and then compares
+# that season-availability quantity to a per-game rate.
+#
+# Measured damage, backup QBs who played 8+ games (n = 44 across 7 seasons):
+#
+#            mean projection   MAE vs realized
+#   r29 (undiscounted)  10.5        5.87
+#   r32 (discounted)     1.44      13.05
+#   realized            14.5
+#
+# The discount made the projection more than twice as wrong. Individual cases:
+#   Josh Allen 2018      r29 7.4  -> r32 1.1  -> actual 20.4
+#   Baker Mayfield 2018  r29 9.8  -> r32 1.5  -> actual 21.0
+#   Ryan Tannehill 2019  r29 16.6 -> r32 2.5  -> actual 25.1
+#   Brock Purdy 2022     r29 8.3  -> r32 0.4  -> actual 17.0
+#
+# QB1s were never touched and are well calibrated (MAE 3.36, mean projection
+# 20.9 vs realized 20.4), which is why this went unnoticed.
+#
+# THE FACTOR IS STILL COMPUTED AND STILL EMITTED as qb_discount_factor. It is
+# a real and useful quantity -- it just belongs to a season-contribution
+# question, not a per-game one. R/33 applies it when building VORP, where
+# "is this player worth a roster spot" is the actual question being asked.
+#
+# Set QB_DEPTH_DISCOUNT_APPLY_TO_MU to TRUE to restore the old behaviour with
+# the machinery intact. Do not do so without re-running the holdout.
+QB_DEPTH_DISCOUNT_APPLY_TO_MU <- FALSE
+
+# ------------------------------------------------------------------------------
 # QB v2 ANCHOR CONSTANTS
 # ------------------------------------------------------------------------------
 
@@ -559,6 +670,47 @@ QB_RUSH_EFF_SEASONS <- (SEASON_RECON - 3L):(SEASON_RECON - 1L)
 PANEL_CACHE_PATH_RECON <- here::here(
   "data", "season2_cache", "s2_week15_player_season_panel_cache.rds"
 )
+
+# ------------------------------------------------------------------------------
+# NAMESPACE, PREFIX AND SEASON RESOLVERS
+# ------------------------------------------------------------------------------
+# SEASON_RECON was a file-level constant, so every derived window (TD prior,
+# QB rush efficiency) and the panel path were fixed at source() time. A caller
+# could not reconcile a different target season, and POSITION_EFFICIENCY in
+# particular was computed the moment this file was sourced, from the window
+# ending the year before SEASON_RECON. For a temporal-holdout backtest that
+# meant the held-out season's efficiency was baked in before any argument
+# existed.
+#
+# Two axes are parameterised: cache_dir (WHERE artifacts live) and out_prefix
+# (WHAT results are called), so a result file identifies its own run from its
+# filename alone. Season windows now derive from a `season` argument.
+#
+# POSITION_EFFICIENCY below is retained as the production default, computed at
+# source() time exactly as before. reconcile_projections() recomputes it ONLY
+# when the requested season differs from SEASON_RECON, and threads the result
+# to its two consumers. Production runs therefore make no extra network call
+# and behave identically.
+
+R32_OUT_PREFIX_DEFAULT <- "s2_week15_"
+
+.r32_panel_cache_path <- function(cache_dir) {
+  file.path(cache_dir, "s2_week15_player_season_panel_cache.rds")
+}
+.r32_output_rds_path <- function(cache_dir,
+                                 out_prefix = R32_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "reconciled_projections.rds"))
+}
+.r32_output_csv_path <- function(cache_dir,
+                                 out_prefix = R32_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "reconciled_projections.csv"))
+}
+.r32_seasons_for_td_prior <- function(season) {
+  season <- as.integer(season); (season - 5L):(season - 1L)
+}
+.r32_qb_rush_eff_seasons <- function(season) {
+  season <- as.integer(season); (season - 3L):(season - 1L)
+}
 
 # Scoring settings. Threaded through reconcile_projections() so a caller can
 # reconcile under a non-default ruleset. The DEFAULTS REPRODUCE v2.1 EXACTLY:
@@ -624,6 +776,10 @@ QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE <- c(
   "translation_active"           = 0.50,
   "veteran_history_only"         = 0.65,
   "phased_out_history_only"      = 0.70,
+  # [2026-09-18] Missing key; same family as phased_out_history_only. NOTE:
+  # while QB_ANCHOR_WEIGHT_FITTED is non-NA this whole table is bypassed by
+  # the coalesce() in .determine_blend_weights(), so the value is dormant.
+  "phaseout_stale_history"       = 0.70,
   "translation_capped_rookie"    = 0.80,
   "phaseout_no_history_fallback" = 0.90,
   "calibrated_fallback"          = 0.90
@@ -631,6 +787,142 @@ QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE <- c(
 
 # Fallback weight for a QB1 with an unrecognized prior_source value.
 QB_DEFAULT_WEIGHT <- 0.70
+
+# ------------------------------------------------------------------------------
+# QB1 ANCHOR WEIGHT, FITTED  [2026-08-09]
+# ------------------------------------------------------------------------------
+# THIS RESOLVES THE "queued QB blend-weight backtest" REFERENCED ABOVE.
+#
+# When non-NA, this single fitted weight REPLACES the prior_source table above
+# for anchored QBs (QB1 and committee QBs). Set to NA_real_ to restore the
+# judgment-set table.
+#
+# EVIDENCE. Forward-chained across the 2018-2025 holdouts (2020 excluded): the
+# weight was fitted on all seasons BEFORE each test season and scored on the
+# test season. Anchored QBs with 8+ games in both the target and prior season.
+#
+#   mean out-of-sample MAE        seasons beaten
+#   live table (0.50-0.90)  3.40        -
+#   fitted w = 0.45         3.34      4 of 5
+#   r29 alone               3.54      0 of 5
+#
+# The fitted weight is very stable: 0.45 0.45 0.45 0.40 0.45, sd 0.022, and the
+# in-sample MAE curve is flat-bottomed from 0.35 to 0.50. Every live value sits
+# ABOVE the optimum, the 0.80 and 0.90 entries substantially so.
+#
+# A FLAT weight is used rather than a re-fitted per-source table because the
+# same test at WR and TE showed prior_source adds nothing once position is
+# known (it lost 6 of 6 and 5 of 6 seasons there), and the QB1 sample is far
+# smaller: ~24 players per season.
+#
+# HONEST LIMITS. This is the weakest-supported of the three changes made on
+# 2026-08-09. Five test seasons, ~24 players each, and the effect is 0.06 PPG.
+# It was adopted because the evidence pattern matches the fixes that worked and
+# because it replaces six untested constants with one fitted number, NOT
+# because the accuracy gain is meaningful.
+#
+# IT DOES NOT ADDRESS QB RANK CORRELATION, which sits near 0.59 and is the
+# largest remaining defect at the position. That is an ordering problem; this
+# is a level-and-spread change.
+QB_ANCHOR_WEIGHT_FITTED <- 0.45
+
+# ------------------------------------------------------------------------------
+# BLEND SIGMA PROPAGATION  [2026-08-10]
+# ------------------------------------------------------------------------------
+# WHAT WAS WRONG. .blend_projections() computed
+#     r32_posterior_mu = w * volume_implied + (1 - w) * r29_posterior_mu
+# and then set
+#     r32_posterior_sigma = r29_posterior_sigma
+# The comment above that line said "tau is unchanged by a SHIFT", which is a
+# true statement about adding a constant and a false description of what the
+# line does. A weighted average is not a shift. The mean moved and the error
+# bar did not, so at w = 0.45 the posterior kept 100 percent of the uncertainty
+# of an arm it only half used. Averaging two estimates makes you MORE certain,
+# not equally certain.
+#
+# The correct form already exists in this build, one file upstream, at R/29
+# update_projection_with_ytd():
+#     posterior_sigma = sqrt(w^2 * sigma_a^2 + (1 - w)^2 * sigma_b^2)
+# This is that same form applied to R/32's two arms.
+#
+# THE MISSING PIECE. The form needs sigma_vol, the volume arm's own error.
+# R/45 build_vi_arm + assemble_blend_frame produce a frame for it, but the QB
+# cell has n = 3, so the QB estimate is unusable, and substituting the pooled
+# value (5.661) moves Willis 11.685 -> 10.71 while moving Murray 6.05 -> 7.15:
+# maximum disruption, no fix. That route is a measured dead end.
+#
+# MODES. Two alternatives were considered and one was rejected:
+#
+#   "zero"  sigma_vol = 0, giving tau32 = (1 - w) * tau29.
+#           A valid arithmetic LOWER BOUND, and rejected as a production
+#           default. It shrinks tau everywhere, halving it on measured QBs
+#           (Murray 1.084 -> 0.596, Mahomes 0.959 -> 0.527 on the dk4 board).
+#           That direction is the overconfidence R/49 measured at 3.7x and
+#           that change_sigma was added to R/29 to stop. Fixing an
+#           unprincipled error with a principled one pointing the wrong way
+#           is not an improvement. Retained runnable, not adopted.
+#
+#   "equal" sigma_vol = tau29, giving tau32 = tau29 * sqrt(w^2 + (1-w)^2).
+#           PRODUCTION DEFAULT. States the honest position: there is no
+#           evidence the volume arm is more or less certain than the R/29
+#           arm, so neither is favoured. Still corrects the defect, because
+#           averaging two equally-uncertain estimates genuinely does reduce
+#           uncertainty, just less aggressively than the zero floor.
+#           Multiplier by position at current weights:
+#             QB w 0.45 -> 0.714 | WR w 0.10 -> 0.906 | TE w 0.05 -> 0.953
+#
+#   "none"  reproduces the pre-2026-08-10 pass-through exactly. Kept for A/B,
+#           same neutralise pattern as BB_HIERARCHICAL in R/33 and
+#           QB_DEPTH_DISCOUNT_APPLY_TO_MU above.
+#
+# HONEST LIMIT. "equal" is an ASSUMPTION, not a measurement. It is the right
+# default while sigma_vol is unavailable and it should be replaced the moment
+# a usable estimate exists. When that happens this becomes a one-line change:
+# add mode "measured" and supply the per-position vector.
+#
+# WHAT THIS DOES NOT FIX. It does not close the QB tau gap on the no-history
+# cohort. Willis moves 6.944 -> 4.957 under "equal", still far above the
+# measured-QB range of 0.96 to 2.58. That gap originates in R/29's no-history
+# branch, not in this blend, and belongs to that file.
+BLEND_SIGMA_VOL_MODE <- "equal"   # one of: "equal", "zero", "none"
+
+# Fail at source() time rather than silently falling through to "none" on a
+# typo. A misspelled mode would reproduce the exact defect this block fixes
+# and would do it without any error.
+if (!BLEND_SIGMA_VOL_MODE %in% c("equal", "zero", "none")) {
+  stop("BLEND_SIGMA_VOL_MODE must be one of 'equal', 'zero', 'none'. Got: ",
+       BLEND_SIGMA_VOL_MODE, call. = FALSE)
+}
+
+# CI_80_Z / CI_95_Z arrive from R/29 and are used to rebuild the intervals
+# against the R/32 posterior. R/29 is sourced above, so a miss here means the
+# source order changed and the intervals would be silently wrong.
+if (!exists("CI_80_Z") || !exists("CI_95_Z")) {
+  stop("CI_80_Z / CI_95_Z not found. R/29 must be sourced before R/32; ",
+       "the projection intervals cannot be rebuilt without them.",
+       call. = FALSE)
+}
+
+# Omega (week-to-week dispersion) settings. [2026-07-30]
+# OMEGA_FIT_MIN_GAMES mirrors R/29's min_games = 8L: below that a per-player
+# SD is too noisy to train on.
+#
+# OMEGA_SHRINK_K is now GATE-SET, not formula-set. [2026-07-30]
+# The method-of-moments derivation produced 3.25 on the 2026 board. R/49's
+# gate 3 swept k against realized within-season dispersion on a held-out
+# 2025 and found the out-of-sample minimum at 12 (rmse 2.3657 vs 2.4147 at
+# 3.25), with a flat basin from about 8 to 16. The moment estimate is the
+# one to distrust here: its variance formula assumes sampling behaviour of
+# an SD that is shaky at the 8-game floor, and it was too small, meaning a
+# noisy 8-game SD was being trusted at w = 0.71 when the evidence supports
+# about 0.40.
+#
+# OMEGA_USE_MOMENT_K keeps the derivation intact and revivable rather than
+# deleting it. Set TRUE to go back to estimating k per run.
+OMEGA_FIT_MIN_GAMES <- 8L
+OMEGA_FIT_MIN_ROWS <- 50L
+OMEGA_SHRINK_K <- 12
+OMEGA_USE_MOMENT_K <- FALSE
 
 # ------------------------------------------------------------------------------
 # NSE DECLARATIONS
@@ -641,13 +933,21 @@ utils::globalVariables(c(
   "projection_lower_80", "projection_upper_80",
   "projection_lower_95", "projection_upper_95",
   "boom_probability", "bust_probability",
+  "boom_threshold_pts", "bust_threshold_pts",
+  "omega_raw", "n_games_history", "omega_model", "omega_shrink_w",
+  "r32_omega", "r32_sigma_week",
+  "boom_probability_week", "bust_probability_week",
+  "exp_td_pts", "td_share", "vol_pg",
+  "r29_boom_probability", "r29_bust_probability",
+  "r32_posterior_sigma",
   "r29_posterior_mu", "r29_posterior_sigma",
   "r29_projection_lower_80", "r29_projection_upper_80",
   "r29_projection_lower_95", "r29_projection_upper_95",
   "r31_expected_targets_pg", "r31_expected_carries_pg",
   "r31_true_targets_pg",
   "volume_implied_ppg_v2", "blend_weight_r31_static", "blend_weight_r31",
-  "r32_posterior_mu", "r32_delta_from_r29",
+  "r32_posterior_mu", "r32_delta_from_r29", "blend_sigma_scale",
+  "gsis_raw", "gsis_resolved", "id_source",
   "r32_projection_lower_80", "r32_projection_upper_80",
   "r32_projection_lower_95", "r32_projection_upper_95",
   "ppr_per_target", "ppr_per_carry",
@@ -699,16 +999,29 @@ utils::globalVariables(c(
     }
   )
 
-  required <- c("nfl_gsis_id", "player_name", "position", "team",
+  required <- c("player_uid", "nfl_gsis_id", "player_name", "position", "team",
                 "posterior_mu", "prior_source",
                 "projection_lower_80", "projection_upper_80")
   missing_cols <- setdiff(required, names(proj))
   if (length(missing_cols) > 0L) {
     stop(glue("R/29 CSV missing required columns: ",
-              "{paste(missing_cols, collapse = ', ')}"))
+              "{paste(missing_cols, collapse = ', ')}. ",
+              "If player_uid is missing, the CSV predates the Wave A2 ",
+              "identity fix -- regenerate R/29 rather than reading it."))
   }
 
-  message(glue("  Loaded {nrow(proj)} R/29 projections"))
+  # player_uid is the never-NA identity key. nfl_gsis_id is NA for the
+  # draftable rookie cohort and must never be used as an identity key here.
+  n_uid_na  <- sum(is.na(proj$player_uid))
+  n_uid_dup <- sum(duplicated(proj$player_uid))
+  if (n_uid_na > 0L || n_uid_dup > 0L) {
+    stop(glue("R/29 CSV player_uid integrity failure: {n_uid_na} NA and ",
+              "{n_uid_dup} duplicate. Regenerate R/29."))
+  }
+
+  message(glue("  Loaded {nrow(proj)} R/29 projections ",
+               "({sum(is.na(proj$nfl_gsis_id))} id-less, carried on ",
+               "player_uid)"))
 
   proj
 }
@@ -962,7 +1275,8 @@ utils::globalVariables(c(
 .compute_volume_implied_ppg <- function(alloc,
                                         team_vol,
                                         qb_rush_eff,
-                                        scoring = R32_DEFAULT_SCORING_SETTINGS) {
+                                        scoring = R32_DEFAULT_SCORING_SETTINGS,
+                                        position_efficiency = POSITION_EFFICIENCY) {
 
   # Per-position PPR coefficients (RB/WR/TE), now driven by `scoring`.
   # SCORING SCHEMA GUARD  [2026-07-15]
@@ -991,7 +1305,7 @@ utils::globalVariables(c(
     ), call. = FALSE)
   }
 
-  pos_coefs <- purrr::imap_dfr(POSITION_EFFICIENCY, function(eff, pos) {
+  pos_coefs <- purrr::imap_dfr(position_efficiency, function(eff, pos) {
     tibble::tibble(
       position       = pos,
       ppr_per_target = eff$catch_rate *
@@ -1002,11 +1316,11 @@ utils::globalVariables(c(
     )
   })
 
-  if (nrow(pos_coefs) != length(POSITION_EFFICIENCY) ||
+  if (nrow(pos_coefs) != length(position_efficiency) ||
       anyNA(pos_coefs$ppr_per_target) || anyNA(pos_coefs$ppr_per_carry)) {
     stop(glue(
       ".compute_volume_implied_ppg(): efficiency coefficient table is malformed ",
-      "({nrow(pos_coefs)} row(s) for {length(POSITION_EFFICIENCY)} position(s), ",
+      "({nrow(pos_coefs)} row(s) for {length(position_efficiency)} position(s), ",
       "NA present: {anyNA(pos_coefs$ppr_per_target) || anyNA(pos_coefs$ppr_per_carry)}). ",
       "This means a scoring term collapsed. Halting instead of blending zeros."
     ), call. = FALSE)
@@ -1041,7 +1355,9 @@ utils::globalVariables(c(
   enriched <- alloc %>%
     dplyr::left_join(pos_coefs, by = "position") %>%
     dplyr::left_join(team_pass, by = "team") %>%
-    dplyr::left_join(team_pass_comm, by = c("team", "nfl_gsis_id" = "qb_id")) %>%
+    # na_matches = "never": guard the id-less cohort against NA-to-NA matching.
+    dplyr::left_join(team_pass_comm, by = c("team", "nfl_gsis_id" = "qb_id"),
+                     na_matches = "never") %>%
     dplyr::mutate(
       is_qb1 = .data$position == "QB" &
         !is.na(.data$depth_position) & .data$depth_position == "QB1",
@@ -1160,7 +1476,8 @@ utils::globalVariables(c(
     depth_lookup$depth_position <- NA_character_
 
   joined <- r29 %>%
-    dplyr::left_join(depth_lookup, by = "nfl_gsis_id")
+    # na_matches = "never": guard the id-less cohort against NA-to-NA matching.
+    dplyr::left_join(depth_lookup, by = "nfl_gsis_id", na_matches = "never")
 
   # Loud drift guard: if R/29 starts emitting a prior_source this table doesn't
   # know about, say so before silently falling back to QB_DEFAULT_WEIGHT.
@@ -1175,25 +1492,61 @@ utils::globalVariables(c(
     unique(qb1_sources[!is.na(qb1_sources)]),
     names(QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE)
   )
-  if (length(unknown_qb_sources) > 0) {
+  # [2026-09-18] Only a real fallback when the fitted flat weight is NA; with
+  # QB_ANCHOR_WEIGHT_FITTED set, coalesce() never reaches the table and the
+  # old warning described a fallback that did not happen.
+  if (length(unknown_qb_sources) > 0 && is.na(QB_ANCHOR_WEIGHT_FITTED)) {
     warning(glue(
       "QB blend weights: prior_source value(s) not in ",
       "QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE -- ",
       "{paste(unknown_qb_sources, collapse = ', ')}. ",
       "Falling back to QB_DEFAULT_WEIGHT ({QB_DEFAULT_WEIGHT}) for those rows."
     ))
+  } else if (length(unknown_qb_sources) > 0) {
+    message(glue("    QB1 prior_source(s) not in the QB table ",
+                 "({paste(unknown_qb_sources, collapse = ', ')}); ",
+                 "dormant while QB_ANCHOR_WEIGHT_FITTED = {QB_ANCHOR_WEIGHT_FITTED}."))
+  }
+
+  # Same drift guard for the RB/WR/TE table, which previously fell through to
+  # DEFAULT_R31_WEIGHT with no message at all.
+  skill_sources <- joined %>%
+    dplyr::filter(.data$position %in% RECON_POSITIONS,
+                  is.na(BLEND_POSITION_WEIGHT_OVERRIDE[.data$position])) %>%
+    dplyr::pull(.data$prior_source)
+  unknown_skill_sources <- setdiff(
+    unique(skill_sources[!is.na(skill_sources)]),
+    names(BLEND_WEIGHTS_BY_PRIOR_SOURCE)
+  )
+  if (length(unknown_skill_sources) > 0) {
+    warning(glue(
+      "RB/WR/TE blend weights: prior_source value(s) not in ",
+      "BLEND_WEIGHTS_BY_PRIOR_SOURCE -- ",
+      "{paste(unknown_skill_sources, collapse = ', ')}. ",
+      "Falling back to DEFAULT_R31_WEIGHT ({DEFAULT_R31_WEIGHT})."
+    ))
   }
 
   joined %>%
     dplyr::mutate(
       blend_weight_r31_static = dplyr::case_when(
+        # Anchored QBs: the fitted flat weight when set, otherwise the
+        # judgment-set prior_source table. See QB_ANCHOR_WEIGHT_FITTED.
         .data$position == "QB" &
           ((!is.na(.data$depth_position) & .data$depth_position == "QB1") |
              !is.na(.data$committee_group)) ~ dplyr::coalesce(
+            QB_ANCHOR_WEIGHT_FITTED,
             QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE[.data$prior_source],
             QB_DEFAULT_WEIGHT
           ),
         .data$position == "QB" ~ 0,
+
+        # Position override, where one exists. See
+        # BLEND_POSITION_WEIGHT_OVERRIDE for the forward-chained evidence.
+        # Positions not named there fall through to the prior_source table.
+        !is.na(BLEND_POSITION_WEIGHT_OVERRIDE[.data$position]) ~
+          unname(BLEND_POSITION_WEIGHT_OVERRIDE[.data$position]),
+
         TRUE ~ dplyr::coalesce(
           BLEND_WEIGHTS_BY_PRIOR_SOURCE[.data$prior_source],
           DEFAULT_R31_WEIGHT
@@ -1213,13 +1566,27 @@ utils::globalVariables(c(
 #' r32_posterior_mu = blend_weight_r31 * volume_implied_ppg_v2
 #'                  + (1 - blend_weight_r31) * r29_posterior_mu
 #'
-#' For QBs (blend_weight_r31 = 0) this reduces to r29_posterior_mu.
+#' For QB2/QB3 and below (blend_weight_r31 = 0, R/32:1419 branch) this reduces
+#' to r29_posterior_mu. ANCHORED QBs do NOT reduce: since 2026-08-09 they blend
+#' at QB_ANCHOR_WEIGHT_FITTED. The previous version of this line said all QBs
+#' reduced to R/29, which stopped being true when that weight was fitted.
 #' For RB/WR/TE without R/31 match (volume_implied NA), reduces to r29 too.
 #'
-#' Projection intervals are shifted by r32_delta_from_r29 (preserves width).
+#' tau is PROPAGATED through the blend, not copied:
+#'   r32_posterior_sigma = r29_posterior_sigma * blend_sigma_scale
+#' with blend_sigma_scale set by BLEND_SIGMA_VOL_MODE. See the gate evidence
+#' at that constant for why "equal" is the default and "zero" was rejected.
+#'
+#' Projection intervals follow whatever tau does. Under mode "none" they are
+#' shifted by r32_delta_from_r29 and preserve width, which is correct when tau
+#' is unchanged. Under "equal" or "zero" they are REBUILT from r32_posterior_mu
+#' and r32_posterior_sigma, because a shifted interval at the old width would
+#' describe a different distribution than the sigma and the boom/bust
+#' probabilities recomputed downstream at R/32 .apply_qb_depth_discount().
 #'
 #' @param merged Tibble with R/29 + R/31 + blend_weight + volume_implied joined.
-#' @return Tibble with r32_posterior_mu and shifted intervals added.
+#' @return Tibble with r32_posterior_mu, r32_posterior_sigma, blend_sigma_scale
+#'   and the four projection intervals added.
 #' @keywords internal
 .blend_projections <- function(merged) {
 
@@ -1241,17 +1608,55 @@ utils::globalVariables(c(
       r32_delta_from_r29 = .data$r32_posterior_mu -
                               .data$r29_posterior_mu,
 
-      # Shift intervals by the same delta (preserve width)
-      r32_projection_lower_80 = .data$r29_projection_lower_80 +
-                                   .data$r32_delta_from_r29,
-      r32_projection_upper_80 = .data$r29_projection_upper_80 +
-                                   .data$r32_delta_from_r29,
-      r32_projection_lower_95 = dplyr::coalesce(
-        .data$r29_projection_lower_95, .data$r29_projection_lower_80
-      ) + .data$r32_delta_from_r29,
-      r32_projection_upper_95 = dplyr::coalesce(
-        .data$r29_projection_upper_95, .data$r29_projection_upper_80
-      ) + .data$r32_delta_from_r29,
+      # TAU PROPAGATION. [2026-08-10] See BLEND_SIGMA_VOL_MODE for the full
+      # gate evidence. The scale is written as its own column so the fix is
+      # visible in the output rather than only inferable from a ratio.
+      #
+      # BASE if/else, not dplyr::if_else(): BLEND_SIGMA_VOL_MODE is a scalar
+      # config constant, and dplyr::if_else() requires the condition to be the
+      # same length as the branches.
+      blend_sigma_scale = if (BLEND_SIGMA_VOL_MODE == "equal") {
+        sqrt(.data$blend_weight_effective^2 +
+               (1 - .data$blend_weight_effective)^2)
+      } else if (BLEND_SIGMA_VOL_MODE == "zero") {
+        1 - .data$blend_weight_effective
+      } else {
+        1
+      },
+
+      r32_posterior_sigma = .data$r29_posterior_sigma *
+                              .data$blend_sigma_scale,
+
+      # INTERVALS. Under "none" tau is unchanged, so shifting by the delta
+      # preserves width and is correct. Under any propagating mode the width
+      # must follow tau, or the interval and the sigma describe different
+      # distributions. R/29 builds its own bounds as mu +/- z * sigma
+      # (R/29:4517-4520), so rebuilding here reproduces that construction
+      # exactly against the R/32 posterior rather than approximating it.
+      r32_projection_lower_80 = if (BLEND_SIGMA_VOL_MODE == "none") {
+        .data$r29_projection_lower_80 + .data$r32_delta_from_r29
+      } else {
+        .data$r32_posterior_mu - CI_80_Z * .data$r32_posterior_sigma
+      },
+      r32_projection_upper_80 = if (BLEND_SIGMA_VOL_MODE == "none") {
+        .data$r29_projection_upper_80 + .data$r32_delta_from_r29
+      } else {
+        .data$r32_posterior_mu + CI_80_Z * .data$r32_posterior_sigma
+      },
+      r32_projection_lower_95 = if (BLEND_SIGMA_VOL_MODE == "none") {
+        dplyr::coalesce(.data$r29_projection_lower_95,
+                        .data$r29_projection_lower_80) +
+          .data$r32_delta_from_r29
+      } else {
+        .data$r32_posterior_mu - CI_95_Z * .data$r32_posterior_sigma
+      },
+      r32_projection_upper_95 = if (BLEND_SIGMA_VOL_MODE == "none") {
+        dplyr::coalesce(.data$r29_projection_upper_95,
+                        .data$r29_projection_upper_80) +
+          .data$r32_delta_from_r29
+      } else {
+        .data$r32_posterior_mu + CI_95_Z * .data$r32_posterior_sigma
+      },
 
       # Clamp negative projections to 0. All four interval bounds are floored
       # (not just the lowers): when R/29 hands over a negative mu, an unfloored
@@ -1315,9 +1720,12 @@ utils::globalVariables(c(
           QB_DEPTH_DISCOUNT_DEFAULT_MULT
       ),
 
-      # Apply discount -- only fires for QBs with a non-null non-QB1 factor
+      # Apply discount -- gated OFF. See QB_DEPTH_DISCOUNT_APPLY_TO_MU above
+      # for the units argument and the holdout evidence. Left as a live branch
+      # rather than deleted so the behaviour can be restored and re-tested.
       r32_posterior_mu = dplyr::case_when(
-        .data$position == "QB" &
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
           !is.na(.data$qb_discount_factor) &
           .data$qb_discount_factor < 1.0 ~
           .data$r29_posterior_mu * .data$qb_discount_factor,
@@ -1328,15 +1736,20 @@ utils::globalVariables(c(
       r32_delta_from_r29 = .data$r32_posterior_mu - .data$r29_posterior_mu,
 
       # Scale intervals proportionally for discounted QBs
+      # Intervals follow mu: gated by the same flag. Scaling the interval
+      # while leaving mu unscaled would make the two describe different
+      # quantities.
       r32_projection_upper_80 = dplyr::case_when(
-        .data$position == "QB" &
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
           !is.na(.data$qb_discount_factor) &
           .data$qb_discount_factor < 1.0 ~
           .data$r29_projection_upper_80 * .data$qb_discount_factor,
         TRUE ~ .data$r32_projection_upper_80
       ),
       r32_projection_lower_80 = dplyr::case_when(
-        .data$position == "QB" &
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
           !is.na(.data$qb_discount_factor) &
           .data$qb_discount_factor < 1.0 ~
           pmax(.data$r29_projection_lower_80 *
@@ -1344,7 +1757,8 @@ utils::globalVariables(c(
         TRUE ~ .data$r32_projection_lower_80
       ),
       r32_projection_upper_95 = dplyr::case_when(
-        .data$position == "QB" &
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
           !is.na(.data$qb_discount_factor) &
           .data$qb_discount_factor < 1.0 ~
           dplyr::coalesce(.data$r29_projection_upper_95,
@@ -1353,13 +1767,63 @@ utils::globalVariables(c(
         TRUE ~ .data$r32_projection_upper_95
       ),
       r32_projection_lower_95 = dplyr::case_when(
-        .data$position == "QB" &
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
           !is.na(.data$qb_discount_factor) &
           .data$qb_discount_factor < 1.0 ~
           pmax(dplyr::coalesce(.data$r29_projection_lower_95,
                                 .data$r29_projection_lower_80) *
                  .data$qb_discount_factor, 0),
         TRUE ~ .data$r32_projection_lower_95
+      ),
+
+      # CURRENTLY INERT. [2026-08-10] Every branch below is gated on
+      # QB_DEPTH_DISCOUNT_APPLY_TO_MU, which is FALSE (see the units-error
+      # evidence at R/32 QB_DEPTH_DISCOUNT_APPLY_TO_MU). While that gate is
+      # off this case_when always takes its TRUE ~ passthrough arm and no QB
+      # sigma is scaled here. Retained runnable rather than deleted, same
+      # neutralise pattern as BLEND_SIGMA_VOL_MODE and R/33 BB_HIERARCHICAL.
+      # The reasoning below is the reasoning for IF the gate is turned back on.
+      #
+      # A playing-time discount SCALES the distribution rather than shifting
+      # it, so tau scales by the same factor. This is why the QB branch does
+      # not preserve interval width and should not be expected to. [2026-07-30]
+      # Gated with mu [2026-08-09]: sigma must describe the same quantity mu
+      # does. Scaling sigma while mu is unscaled would make a backup look
+      # implausibly certain about a number that was never discounted.
+      r32_posterior_sigma = dplyr::case_when(
+        isTRUE(QB_DEPTH_DISCOUNT_APPLY_TO_MU) &
+          .data$position == "QB" &
+          !is.na(.data$qb_discount_factor) &
+          .data$qb_discount_factor < 1.0 ~
+          .data$r29_posterior_sigma * .data$qb_discount_factor,
+        TRUE ~ .data$r32_posterior_sigma
+      ),
+
+      # RECOMPUTE the tail probabilities against THIS file's posterior.
+      # [2026-07-30] R/29 computes these against r29_posterior_mu and they were
+      # previously passed through untouched, while R/33 adds them to a VORP
+      # built from r32_posterior_mu. On the DK board the two mus differ by 1.70
+      # PPG on average and 17.18 at the extreme, so the upside term and the
+      # point estimate it modified described different projections. The
+      # thresholds come from R/29 so the DEFINITION of boom stays owned by one
+      # file; only the distribution they are evaluated under changes here.
+      #
+      # A zero or NA tau leaves the normal degenerate. Fall back to R/29's
+      # value in that case rather than emitting NaN.
+      boom_probability = dplyr::if_else(
+        !is.na(.data$r32_posterior_sigma) & .data$r32_posterior_sigma > 0,
+        1 - stats::pnorm(.data$boom_threshold_pts,
+                         mean = .data$r32_posterior_mu,
+                         sd   = .data$r32_posterior_sigma),
+        .data$r29_boom_probability
+      ),
+      bust_probability = dplyr::if_else(
+        !is.na(.data$r32_posterior_sigma) & .data$r32_posterior_sigma > 0,
+        stats::pnorm(.data$bust_threshold_pts,
+                     mean = .data$r32_posterior_mu,
+                     sd   = .data$r32_posterior_sigma),
+        .data$r29_bust_probability
       )
     ) %>%
     # depth_position was a working join column -- remove from output
@@ -1381,6 +1845,207 @@ utils::globalVariables(c(
   updated
 }
 
+
+# ------------------------------------------------------------------------------
+# .build_omega
+# ------------------------------------------------------------------------------
+
+#' Build week-to-week dispersion (omega) and the weekly predictive sigma
+#'
+#' ADDITIVE ONLY. [2026-07-30] This adds columns and changes none. Managed-league
+#' output (r32_posterior_mu, boom_probability, bust_probability, and every
+#' interval column) is identical whether or not this runs. Only best-ball
+#' consumers need to read what it produces.
+#'
+#' WHY THIS EXISTS
+#' posterior_sigma is tau: uncertainty about a player's SEASON MEAN, which
+#' shrinks as history accumulates. Best ball does not pay for that. It pays for
+#' the spread of a player's WEEKS, because a best-ball lineup is chosen after
+#' the fact, so bad weeks are discarded and good weeks are kept in full. The
+#' quantity that prices that option is omega, the within-season game-to-game SD.
+#'
+#' For a single future week the two combine as Var(week) = tau^2 + omega^2.
+#' On the current DK board tau is near 1.1 and omega near 5.7, so omega carries
+#' roughly 98 percent of it. A tail probability computed from tau alone runs at
+#' about one fifth of the correct SD.
+#'
+#' SHRINKAGE
+#' omega_raw is a per-player SD off as few as 8 games, and about half the board
+#' has no NFL history at all. One empirical-Bayes step handles both:
+#'   omega = w * omega_raw + (1 - w) * omega_model,  w = n / (n + k)
+#' A player with no history gets w = 0 and takes the model value outright.
+#'
+#' The model is continuous in role rather than binned. Weekly dispersion is
+#' driven by how much of a player's scoring comes from lumpy events. Touchdowns
+#' are lumpy; receptions and yardage are not. A goal-line back and a possession
+#' receiver can share a projection and have very different weekly shapes.
+#' Bins were rejected on two grounds: hand-set thresholds are undefended, and
+#' thresholds fitted on omega then used as omega's own shrinkage target are
+#' circular.
+#'
+#' KNOWN GAP
+#' omega_raw is computed only over games actually PLAYED. Missed weeks are
+#' absent rather than zero, so this overstates weekly reliability for
+#' injury-prone players. Availability is genuinely part of best-ball value and
+#' is not captured here. R/48 is the intended input; until then this bias is
+#' unmeasured and must not be described as handled.
+#'
+#' @param df Tibble carrying omega_raw, n_games_history, position,
+#'   r32_posterior_mu, r32_posterior_sigma, r31_expected_targets_pg,
+#'   r31_expected_carries_pg, boom_threshold_pts, bust_threshold_pts.
+#' @param scoring_settings List. Used to value TDs when deriving TD share.
+#' @param verbose Logical.
+#' @return df plus omega_model, omega_shrink_w, r32_omega, r32_sigma_week,
+#'   boom_probability_week, bust_probability_week.
+#' @keywords internal
+.build_omega <- function(df, scoring_settings, verbose = TRUE,
+                         position_efficiency = POSITION_EFFICIENCY) {
+
+  .num_or <- function(x, default) {
+    if (is.null(x) || length(x) != 1L || is.na(x) || !is.numeric(x)) default else x
+  }
+  rec_td  <- .num_or(scoring_settings$rec_td, 6)
+  rush_td <- .num_or(scoring_settings$rush_td, 6)
+
+  .eff_rate <- function(pos, field) {
+    vapply(pos, function(p) {
+      e <- position_efficiency[[p]]
+      if (is.null(e) || is.null(e[[field]])) NA_real_ else as.numeric(e[[field]])
+    }, numeric(1), USE.NAMES = FALSE)
+  }
+
+  if (!"omega_raw" %in% names(df)) {
+    warning("R/32 .build_omega(): omega_raw absent. That R/29 CSV predates the ",
+            "2026-07-30 omega pass-through. Emitting NA omega; best-ball ",
+            "outputs are unusable until R/29 is regenerated. Managed-league ",
+            "outputs are unaffected.", call. = FALSE)
+    df$omega_raw <- NA_real_
+    df$n_games_history <- NA_integer_
+  }
+
+  # Expected points from TDs, from R/31 volume and the R/32 efficiency rates.
+  # Available for every player including rookies with zero NFL snaps, which is
+  # what lets the model speak for the no-history half of the board instead of
+  # falling back to a positional average.
+  df <- df %>%
+    dplyr::mutate(
+      .tgt        = dplyr::coalesce(.data$r31_expected_targets_pg, 0),
+      .car        = dplyr::coalesce(.data$r31_expected_carries_pg, 0),
+      .td_per_tgt = dplyr::coalesce(.eff_rate(.data$position, "td_per_target"), 0),
+      .td_per_car = dplyr::coalesce(.eff_rate(.data$position, "td_per_carry"), 0),
+      exp_td_pts  = .data$.tgt * .data$.td_per_tgt * rec_td +
+                      .data$.car * .data$.td_per_car * rush_td,
+      vol_pg      = .data$.tgt + .data$.car,
+      td_share    = dplyr::if_else(
+        !is.na(.data$r32_posterior_mu) & .data$r32_posterior_mu > 0,
+        pmin(.data$exp_td_pts / .data$r32_posterior_mu, 1),
+        NA_real_
+      )
+    )
+
+  fit_rows <- df %>%
+    dplyr::filter(!is.na(.data$omega_raw), .data$omega_raw > 0,
+                  !is.na(.data$n_games_history),
+                  .data$n_games_history >= OMEGA_FIT_MIN_GAMES,
+                  !is.na(.data$r32_posterior_mu)) %>%
+    dplyr::mutate(td_share_f = dplyr::coalesce(.data$td_share, 0))
+
+  omega_fit <- NULL
+  if (nrow(fit_rows) >= OMEGA_FIT_MIN_ROWS) {
+    omega_fit <- tryCatch(
+      stats::lm(omega_raw ~ position + r32_posterior_mu +
+                  log1p(vol_pg) + td_share_f,
+                data = fit_rows),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(omega_fit)) {
+    warning("R/32 .build_omega(): omega model not fitted (", nrow(fit_rows),
+            " usable rows). Emitting NA omega. Managed-league outputs are ",
+            "unaffected.", call. = FALSE)
+    df$omega_model <- NA_real_
+  } else {
+    df$omega_model <- tryCatch({
+      pred_df <- df %>%
+        dplyr::mutate(td_share_f = dplyr::coalesce(.data$td_share, 0))
+      # An SD cannot be negative; a linear model can predict one.
+      pmax(as.numeric(stats::predict(omega_fit, newdata = pred_df)), 0)
+    }, error = function(e) rep(NA_real_, nrow(df)))
+  }
+
+  # Empirical-Bayes weight. Var(s) is about sigma^2 / (2n), so the sampling
+  # variance of omega_raw at n games is about omega^2 / (2n). Method of moments
+  # then gives k = mean(omega^2 / 2) / var(omega_raw).
+  k_omega <- OMEGA_SHRINK_K
+  k_moment <- NA_real_
+  if (nrow(fit_rows) >= OMEGA_FIT_MIN_ROWS) {
+    between_var <- stats::var(fit_rows$omega_raw, na.rm = TRUE)
+    within_num  <- mean(fit_rows$omega_raw^2 / 2, na.rm = TRUE)
+    if (is.finite(between_var) && between_var > 0 && is.finite(within_num)) {
+      k_moment <- within_num / between_var
+      if (isTRUE(OMEGA_USE_MOMENT_K)) k_omega <- k_moment
+    }
+  }
+
+  df <- df %>%
+    dplyr::mutate(
+      omega_shrink_w = dplyr::if_else(
+        !is.na(.data$omega_raw) & .data$omega_raw > 0 &
+          !is.na(.data$n_games_history) & .data$n_games_history > 0,
+        .data$n_games_history / (.data$n_games_history + k_omega),
+        0
+      ),
+      r32_omega = dplyr::case_when(
+        !is.na(.data$omega_raw) & !is.na(.data$omega_model) ~
+          .data$omega_shrink_w * .data$omega_raw +
+            (1 - .data$omega_shrink_w) * .data$omega_model,
+        is.na(.data$omega_raw)   ~ .data$omega_model,
+        is.na(.data$omega_model) ~ .data$omega_raw,
+        TRUE ~ NA_real_
+      ),
+      # Predictive SD for ONE future week. tau and omega are independent sources
+      # of variation and add in quadrature. This is the denominator a best-ball
+      # tail probability belongs on.
+      r32_sigma_week = dplyr::if_else(
+        !is.na(.data$r32_omega),
+        sqrt(dplyr::coalesce(.data$r32_posterior_sigma, 0)^2 + .data$r32_omega^2),
+        NA_real_
+      ),
+      # Parallel tail probabilities on the weekly distribution. The tau-based
+      # boom_probability / bust_probability are deliberately left untouched so
+      # the managed-league path does not move.
+      boom_probability_week = dplyr::if_else(
+        !is.na(.data$r32_sigma_week) & .data$r32_sigma_week > 0,
+        1 - stats::pnorm(.data$boom_threshold_pts,
+                         mean = .data$r32_posterior_mu,
+                         sd   = .data$r32_sigma_week),
+        NA_real_
+      ),
+      bust_probability_week = dplyr::if_else(
+        !is.na(.data$r32_sigma_week) & .data$r32_sigma_week > 0,
+        stats::pnorm(.data$bust_threshold_pts,
+                     mean = .data$r32_posterior_mu,
+                     sd   = .data$r32_sigma_week),
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(-".tgt", -".car", -".td_per_tgt", -".td_per_car")
+
+  if (verbose) {
+    message("\nSTEP 7.6: Building omega (week-to-week dispersion)")
+    message(glue("  omega model fit rows: {nrow(fit_rows)} of {nrow(df)}"))
+    message(glue("  EB shrink k: {round(k_omega, 2)} games ",
+                 "({if (isTRUE(OMEGA_USE_MOMENT_K)) 'moment-estimated' else 'R/49 gate-set'}; ",
+                 "moment estimate would be {round(k_moment, 2)})"))
+    message(glue("  no-history players on model alone: {sum(is.na(df$omega_raw))}"))
+    message(glue("  mean tau {round(mean(df$r32_posterior_sigma, na.rm = TRUE), 2)} | ",
+                 "mean omega {round(mean(df$r32_omega, na.rm = TRUE), 2)} | ",
+                 "mean sigma_week {round(mean(df$r32_sigma_week, na.rm = TRUE), 2)}"))
+  }
+
+  df
+}
 
 # ==============================================================================
 # PUBLIC ENTRY POINT
@@ -1424,10 +2089,29 @@ reconcile_projections <- function(
     r30_path = R30_TEAM_VOL_RDS_RECON,
     as_of_week = NULL,
     scoring_settings = R32_DEFAULT_SCORING_SETTINGS,
+    season = SEASON_RECON,
+    cache_dir = here::here("data", "season2_cache"),
+    out_prefix = R32_OUT_PREFIX_DEFAULT,
     save_output = TRUE) {
 
+  season <- as.integer(season)
+
+  # POSITION_EFFICIENCY is derived at source() time over the window ending the
+  # year before SEASON_RECON. When a different target season is requested that
+  # baked-in table would contain the very season being predicted, so it is
+  # recomputed here over the correct window and threaded to its consumers.
+  # Identical object, and no extra network call, at the default season.
+  position_efficiency <- if (identical(season, as.integer(SEASON_RECON))) {
+    POSITION_EFFICIENCY
+  } else {
+    message(glue("  Re-deriving POSITION_EFFICIENCY for target season {season} ",
+                 "over {min(.r32_seasons_for_td_prior(season))}-",
+                 "{max(.r32_seasons_for_td_prior(season))}"))
+    .derive_position_efficiency(.r32_seasons_for_td_prior(season))
+  }
+
   message(glue("\n{strrep('=', 70)}"))
-  message(glue("R/32: Reconciling projections for season {SEASON_RECON}"))
+  message(glue("R/32: Reconciling projections for season {season}"))
   message(glue("Sack adjustment: {SACK_ADJUSTMENT}"))
   message(glue("Reconciled positions: {paste(RECON_POSITIONS, collapse = ', ')}"))
   if (is.null(as_of_week)) {
@@ -1450,8 +2134,25 @@ reconcile_projections <- function(
       r29_projection_lower_80 = projection_lower_80,
       r29_projection_upper_80 = projection_upper_80,
       r29_projection_lower_95 = projection_lower_95,
-      r29_projection_upper_95 = projection_upper_95
+      r29_projection_upper_95 = projection_upper_95,
+      # Quarantined under their r29_ names. These describe r29_posterior_mu,
+      # which is NOT the projection this file emits. The plain-named
+      # boom_probability / bust_probability are recomputed downstream so that
+      # R/33 consumes a tail probability that matches the mu it modifies.
+      r29_boom_probability    = boom_probability,
+      r29_bust_probability    = bust_probability
     )
+
+  # The thresholds are what make recomputation possible. They cannot be
+  # recovered by inverting qnorm() once a probability saturates at 0 or 1,
+  # and after the tau units fix a majority of the board saturates.
+  .thr_missing <- setdiff(c("boom_threshold_pts", "bust_threshold_pts"),
+                          names(r29_renamed))
+  if (length(.thr_missing) > 0L) {
+    stop(glue("R/29 CSV missing {paste(.thr_missing, collapse = ', ')}. ",
+              "That CSV predates the 2026-07-30 threshold pass-through; ",
+              "regenerate R/29 rather than reading it."))
+  }
 
   # STEP 2: Load R/31 allocations
   message("\nSTEP 2/7: Loading R/31 player allocations")
@@ -1462,6 +2163,17 @@ reconcile_projections <- function(
   # WR and DB). For reconciliation we want one row per nfl_gsis_id --
   # the primary role, defined as the row with the highest combined
   # expected volume (targets + carries).
+  #
+  # NA-safety: this groups on nfl_gsis_id, so any NA-id rows would collapse
+  # into a single group and silently discard distinct players. R/31 is built
+  # from NFL depth charts and should never carry an NA id; if it does, that is
+  # an upstream defect and must stop the run rather than be absorbed here.
+  n_r31_na_id <- sum(is.na(r31$nfl_gsis_id))
+  if (n_r31_na_id > 0L) {
+    stop(glue("R/31 allocations carry {n_r31_na_id} NA nfl_gsis_id row(s). ",
+              "Grouping on that key would collapse distinct players into one."))
+  }
+
   n_before <- nrow(r31)
   r31 <- r31 %>%
     dplyr::group_by(.data$nfl_gsis_id) %>%
@@ -1477,13 +2189,86 @@ reconcile_projections <- function(
                  "-- one row per player retained ({n_after} unique players)"))
   }
 
+  # ---------------------------------------------------------------------------
+  # PHASE 3: IDENTITY RESOLUTION BEFORE ANY JOIN  [2026-08-10]
+  # ---------------------------------------------------------------------------
+  # R/29 and R/31 are keyed on gsis ids of different VINTAGES for the 2026
+  # rookie class. nflreadr's draft table issues placeholders ("LOV121782") that
+  # R/28 reads and R/29 carries; nflreadr's depth chart carries the real id
+  # ("00-0041027") that R/31 reads. Neither stage invented anything and neither
+  # is wrong. Nothing re-links them when the real id is issued, so every join
+  # between the two frames misses that cohort entirely.
+  #
+  # MEASURED on the 2026-08-10 board: 75 of 599 R/29 rows carry a placeholder,
+  # 74 of them known to R/31 under a real id. All reached the board with
+  # blend_weight_effective = 0, meaning NO VOLUME INPUT AT ALL. Two sat inside
+  # the top 200.
+  #
+  # WHY THIS BECAME URGENT. R/31 gained a working draft-capital join on
+  # 2026-08-10 and rescales team shares to sum to one, so 76 rookies gaining
+  # share means the veterans beside them lose it. The veterans reach this file
+  # and the rookies do not. Measured on the 2026-08-11 board: DJ Giddens fell
+  # 109 ranks and 2.0 PPG to Indianapolis teammates invisible here. The ladder
+  # was debiting veterans and crediting nobody.
+  #
+  # WHY ONE RESOLUTION POINT AND NOT FOUR. This file joins the two frames at
+  # four sites: the depth lookup, the central merge, vol_implied, and
+  # blend_weights. Resolving once, after both frames are loaded and before
+  # anything is joined, gives every downstream join a consistent key. Patching
+  # the four sites individually would leave the next join anyone adds keyed on
+  # the raw id.
+  #
+  # SCOPE. The join key becomes the resolved id on both sides. gsis_raw retains
+  # the original and travels to the output for audit. player_uid is NOT touched:
+  # that is Phase 4 and it requires R/39 to be regenerated, because R/39 builds
+  # its uid from whatever id it receives and would lose the join for exactly
+  # the players being repaired here.
+  message("\n  Resolving player identity across R/29 and R/31")
+  .pidr_auth <- pidr_build_authority(season = season, verbose = TRUE)
+
+  if (nrow(.pidr_auth) == 0L) {
+    warning("R/32: identity authority empty; joins fall back to raw ids and ",
+            "the placeholder-id cohort receives no volume input.",
+            call. = FALSE)
+  } else {
+    r29_renamed <- pidr_resolve(r29_renamed, .pidr_auth, verbose = FALSE)
+    r31         <- pidr_resolve(r31,         .pidr_auth, verbose = FALSE)
+
+    n29 <- sum(r29_renamed$id_source == "recovered_by_name")
+    n31 <- sum(r31$id_source == "recovered_by_name")
+
+    r29_renamed <- r29_renamed %>%
+      dplyr::mutate(nfl_gsis_id = .data$gsis_resolved) %>%
+      dplyr::select(-gsis_resolved)
+    r31 <- r31 %>%
+      dplyr::mutate(nfl_gsis_id = .data$gsis_resolved) %>%
+      dplyr::select(-gsis_resolved, -gsis_raw, -id_source)
+
+    # Two players resolving to one id would fan out every join below. The
+    # authority excludes ambiguous keys, so this should be impossible; verified
+    # rather than assumed.
+    dup29 <- sum(duplicated(stats::na.omit(r29_renamed$nfl_gsis_id)))
+    dup31 <- sum(duplicated(stats::na.omit(r31$nfl_gsis_id)))
+    if (dup29 > 0L || dup31 > 0L) {
+      stop(glue("R/32: identity resolution produced duplicate join keys ",
+                "(R/29 {dup29}, R/31 {dup31}). Two players resolved to one ",
+                "id; joining on this key would fan out."), call. = FALSE)
+    }
+
+    message(glue("    Identity resolved: R/29 {n29} row(s), R/31 {n31} row(s) ",
+                 "mapped from a placeholder to a real gsis id"))
+  }
+
   # STEP 3: Load R/30 team volumes and derive QB rush efficiency (QB v2 anchor)
   # Ensure the committee tag exists even if R/31 predates committee support.
   if (!"committee_group" %in% names(r31)) r31$committee_group <- NA_character_
 
   message("\nSTEP 3/7: Loading R/30 team volumes + deriving QB rush efficiency")
   team_vol    <- .load_r30_team_volumes(path = r30_path)
-  qb_rush_eff <- .derive_qb_rush_efficiency()
+  qb_rush_eff <- .derive_qb_rush_efficiency(
+    seasons    = .r32_qb_rush_eff_seasons(season),
+    panel_path = .r32_panel_cache_path(cache_dir)
+  )
 
   # STEP 4: Compute volume-implied PPG (RB/WR/TE efficiency; QB1 R/30 anchor)
   message("\nSTEP 4/7: Computing volume-implied PPG (efficiency + QB1 anchor)")
@@ -1491,7 +2276,8 @@ reconcile_projections <- function(
     alloc       = r31,
     team_vol    = team_vol,
     qb_rush_eff = qb_rush_eff,
-    scoring     = scoring_settings
+    scoring     = scoring_settings,
+    position_efficiency = position_efficiency
   )
 
   # STEP 5: Determine per-player blend weights
@@ -1511,10 +2297,14 @@ reconcile_projections <- function(
           r31_expected_targets_pg = expected_targets_pg,
           r31_expected_carries_pg = expected_carries_pg
         ),
-      by = "nfl_gsis_id"
+      # na_matches = "never": the R/29 side carries NA nfl_gsis_id for the
+      # id-less rookie cohort. Under dplyr's default na_matches = "na" those
+      # rows match every other NA-id row and fan out. These rookies have no
+      # R/31 depth-chart allocation, so NA on the right is the correct result.
+      by = "nfl_gsis_id", na_matches = "never"
     ) %>%
-    dplyr::left_join(vol_implied, by = "nfl_gsis_id") %>%
-    dplyr::left_join(blend_weights, by = "nfl_gsis_id")
+    dplyr::left_join(vol_implied, by = "nfl_gsis_id", na_matches = "never") %>%
+    dplyr::left_join(blend_weights, by = "nfl_gsis_id", na_matches = "never")
 
   # STEP 7: Blend projections
   message("\nSTEP 7/7: Blending R/29 and R/31 into r32_posterior_mu")
@@ -1526,6 +2316,12 @@ reconcile_projections <- function(
   message("\nSTEP 7.5: Applying QB depth discount for backup QBs")
   reconciled <- .apply_qb_depth_discount(reconciled)
 
+  # STEP 7.6: omega and the weekly predictive sigma. Purely ADDITIVE:
+  # adds omega/sigma_week columns and a parallel pair of weekly tail
+  # probabilities, and modifies nothing the managed-league path reads.
+  reconciled <- .build_omega(reconciled, scoring_settings = scoring_settings,
+                             position_efficiency = position_efficiency)
+
   # Tag schema and finalize
   output <- reconciled %>%
     dplyr::mutate(schema_tag = SCHEMA_TAG_RECON) %>%
@@ -1533,6 +2329,8 @@ reconcile_projections <- function(
 
   # Save outputs
   if (save_output) {
+    OUTPUT_RDS_PATH_RECON <- .r32_output_rds_path(cache_dir, out_prefix)
+    OUTPUT_CSV_PATH_RECON <- .r32_output_csv_path(cache_dir, out_prefix)
     dir.create(dirname(OUTPUT_RDS_PATH_RECON), recursive = TRUE,
                 showWarnings = FALSE)
     saveRDS(output, OUTPUT_RDS_PATH_RECON)

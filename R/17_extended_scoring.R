@@ -6,10 +6,10 @@
 # PURPOSE
 # -------
 # Extends the Season 1 calculate_fantasy_points() (05_consistency_metrics.R)
-# to cover the full Sleeper scoring option set. New parameters all default to
-# 0 or their Season 1 equivalent, preserving 100% backward compatibility.
-# Calling calculate_fantasy_points_ext() with no new arguments produces output
-# identical to Season 1 calculate_fantasy_points() output.
+# to cover the full Sleeper scoring option set. Defaults are flat full PPR
+# (see DEFAULTS below). Differences from R/05 at matching defaults: R/05 also
+# credits the passer on a successful 2-pt pass (here that is pass_2pt,
+# default 0), and the two files detect pick-sixes differently.
 #
 # NAVIGATION
 # ----------
@@ -46,16 +46,20 @@
 #   and receiving first downs (first_down_pass == 1) only -- not passing TDs
 #   that also happen to be first downs (those are already rewarded via TD points).
 #
-# BACKWARD COMPATIBILITY
-# ----------------------
-#   All Season 1 parameters are preserved with identical names and defaults:
-#     pass_yd = 0.04, pass_td = 6, pass_int = -2, pick6_penalty = -4
+# DEFAULTS [2026-09-30]
+# ---------------------
+#   Argument defaults are FLAT FULL PPR, matching R/05 and R/29:
+#     pass_yd = 0.04, pass_td = 4, pass_int = -2, pick6_penalty = 0
 #     rush_yd = 0.1, rush_td = 6
 #     rec_yd = 0.1, rec_td = 6, ppr = 1
-#     fumbles = -2, use_tiered_ppr = TRUE, te_premium = TRUE
-#     rush_att_bonus = 0.25
-#   The output schema is identical to Season 1 with additional columns appended.
-#   Season 1 code that reads total_fantasy_points still works unchanged.
+#     fumbles = -2, use_tiered_ppr = FALSE, te_premium = FALSE
+#     rush_att_bonus = 0, two_point_conversion = 2
+#   Before this date the Season 1 defaults were one league's settings
+#   (6pt pass TD, -4 pick-six, tiered PPR, TE premium, 0.25 rush-attempt
+#   bonus) and two_point_conversion defaulted to 0. Those settings are now
+#   passed explicitly by whoever needs them; they are never a default.
+#   The output schema is identical to Season 1 with additional columns
+#   appended. Season 1 code that reads total_fantasy_points still works.
 #
 # DEPENDENCIES
 # ------------
@@ -137,6 +141,36 @@ DK_BEST_BALL_SCORING <- list(
   bonus_rec_yd_200 = 0, bonus_rush_yd_200 = 0, pass_2pt = 0
 )
 
+# ------------------------------------------------------------------------------
+# FANDUEL_SCORING  [2026-10-01]
+# ------------------------------------------------------------------------------
+# FanDuel NFL classic offensive scoring, read from fanduel.com/rules on
+# 2026-10-01:
+#   0.04 / pass yd; 4 / pass TD; -1 INT; +3 at 300 pass yds (game);
+#   +2 two-point conversion thrown;
+#   0.1 / rush yd; 6 / rush TD; +3 at 100 rush yds (game);
+#   0.1 / rec yd; 6 / rec TD; 0.5 per reception; +3 at 100 rec yds (game);
+#   -2 fumble lost; +2 two-point conversion scored.
+# NOT REPRESENTED: kickoff and punt return TDs and team self fumble-recovery
+# TDs (6 each on FanDuel). R/17 has no parameter for them; the same gap exists
+# for DK_BEST_BALL_SCORING. Rare events, logged rather than modelled.
+#
+# Same shape as DK_BEST_BALL_SCORING (R/17's own parameter names), so it can be
+# passed anywhere a scoring_settings list is accepted. Gate tables fit under it
+# are keyed by .scoring_settings_key() (see R/29 scoring_gate_path()), so they
+# never collide with the flat-PPR production tables.
+FANDUEL_SCORING <- list(
+  pass_yd = 0.04, pass_td = 4, pass_int = -1, pick6_penalty = 0,
+  rush_yd = 0.1, rush_td = 6,
+  rec_yd = 0.1, rec_td = 6, ppr = 0.5, fumbles = -2,
+  use_tiered_ppr = FALSE, te_premium = FALSE, rush_att_bonus = 0,
+  first_down_points = 0, long_td_tiers = NULL,
+  hundred_yard_bonus = 3, superflex_pass_td = 0, two_point_conversion = 2,
+  sack_penalty = 0, tiered_rec_tiers = NULL,
+  bonus_pass_yd_300 = 3, bonus_pass_yd_400 = 0,
+  bonus_rec_yd_200 = 0, bonus_rush_yd_200 = 0, pass_2pt = 2
+)
+
 # ==============================================================================
 # SECTION 2: MAIN FUNCTION
 # ==============================================================================
@@ -161,12 +195,12 @@ DK_BEST_BALL_SCORING <- list(
 #' @param week_min Optional integer. Minimum week (inclusive). NULL = no lower bound.
 #' @param week_max Optional integer. Maximum week (inclusive). NULL = no upper bound.
 #'
-#' # --- Season 1 parameters (preserved with identical defaults) ---
+#' # --- Season 1 parameters (defaults are flat full PPR as of 2026-09-30) ---
 #' @param pass_yd Numeric. Points per passing yard. Default 0.04.
-#' @param pass_td Numeric. Points per passing TD. Default 6.
+#' @param pass_td Numeric. Points per passing TD. Default 4.
 #' @param pass_int Numeric. Points per interception thrown. Default -2.
 #' @param pick6_penalty Numeric. Additional penalty when INT returned for TD.
-#'   Added to pass_int. Default -4 (total pick-6 cost = -6).
+#'   Added to pass_int. Default 0 (no extra penalty).
 #' @param rush_yd Numeric. Points per rushing yard. Default 0.1.
 #' @param rush_td Numeric. Points per rushing TD. Default 6.
 #' @param rec_yd Numeric. Points per receiving yard. Default 0.1.
@@ -175,11 +209,11 @@ DK_BEST_BALL_SCORING <- list(
 #'   use_tiered_ppr = TRUE. Default 1.
 #' @param fumbles Numeric. Points lost per fumble lost. Default -2.
 #' @param use_tiered_ppr Logical. Use tiered reception points based on
-#'   yards gained (see TIERED_PPR_BREAKS). Default TRUE.
+#'   yards gained (see TIERED_PPR_BREAKS). Default FALSE.
 #' @param te_premium Logical. Add TE_PREMIUM_PTS (0.5) per TE reception.
-#'   Requires roster_data. Default TRUE.
+#'   Requires roster_data. Default FALSE.
 #' @param rush_att_bonus Numeric. Points per rushing attempt regardless of
-#'   outcome. Default 0.25.
+#'   outcome. Default 0.
 #'
 #' # --- New Season 2 parameters (all default to 0 = no effect) ---
 #' @param first_down_points Numeric. Bonus points for each first down earned
@@ -206,7 +240,7 @@ DK_BEST_BALL_SCORING <- list(
 #' @param two_point_conversion Numeric. Points for a successful 2-point
 #'   conversion. Applies to both the passer (if passing 2PC) and the rusher/
 #'   receiver who scores. In Sleeper this is typically awarded to the scorer.
-#'   Common Sleeper value: 2.0. Default 0.
+#'   Default 2 (flat PPR standard; was 0 before 2026-09-30).
 #' @param sack_penalty Numeric. Negative points per sack taken. Applied to
 #'   the QB (passer_player_id). Common Sleeper value: -1.0. Default 0.
 #'
@@ -260,11 +294,11 @@ DK_BEST_BALL_SCORING <- list(
 #'   - two_point_successes (int): NEW raw count
 #'
 #' @details
-#' **Backward Compatibility:**
-#' Calling with no new arguments is identical to Season 1 calculate_fantasy_points()
-#' because all new parameters default to 0. The output has additional columns
-#' (two_pt_fantasy_points, first_down_fantasy_points, etc.) but total_fantasy_points
-#' is identical to Season 1 output when new parameters are at their defaults.
+#' **Defaults:**
+#' Calling with no scoring arguments gives flat full PPR (2026-09-30). The
+#' output carries additional component columns (two_pt_fantasy_points,
+#' first_down_fantasy_points, etc.) beyond the Season 1 schema; the Season 1
+#' column names are unchanged.
 #'
 #' **Two-Point Conversion Handling:**
 #' Two-point attempts appear in nflfastR as two_point_attempt = 1 with
@@ -303,7 +337,7 @@ DK_BEST_BALL_SCORING <- list(
 #' pbp <- load_normalized_season(2024)
 #' roster <- nflreadr::load_rosters(seasons = 2024)
 #'
-#' # --- EXAMPLE 1: Default settings (identical to Season 1 output) ---
+#' # --- EXAMPLE 1: Default settings (flat full PPR) ---
 #' fp_default <- calculate_fantasy_points_ext(pbp, roster, season = 2024L)
 #'
 #' # --- EXAMPLE 2: Sleeper-style scoring ---
@@ -359,32 +393,60 @@ DK_BEST_BALL_SCORING <- list(
 #' \code{\link{get_ext_scoring_defaults}} to inspect all default values
 #'
 #' @export
+#' Resolve one display name per player_id per season (internal)
+#'
+#' Most frequent spelling across the player's passer/rusher/receiver name
+#' appearances in the season; ties broken alphabetically. Added 2026-09-17.
+#' Mirrors .resolve_display_names() in R/05; kept separate so R/17 does not
+#' depend on R/05 being sourced.
+#' @keywords internal
+.resolve_display_names_ext <- function(pbp) {
+  dplyr::bind_rows(
+    pbp %>%
+      dplyr::filter(!is.na(passer_player_id), !is.na(passer_player_name)) %>%
+      dplyr::transmute(season, player_id = passer_player_id,
+                       player_name = passer_player_name),
+    pbp %>%
+      dplyr::filter(!is.na(rusher_player_id), !is.na(rusher_player_name)) %>%
+      dplyr::transmute(season, player_id = rusher_player_id,
+                       player_name = rusher_player_name),
+    pbp %>%
+      dplyr::filter(!is.na(receiver_player_id), !is.na(receiver_player_name)) %>%
+      dplyr::transmute(season, player_id = receiver_player_id,
+                       player_name = receiver_player_name)
+  ) %>%
+    dplyr::count(season, player_id, player_name, name = "n_appearances") %>%
+    dplyr::arrange(season, player_id, dplyr::desc(n_appearances), player_name) %>%
+    dplyr::distinct(season, player_id, .keep_all = TRUE) %>%
+    dplyr::select(season, player_id, player_name)
+}
+
 calculate_fantasy_points_ext <- function(
   pbp_data,
   roster_data          = NULL,
   season               = NULL,
   week_min             = NULL,
   week_max             = NULL,
-  # --- Season 1 parameters (preserved exactly) ---
+  # --- Season 1 parameters (flat full PPR defaults, 2026-09-30) ---
   pass_yd              = 0.04,
-  pass_td              = 6,
+  pass_td              = 4,
   pass_int             = -2,
-  pick6_penalty        = -4,
+  pick6_penalty        = 0,
   rush_yd              = 0.1,
   rush_td              = 6,
   rec_yd               = 0.1,
   rec_td               = 6,
   ppr                  = 1,
   fumbles              = -2,
-  use_tiered_ppr       = TRUE,
-  te_premium           = TRUE,
-  rush_att_bonus       = 0.25,
-  # --- New Season 2 parameters (default to 0 = no effect) ---
+  use_tiered_ppr       = FALSE,
+  te_premium           = FALSE,
+  rush_att_bonus       = 0,
+  # --- New Season 2 parameters (0 = no effect; 2PC is standard at 2) ---
   first_down_points    = 0,
   long_td_tiers        = NULL,
   hundred_yard_bonus   = 0,
   superflex_pass_td    = 0,
-  two_point_conversion = 0,
+  two_point_conversion = 2,
   sack_penalty         = 0,
   # --- New Sleeper parity parameters (all default to 0 / NULL = no effect) ---
   tiered_rec_tiers  = NULL,
@@ -582,7 +644,10 @@ calculate_fantasy_points_ext <- function(
 
   # Build a unified player-game spine from all component tables
   # Use full_join so players appear even if they only contributed in one category
-  join_key <- c("season", "week", "game_id", "player_id", "player_name", "team")
+  # [2026-09-17] player_name removed from join_key. Name spellings differ
+  # across plays and roles in nflfastR, which split one player-game into
+  # separate rows. Name is attached after the join (see below).
+  join_key <- c("season", "week", "game_id", "player_id", "team")
 
   all_components <- list(passing_pts, rushing_pts, receiving_pts, two_pt_pts)
 
@@ -642,6 +707,14 @@ calculate_fantasy_points_ext <- function(
       pass_milestone_fantasy_points = dplyr::coalesce(pass_milestone_pts, 0)
     )
 
+  # Attach one display name per player_id per season [2026-09-17].
+  # Rule: the most frequent spelling across the player's passer, rusher, and
+  # receiver name appearances in the season (pbp_filtered), ties broken
+  # alphabetically.
+  name_lookup_ext <- .resolve_display_names_ext(pbp_filtered)
+  combined <- combined %>%
+    dplyr::left_join(name_lookup_ext, by = c("season", "player_id"))
+
   # Resolve position. position was stripped before the full_join to prevent
   # column-suffix collisions (position.x / position.y). Reattach it here.
   # When roster_data is provided, anchor to the roster (accurate for dual-role
@@ -658,6 +731,11 @@ calculate_fantasy_points_ext <- function(
       ) %>%
       dplyr::select(-position_roster)
   } else {
+    # NOTE [2026-09-17]: this labels a scoring ROLE, not the player's position.
+    # Any passing points -> "QB"; rushing but no passing -> "RB"; everything
+    # else, including every TE, -> "WR". A QB with zero passing points in a
+    # game is "RB" or "WR" for that game. Unchanged by design; pass
+    # roster_data for real positions.
     combined <- combined %>%
       dplyr::mutate(
         position = dplyr::case_when(
@@ -743,7 +821,7 @@ calculate_fantasy_points_ext <- function(
 #' @param sack_penalty Numeric. Points per sack taken (negative).
 #' @param fumbles Numeric. Points per fumble lost.
 #'
-#' @return Tibble with columns: season, week, game_id, player_id, player_name,
+#' @return Tibble with columns: season, week, game_id, player_id,
 #'   team, position, pass_yards, pass_tds, pass_ints, sacks_taken,
 #'   pass_fantasy_points.
 #'
@@ -914,10 +992,12 @@ calculate_fantasy_points_ext <- function(
     )
 
   pass_agg <- pass_plays %>%
+    # [2026-09-17] player_name removed from the grouping key; one row per
+    # season, week, game_id, player_id. The display name is attached once in
+    # calculate_fantasy_points_ext() after all components are joined.
     dplyr::group_by(
       season, week, game_id,
-      player_id   = passer_player_id,
-      player_name = passer_player_name
+      player_id   = passer_player_id
     ) %>%
     dplyr::summarise(
       team        = dplyr::last(posteam),
@@ -965,7 +1045,7 @@ calculate_fantasy_points_ext <- function(
         dplyr::if_else(pass_yards >= 400, bonus_pass_yd_400, 0)
     ) %>%
     dplyr::select(
-      season, week, game_id, player_id, player_name, team, position,
+      season, week, game_id, player_id, team, position,
       pass_yards, pass_tds, pass_ints, sacks_taken,
       pass_fantasy_points, pass_milestone_pts, long_td_pass_pts
     )
@@ -977,7 +1057,7 @@ calculate_fantasy_points_ext <- function(
 .empty_passing_component <- function() {
   tibble::tibble(
     season = integer(), week = integer(), game_id = character(),
-    player_id = character(), player_name = character(),
+    player_id = character(),
     team = character(), position = character(),
     pass_yards = numeric(), pass_tds = integer(), pass_ints = integer(),
     sacks_taken = integer(), pass_fantasy_points = numeric(),
@@ -1003,7 +1083,7 @@ calculate_fantasy_points_ext <- function(
 #'   calculate_fantasy_points_ext(). Only the rush component is read here.
 #' @param hundred_yard_bonus Numeric. Bonus for 100+ rushing yards in a game.
 #'
-#' @return Tibble with columns: season, week, game_id, player_id, player_name,
+#' @return Tibble with columns: season, week, game_id, player_id,
 #'   team, position, rush_yards, rush_tds, rush_attempts, rush_first_downs,
 #'   rush_fantasy_points, long_td_fantasy_points, hundred_yard_fantasy_points.
 #'   Note: first_down_fantasy_points and long/hundred bonuses are stored in
@@ -1063,10 +1143,12 @@ calculate_fantasy_points_ext <- function(
     )
 
   rush_agg <- rush_plays %>%
+    # [2026-09-17] player_name removed from the grouping key; one row per
+    # season, week, game_id, player_id. The display name is attached once in
+    # calculate_fantasy_points_ext() after all components are joined.
     dplyr::group_by(
       season, week, game_id,
-      player_id   = rusher_player_id,
-      player_name = rusher_player_name
+      player_id   = rusher_player_id
     ) %>%
     dplyr::summarise(
       team          = dplyr::last(posteam),
@@ -1113,7 +1195,7 @@ calculate_fantasy_points_ext <- function(
         dplyr::if_else(rush_yards >= 200, bonus_rush_yd_200, 0)
     ) %>%
     dplyr::select(
-      season, week, game_id, player_id, player_name, team, position,
+      season, week, game_id, player_id, team, position,
       rush_yards, rush_tds, rush_attempts, rush_first_downs,
       rush_fantasy_points,
       rush_first_down_pts,
@@ -1127,7 +1209,7 @@ calculate_fantasy_points_ext <- function(
 .empty_rushing_component <- function() {
   tibble::tibble(
     season = integer(), week = integer(), game_id = character(),
-    player_id = character(), player_name = character(),
+    player_id = character(),
     team = character(), position = character(),
     rush_yards = numeric(), rush_tds = integer(),
     rush_attempts = integer(), rush_first_downs = integer(),
@@ -1226,10 +1308,12 @@ calculate_fantasy_points_ext <- function(
     )
 
   rec_agg <- target_plays %>%
+    # [2026-09-17] player_name removed from the grouping key; one row per
+    # season, week, game_id, player_id. The display name is attached once in
+    # calculate_fantasy_points_ext() after all components are joined.
     dplyr::group_by(
       season, week, game_id,
-      player_id   = receiver_player_id,
-      player_name = receiver_player_name
+      player_id   = receiver_player_id
     ) %>%
     dplyr::summarise(
       team             = dplyr::last(posteam),
@@ -1303,7 +1387,7 @@ calculate_fantasy_points_ext <- function(
 
   rec_agg <- rec_agg %>%
     dplyr::select(
-      season, week, game_id, player_id, player_name, team, position,
+      season, week, game_id, player_id, team, position,
       targets, receptions, rec_yards, rec_tds, rec_first_downs,
       rec_fantasy_points,
       rec_first_down_pts,
@@ -1317,7 +1401,7 @@ calculate_fantasy_points_ext <- function(
 .empty_receiving_component <- function() {
   tibble::tibble(
     season = integer(), week = integer(), game_id = character(),
-    player_id = character(), player_name = character(),
+    player_id = character(),
     team = character(), position = character(),
     targets = integer(), receptions = integer(),
     rec_yards = numeric(), rec_tds = integer(), rec_first_downs = integer(),
@@ -1379,10 +1463,12 @@ calculate_fantasy_points_ext <- function(
   # Two-point pass: receiver_player_id is not NA (receiver scores, not passer)
   two_pt_rush <- two_pt_plays %>%
     dplyr::filter(!is.na(rusher_player_id)) %>%
+    # [2026-09-17] player_name removed from the grouping key; one row per
+    # season, week, game_id, player_id. The display name is attached once in
+    # calculate_fantasy_points_ext() after all components are joined.
     dplyr::group_by(
       season, week, game_id,
-      player_id   = rusher_player_id,
-      player_name = rusher_player_name
+      player_id   = rusher_player_id
     ) %>%
     dplyr::summarise(
       team                 = dplyr::last(posteam),
@@ -1393,10 +1479,12 @@ calculate_fantasy_points_ext <- function(
 
   two_pt_rec <- two_pt_plays %>%
     dplyr::filter(!is.na(receiver_player_id)) %>%
+    # [2026-09-17] player_name removed from the grouping key; one row per
+    # season, week, game_id, player_id. The display name is attached once in
+    # calculate_fantasy_points_ext() after all components are joined.
     dplyr::group_by(
       season, week, game_id,
-      player_id   = receiver_player_id,
-      player_name = receiver_player_name
+      player_id   = receiver_player_id
     ) %>%
     dplyr::summarise(
       team                 = dplyr::last(posteam),
@@ -1410,7 +1498,7 @@ calculate_fantasy_points_ext <- function(
       two_pt_fantasy_points = two_point_successes * two_point_conversion
     ) %>%
     dplyr::select(
-      season, week, game_id, player_id, player_name, team, position,
+      season, week, game_id, player_id, team, position,
       two_point_successes, two_pt_fantasy_points
     )
 
@@ -1424,10 +1512,10 @@ calculate_fantasy_points_ext <- function(
         !is.na(passer_player_name),
         !is.na(receiver_player_id)  # confirms this was a passing 2PC
       ) %>%
+      # [2026-09-17] player_name removed from the grouping key.
       dplyr::group_by(
         season, week, game_id,
-        player_id   = passer_player_id,
-        player_name = passer_player_name
+        player_id   = passer_player_id
       ) %>%
       dplyr::summarise(
         team                  = dplyr::last(posteam),
@@ -1439,7 +1527,7 @@ calculate_fantasy_points_ext <- function(
         two_pt_fantasy_points = two_point_successes * pass_2pt
       ) %>%
       dplyr::select(
-        season, week, game_id, player_id, player_name, team, position,
+        season, week, game_id, player_id, team, position,
         two_point_successes, two_pt_fantasy_points
       )
 
@@ -1449,10 +1537,17 @@ calculate_fantasy_points_ext <- function(
   # Collapse duplicate player-game rows (e.g., QB rushes for a 2PC AND
   # throws a passing 2PC in the same game -- appears in both tables)
   two_pt_combined <- two_pt_combined %>%
+    # [2026-09-17] player_name and position removed from this collapse key.
+    # position here is the scorer-role placeholder ("RB"/"WR"/"QB"); keeping it
+    # as a key left a player with both a rush and a receiving 2PC in one game
+    # on two rows, which duplicated that player-game at the full_join. position
+    # is stripped before the join in the caller, so it was never an output
+    # value; removing it as a key only removes the duplicate row.
     dplyr::group_by(
-      season, week, game_id, player_id, player_name, team, position
+      season, week, game_id, player_id, team
     ) %>%
     dplyr::summarise(
+      position              = dplyr::first(position),
       two_point_successes   = sum(two_point_successes, na.rm = TRUE),
       two_pt_fantasy_points = sum(two_pt_fantasy_points, na.rm = TRUE),
       .groups               = "drop"
@@ -1464,7 +1559,7 @@ calculate_fantasy_points_ext <- function(
 .empty_two_point_component <- function() {
   tibble::tibble(
     season = integer(), week = integer(), game_id = character(),
-    player_id = character(), player_name = character(),
+    player_id = character(),
     team = character(), position = character(),
     two_point_successes = integer(),
     two_pt_fantasy_points = numeric()
@@ -1512,13 +1607,13 @@ calculate_fantasy_points_ext <- function(
 #'
 #' @export
 validate_ext_scoring_params <- function(
-  pass_yd = 0.04, pass_td = 6, pass_int = -2, pick6_penalty = -4,
+  pass_yd = 0.04, pass_td = 4, pass_int = -2, pick6_penalty = 0,
   rush_yd = 0.1, rush_td = 6,
   rec_yd = 0.1, rec_td = 6, ppr = 1, fumbles = -2,
-  rush_att_bonus = 0.25,
+  rush_att_bonus = 0,
   first_down_points = 0, long_td_tiers = NULL,
   hundred_yard_bonus = 0, superflex_pass_td = 0,
-  two_point_conversion = 0, sack_penalty = 0,
+  two_point_conversion = 2, sack_penalty = 0,
   tiered_rec_tiers  = NULL,
   bonus_pass_yd_300 = 0, bonus_pass_yd_400 = 0,
   bonus_rec_yd_200  = 0, bonus_rush_yd_200  = 0,
@@ -1624,7 +1719,7 @@ validate_ext_scoring_params <- function(
 #' @param week_min,week_max Optional integers. Week range.
 #' @param systems Named list of lists. Each element is a named list of
 #'   scoring parameter overrides. The default element (empty list) uses
-#'   Season 1 defaults. Example:
+#'   function defaults (flat full PPR). Example:
 #'   \code{list(Default = list(), Sleeper = list(first_down_points = 0.5))}
 #' @param min_games Integer. Minimum games played to include a player.
 #'   Default 4 (prevents noise from small samples).
@@ -1760,20 +1855,22 @@ compare_scoring_systems <- function(
 #' @export
 get_ext_scoring_defaults <- function(show_new_only = FALSE) {
 
+  # [2026-09-30] Flat full PPR. Must match calculate_fantasy_points_ext()'s
+  # signature exactly; the verification block compares the two.
   season1_defaults <- list(
     pass_yd        = 0.04,
-    pass_td        = 6,
+    pass_td        = 4,
     pass_int       = -2,
-    pick6_penalty  = -4,
+    pick6_penalty  = 0,
     rush_yd        = 0.1,
     rush_td        = 6,
     rec_yd         = 0.1,
     rec_td         = 6,
     ppr            = 1,
     fumbles        = -2,
-    use_tiered_ppr = TRUE,
-    te_premium     = TRUE,
-    rush_att_bonus = 0.25
+    use_tiered_ppr = FALSE,
+    te_premium     = FALSE,
+    rush_att_bonus = 0
   )
 
   season2_defaults <- list(
@@ -1781,7 +1878,7 @@ get_ext_scoring_defaults <- function(show_new_only = FALSE) {
     long_td_tiers        = NULL,
     hundred_yard_bonus   = 0,
     superflex_pass_td    = 0,
-    two_point_conversion = 0,
+    two_point_conversion = 2,
     sack_penalty         = 0,
     # Sleeper parity parameters
     tiered_rec_tiers  = NULL,

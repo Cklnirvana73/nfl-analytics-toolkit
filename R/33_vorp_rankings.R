@@ -63,12 +63,22 @@
 #
 # LEAGUE FORMAT DEFAULTS
 # ----------------------
-# Standard:   boom_weight = 1.5, bust_weight = 2.0, ceiling_factor = 0.0
-# Best ball:  boom_weight = 4.0, bust_weight = 0.5, ceiling_factor = 0.3
+# ALL WEIGHTS ARE 0.00.  [Wave A2 R6, 2026-08-07]
 #
-# Loss aversion baked into standard formats (bust weighted more than boom).
-# Best ball inverts: ceiling matters most, floor barely matters because the
-# platform auto-sets the highest-scoring lineup every week.
+# The former defaults were:
+#   Standard:   boom_weight = 1.5, bust_weight = 2.0, ceiling_factor = 0.0
+#   Best ball:  boom_weight = 4.0, bust_weight = 0.5, ceiling_factor = 0.3
+# Five non-zero constants, none of them fitted or gated out of sample. The
+# stated rationale was loss aversion in standard formats and ceiling-seeking in
+# best ball. Both are plausible claims about football; neither was ever tested,
+# and the ceiling term is not even a separate signal: under a symmetric
+# predictive distribution (upper_80 - mu) is a fixed multiple of sigma, so
+# ceiling_modifier is a rescaled sigma presented as new information.
+#
+# With every weight at 0.00, adjusted_vorp == vorp_base exactly. The modifier
+# columns still emit, as zeros, so the neutralization is auditable rather than
+# invisible. See LEAGUE_FORMAT_DEFAULTS for the measured effect and the
+# conditions for reinstating a fitted weight set.
 #
 # CONFIGURATION SOURCES
 # ---------------------
@@ -168,26 +178,53 @@ WRRB_FLEX_ELIGIBLE <- c("RB", "WR")
 SUPERFLEX_ELIGIBLE <- c("QB", "RB", "WR", "TE")
 
 # League format defaults (boom/bust/ceiling weights)
+#
+# ALL FIVE WEIGHTS NEUTRALIZED TO 0.00  [Wave A2 R6]
+#
+# The three modifiers below add a quantity to vorp_base that no gate ever
+# supported. Each of the five constants (boom 1.5/4.0, bust 2.0/0.5, ceiling
+# 0.3) was chosen by assertion, not fitted or validated out of sample, and the
+# ceiling term is worse than merely unsupported: ceiling_factor * (upper_80 -
+# mu) is a fixed multiple of sigma under a symmetric predictive distribution,
+# so it carries NO information beyond sigma while presenting itself as a
+# separate signal. It is a rescaled sigma wearing the name of a ceiling.
+#
+# Measured effect before neutralization, on a 12-team redraft board: the extra
+# term ranged -0.4 to +1.45 PPG, mean absolute rank shift 3.33 places, max 13.
+# That is enough to reorder real draft decisions on the strength of five
+# constants nobody had tested.
+#
+# With every weight at 0.00, adjusted_vorp is arithmetically identical to
+# vorp_base, and vorp_base is r32_posterior_mu minus positional replacement:
+# a quantity that means something. The machinery is retained so a fitted
+# replacement can be dropped in behind the same interface once the best-ball
+# simulation supplies weights EARNED from simulated lineup value rather than
+# assumed. Do not restore a non-zero value without an out-of-sample gate.
+# QB availability weighting: see compute_vorp_rankings() for the full argument.
+# TRUE multiplies backup QB mu by qb_discount_factor before ranking, so a
+# high-PPG backup does not outrank a starter on a draft board.
+VORP_APPLY_QB_AVAILABILITY <- TRUE
+
 LEAGUE_FORMAT_DEFAULTS <- list(
   "standard" = list(
-    boom_weight    = 1.5,
-    bust_weight    = 2.0,
+    boom_weight    = 0.0,
+    bust_weight    = 0.0,
     ceiling_factor = 0.0
   ),
   "half_ppr" = list(
-    boom_weight    = 1.5,
-    bust_weight    = 2.0,
+    boom_weight    = 0.0,
+    bust_weight    = 0.0,
     ceiling_factor = 0.0
   ),
   "ppr" = list(
-    boom_weight    = 1.5,
-    bust_weight    = 2.0,
+    boom_weight    = 0.0,
+    bust_weight    = 0.0,
     ceiling_factor = 0.0
   ),
   "best_ball" = list(
-    boom_weight    = 4.0,
-    bust_weight    = 0.5,
-    ceiling_factor = 0.3
+    boom_weight    = 0.0,
+    bust_weight    = 0.0,
+    ceiling_factor = 0.0
   )
 )
 
@@ -212,6 +249,7 @@ utils::globalVariables(c(
   "league_name", "league_format", "league_teams",
   "r32_projection_upper_80", "r32_projection_lower_80",
   "replacement_ppg", "vorp_base", "boom_modifier", "bust_modifier",
+  "qb_discount_factor", "vorp_availability", "r32_posterior_mu_ppg",
   "ceiling_modifier", "adjusted_vorp", "overall_rank", "position_rank",
   "pos_rank", "role", "n_used",
   "FLEX", "SUPER_FLEX", "BN", "IR", "TAXI", "K", "DEF",
@@ -487,19 +525,46 @@ build_configs_from_sleeper_user <- function(username,
 #' from remaining QB/RB/WR/TE. Replacement PPG at each position = PPG of the
 #' next-best player below everyone allocated.
 #'
-#' @param projections Tibble. Must contain nfl_gsis_id, position, and
-#'   r32_posterior_mu.
+#' @param projections Tibble. Must contain player_uid, nfl_gsis_id, position,
+#'   and r32_posterior_mu. player_uid is the identity key; nfl_gsis_id is NA
+#'   for the draftable rookie cohort and must not be used to identify rows.
 #' @param config League_config list.
 #' @return Named list with two elements:
 #'   replacement_ppg: named numeric (QB, RB, WR, TE)
-#'   role_assignments: tibble with nfl_gsis_id, role
+#'   role_assignments: tibble with player_uid, nfl_gsis_id, role
 #'   (starter/flex/rec_flex/wrrb_flex/superflex/bench)
 #' @keywords internal
 .compute_replacement_levels <- function(projections, config) {
 
+  # WAVE A2 IDENTITY FIX.
+  #
+  # Role assignment below previously matched rows with
+  #   proj$role[proj$nfl_gsis_id %in% candidates$nfl_gsis_id] <- ...
+  # nfl_gsis_id is NA for the draftable rookie cohort, and in R
+  # NA %in% c(NA) is TRUE. So if a single id-less rookie earned a flex slot,
+  # EVERY id-less rookie was flagged into that slot and removed from the bench
+  # pool. Step 4 reads replacement_ppg off the first bench player, and
+  # vorp_base = r32_posterior_mu - replacement_ppg, so the corruption did not
+  # stay with the rookies -- it moved the replacement level and therefore
+  # every VORP number at that position.
+  #
+  # The fix does not swap one key for another. It assigns by row position via
+  # .vorp_row_id, which is correct no matter what the identity column holds.
+  # player_uid is still required and validated, because it is what makes the
+  # id-less cohort addressable at all downstream.
+  if (!"player_uid" %in% names(projections)) {
+    stop(
+      ".compute_replacement_levels(): projections carry no player_uid. ",
+      "Regenerate R/29 and R/32 -- nfl_gsis_id is NA for draftable rookies ",
+      "and cannot serve as the identity key.",
+      call. = FALSE
+    )
+  }
+
   proj <- projections %>%
     dplyr::filter(.data$position %in% VORP_POSITIONS,
                    !is.na(.data$r32_posterior_mu)) %>%
+    dplyr::mutate(.vorp_row_id = dplyr::row_number()) %>%
     dplyr::group_by(.data$position) %>%
     dplyr::arrange(dplyr::desc(.data$r32_posterior_mu), .by_group = TRUE) %>%
     dplyr::mutate(pos_rank = dplyr::row_number()) %>%
@@ -537,7 +602,7 @@ build_configs_from_sleeper_user <- function(username,
         dplyr::arrange(dplyr::desc(.data$r32_posterior_mu)) %>%
         dplyr::slice_head(n = n_slot_total)
 
-      proj$role[proj$nfl_gsis_id %in% slot_candidates$nfl_gsis_id] <-
+      proj$role[proj$.vorp_row_id %in% slot_candidates$.vorp_row_id] <-
         spec$role
     }
   }
@@ -551,7 +616,7 @@ build_configs_from_sleeper_user <- function(username,
       dplyr::arrange(dplyr::desc(.data$r32_posterior_mu)) %>%
       dplyr::slice_head(n = n_sflex_total)
 
-    proj$role[proj$nfl_gsis_id %in% sflex_candidates$nfl_gsis_id] <-
+    proj$role[proj$.vorp_row_id %in% sflex_candidates$.vorp_row_id] <-
       "superflex"
   }
 
@@ -575,7 +640,8 @@ build_configs_from_sleeper_user <- function(username,
 
   list(
     replacement_ppg  = replacement_ppg,
-    role_assignments = proj %>% dplyr::select(nfl_gsis_id, role, pos_rank)
+    role_assignments = proj %>%
+      dplyr::select(player_uid, nfl_gsis_id, role, pos_rank)
   )
 }
 
@@ -621,9 +687,635 @@ build_configs_from_sleeper_user <- function(username,
                              0
                            ),
 
+      # With LEAGUE_FORMAT_DEFAULTS all at 0.00 every modifier is exactly 0 and
+      # this reduces to vorp_base. Kept as a sum rather than collapsed so the
+      # modifier columns still emit (all zeros, auditable) and so a fitted
+      # weight set can be reinstated without touching this line.
       adjusted_vorp = .data$vorp_base + .data$boom_modifier +
                         .data$bust_modifier + .data$ceiling_modifier
     )
+}
+
+# ==============================================================================
+# BEST-BALL SIMULATION  [2026-07-30, Wave A2 R6]
+#
+# WHAT THIS REPLACES
+# The composite formula above prices upside with three hand-set numbers:
+#   boom_modifier    = boom_weight   * boom_probability     (4.0 in best ball)
+#   bust_modifier    = -bust_weight  * bust_probability     (0.5)
+#   ceiling_modifier = ceiling_factor * (upper_80 - mu)     (0.3)
+# None of the five weights across the two formats ever had OOS gate evidence,
+# and R/49 showed ceiling_modifier was exactly 0.3 * 1.282 * sigma, carrying no
+# information beyond sigma itself.
+#
+# They exist only because the board holds a POINT estimate and upside had to be
+# stapled on afterwards. Given a weekly predictive distribution there is nothing
+# left for them to do: best-ball value is what the lineup actually scores, and
+# the lineup keeps good weeks and discards bad ones by itself.
+#
+# WHY BEST BALL PAYS FOR VARIANCE
+# No in-season management means the optimal lineup is chosen after the results
+# are known. A player's bad weeks never enter the lineup, and his good weeks
+# enter in full. His downside is truncated and his upside is not, so his value
+# is an option on his weeks rather than his average. Two players with identical
+# projections are not equally valuable if one delivers 12 every week and the
+# other alternates 3 and 21: the 21s are kept and the 3s are thrown away.
+#
+# THE MARGINAL-VALUE IDENTITY
+# Adding one player of position p, scoring x, to a roster changes the weekly
+# lineup total by exactly
+#     max(0, x - bar_p)
+# where bar_p is the score he must beat. For a flex-eligible position,
+#     bar_p = min(A[s_p], F)
+# with A[s_p] the s_p-th best score at p on the baseline roster and F the best
+# remaining flex-eligible score. Derivation: if x clears A[s_p] he takes a
+# position slot and displaces A[s_p], who then competes for flex, so the flex
+# gains max(0, A[s_p] - F); summing gives x - F when A[s_p] >= F and
+# x - A[s_p] otherwise, which is x - min(A[s_p], F) in both branches. For a
+# non-flex position, bar_p = A[s_p].
+#
+# That identity is what makes this tractable: the baseline roster is simulated
+# ONCE, and every player is then priced against the same bar rather than
+# re-optimising a lineup 586 times per simulated week.
+#
+# TWO-LEVEL DRAW  [2026-08-03]
+# WHAT WAS WRONG. Every week used to be drawn as
+#     week ~ shape(mu, sigma_week),  sigma_week = sqrt(tau^2 + omega^2)
+# seventeen independent times. tau and omega are not the same kind of quantity
+# and cannot be consumed the same way:
+#   tau   is uncertainty about the player's SEASON MEAN. It is settled once.
+#         Whether a first-year starter is a 12-point player or a 22-point
+#         player is decided for the year, not re-decided every Sunday.
+#   omega is WEEK-TO-WEEK dispersion around whatever that mean turns out to be.
+#         It genuinely does resample every week.
+# Replicating sigma_week across the season and drawing independently gave a
+# player seventeen separate chances to be his own optimistic case. Best ball
+# keeps the maximum, so uncertainty about the LEVEL was harvested as weekly
+# CEILING. The players the model knew least about got the largest bonus.
+#
+# MEASURED CONSEQUENCE (2026-08-03, DK best ball board, 586 players):
+#   Malik Willis    mu 17.31  tau 6.944  sigma_week 11.69  ranked QB9
+#   Deshaun Watson  mu 17.05  tau 6.944  sigma_week 11.94  ranked QB10
+#   Kyler Murray    mu 19.76  tau 1.084  sigma_week  6.05  ranked QB12
+#   Patrick Mahomes mu 18.93  tau 0.959  sigma_week  6.77  ranked QB15
+# Willis outranked Murray while projecting 2.45 PPG lower. The entire gap was
+# tau. Both flagged players are starters with no usable NFL history, so their
+# 6.944 is the QB translation RMSE and is an HONEST number. It was being spent
+# in the wrong place.
+#
+# TWO CORRECTIONS TO THE PARAGRAPH ABOVE  [2026-08-10]
+#
+# 1. ATTRIBUTION. 6.944 does NOT come from .load_translation_sigmas(). That
+#    loader is retired (R/29:3562) and returns 6.667. The live value comes from
+#    .compute_translation_sigmas_scored(), which recomputes the RMSE under the
+#    TARGET SCORING rather than reading a fixed reference-scoring number. 6.944
+#    is that function's output under DK best ball. Verified live:
+#      legacy 6.667 | scoring-aware PPR 6.663 | scoring-aware DK 6.944
+#    QB is the only position where the two paths differ materially; RB, WR and
+#    TE agree to three decimals. The number was always right; the citation was
+#    not.
+#
+# 2. THE PEER RANGE IS SUPERSEDED. Contemporary notes compared 6.944 against a
+#    "measured-QB range of 0.96 to 2.58". That range was measured BEFORE the
+#    change_sigma term was added to the history arm on 2026-07-30 (R/29:2155).
+#    Without it, a long career drove tau toward zero, which R/49 measured as
+#    3.7x overconfident. On the same board rebuilt after that fix:
+#      measured QB median tau 2.337 -> 3.768
+#      Willis / Watson         6.944 -> 6.944  (no history arm, unchanged)
+#      ratio                    2.97x -> 1.84x
+#    The gap is roughly 40 percent smaller than the older figures imply. Do not
+#    quote 0.96 to 2.58 as a current benchmark.
+#
+# The DEFECT this block documents is real and the fix is correct. Only these
+# two supporting details were wrong.
+#
+# WHAT IT IS NOW
+#     theta ~ Normal(mu, tau)        ONCE per simulated season
+#     week  ~ shape(theta, omega)    weeks times, around that season's theta
+# An uncertain player still earns real option value: some simulated seasons
+# draw him high and in those seasons he is excellent. He no longer collects
+# seventeen independent lottery tickets inside one season.
+#
+# WHY LEVEL 1 IS NORMAL AND NOT THE R/50 SHAPE
+# tau is constructed in R/29 .blend_prior_components() as a precision-weighted
+# Gaussian standard error. Normal is the distribution it already is; nothing
+# new is assumed. The R/50 shape table was fitted on standardized WEEKLY
+# residuals and does not transfer to a season mean. Applying it at level 1
+# would be using a fitted object outside the population it was fitted on.
+# A right-skewed season-level form belongs to queue item R5, once there is
+# evidence for one.
+#
+# SCOPE. Only the best-ball SIMULATION changes. r32_sigma_week itself is
+# untouched and remains correct for what it is: the marginal SD of one future
+# week in isolation. R/32's boom_probability_week / bust_probability_week are
+# single-week marginal questions and stay on sqrt(tau^2 + omega^2).
+#
+# LIMITS, stated here rather than discovered later
+#  - The baseline roster is replacement-level players on unrelated NFL teams,
+#    so a candidate's correlation with the bar is ~0. That is right for a
+#    marginal-value board and WRONG for any stacking question, which is what
+#    simulate_roster_season() below is for.
+#  - Shape calibration is weakest in the low-projection tercile (R/50 measured
+#    dev 3.0-4.5 against 1.4-2.3 elsewhere), which is exactly where cheap
+#    high-variance players live. Their values carry more error than the
+#    expensive ones.
+#  - Availability is not modelled. omega is measured over games PLAYED, so a
+#    missed week is absent rather than zero.
+#  - theta is NOT floored at zero. The floor stays where it already was, on
+#    the weekly score, exactly as predictive_draw() applies it. Flooring the
+#    season mean would bias every uncertain player upward and break the
+#    marginal-variance identity.
+#  - Level 1 is drawn independently across players, including team-mates, in
+#    simulate_roster_season(). The R/50 copula was calibrated on weekly
+#    residuals; there is no evidence for a season-level correlation and
+#    borrowing the weekly one would repeat the mistake this block fixes.
+# ==============================================================================
+
+# 17-game regular season, 2021 onward.
+BB_SEASON_WEEKS <- 17L
+
+# Simulated seasons for the marginal-value board. The bar is shared across all
+# players, so its Monte Carlo error is common rather than per-player, and
+# rankings stabilise well before individual values do.
+BB_DEFAULT_SIMS <- 2000L
+
+# Two-level draw. TRUE is the corrected behaviour and the production default.
+# The FALSE path is kept, not deleted, so the pre-2026-08-03 construction stays
+# runnable for A/B verification and so any figure produced under it can be
+# reproduced. Same pattern as every other neutralised path in this build:
+# machinery intact, gate evidence written into the file above.
+BB_HIERARCHICAL <- TRUE
+
+utils::globalVariables(c(
+  "r32_sigma_week", "r32_omega", "r32_posterior_sigma",
+  "bb_value", "bb_rank", "bb_starts",
+  "sim", "wk", "bar", "pos_slot", "tau", "omega"
+))
+
+# ------------------------------------------------------------------------------
+# .best_ball_week_score
+# ------------------------------------------------------------------------------
+
+#' Optimal best-ball lineup score for one week
+#'
+#' Exact for a slot structure where every slot is position-exclusive apart from
+#' flex slots drawn from a single eligible set: take the top s_p at each
+#' position, then fill flex from whatever remains. Greedy is optimal here
+#' because no earlier choice can ever be improved by a later one.
+#'
+#' This is deliberately NOT a general optimizer. R/35 remains the general one,
+#' with league rules, availability and matchups. Calling R/35 inside a
+#' simulation loop would be both wrong for this structure and far too slow.
+#'
+#' @param points Numeric vector of weekly scores.
+#' @param positions Character vector, same length.
+#' @param starters Named list, e.g. list(QB = 1, RB = 2, WR = 3, TE = 1).
+#' @param flex_n Integer. Number of generic flex slots.
+#' @param flex_eligible Character vector.
+#' @return Numeric scalar.
+#' @keywords internal
+.best_ball_week_score <- function(points, positions, starters, flex_n,
+                                   flex_eligible = FLEX_ELIGIBLE) {
+
+  total <- 0
+  used  <- rep(FALSE, length(points))
+
+  for (pos in names(starters)) {
+    n_slot <- as.integer(starters[[pos]])
+    if (n_slot <= 0L) next
+    idx <- which(positions == pos)
+    if (length(idx) == 0L) next
+    ord <- idx[order(points[idx], decreasing = TRUE)]
+    take <- ord[seq_len(min(n_slot, length(ord)))]
+    total <- total + sum(points[take])
+    used[take] <- TRUE
+  }
+
+  if (flex_n > 0L) {
+    idx <- which(!used & positions %in% flex_eligible)
+    if (length(idx) > 0L) {
+      ord <- idx[order(points[idx], decreasing = TRUE)]
+      take <- ord[seq_len(min(flex_n, length(ord)))]
+      total <- total + sum(points[take])
+    }
+  }
+
+  total
+}
+
+# ------------------------------------------------------------------------------
+# .hier_draw
+# ------------------------------------------------------------------------------
+
+#' Draw a full simulated season panel for ONE player, two levels
+#'
+#' Returns n_sims * weeks weekly scores, ordered SEASON-MAJOR: rows
+#' 1..weeks are season 1, rows (weeks+1)..(2*weeks) are season 2, and so on.
+#' That ordering is required by every consumer in this file and by
+#' \code{matrix(x, nrow = weeks, ncol = n_sims)}, which fills column-major.
+#'
+#' Level 1 draws the season mean once from Normal(mu, tau). Level 2 draws each
+#' week around that season's mean with dispersion omega, through the R/50
+#' predictive machinery so the fitted weekly shape is preserved.
+#'
+#' The gamma_points route is handled by delegating each season to
+#' \code{predictive_draw()} rather than reimplementing the parameterisation.
+#' That also preserves R/50's guard fallback for seasons whose drawn mean is
+#' too small for a valid gamma.
+#'
+#' @param position Character. One position.
+#' @param n_sims Integer. Simulated seasons.
+#' @param weeks Integer. Weeks per season.
+#' @param mu Numeric. Projected points per game.
+#' @param tau Numeric. SD of the season mean (R/32 r32_posterior_sigma).
+#' @param omega Numeric. Week-to-week dispersion (R/32 r32_omega).
+#' @param shape_table R/50 shape table.
+#' @param hierarchical Logical. FALSE reproduces the pre-2026-08-03 draw.
+#' @return Numeric vector of length n_sims * weeks.
+#' @keywords internal
+.hier_draw <- function(position, n_sims, weeks, mu, tau, omega, shape_table,
+                        hierarchical = BB_HIERARCHICAL) {
+
+  n_draw <- as.integer(n_sims) * as.integer(weeks)
+
+  tau   <- if (is.na(tau)) 0 else max(tau, 0)
+  omega <- if (is.na(omega)) 0 else max(omega, 0)
+
+  if (!isTRUE(hierarchical)) {
+    # Pre-fix construction, retained for A/B only.
+    return(predictive_draw(position, n_draw, mu,
+                            sqrt(tau^2 + omega^2), shape_table))
+  }
+
+  if (omega <= 0) {
+    stop(".hier_draw(): omega must be > 0 for ", position,
+         " (mu = ", mu, "). A player with no weekly dispersion cannot be ",
+         "simulated. Regenerate R/32 with the omega columns.", call. = FALSE)
+  }
+
+  # LEVEL 1: the season mean, settled once per simulated season.
+  theta <- if (tau > 0) stats::rnorm(n_sims, mean = mu, sd = tau) else rep(mu, n_sims)
+
+  ent <- shape_table[[as.character(position)]]
+
+  if (!is.null(ent) && identical(ent$method, "gamma_points")) {
+    # LEVEL 2, points-space gamma. Parameters depend on the season's own mean,
+    # so this cannot be vectorised across seasons.
+    out <- numeric(n_draw)
+    for (s in seq_len(n_sims)) {
+      idx <- ((s - 1L) * weeks + 1L):(s * weeks)
+      out[idx] <- predictive_draw(position, weeks, theta[s], omega, shape_table)
+    }
+    return(out)
+  }
+
+  # LEVEL 2, standardized route. One shape_draw() call for the whole panel.
+  # The zero floor sits on the WEEK, matching predictive_draw() exactly.
+  pmax(rep(theta, each = weeks) +
+         omega * shape_draw(position, n_draw, shape_table), 0)
+}
+
+# ------------------------------------------------------------------------------
+# .build_baseline_roster
+# ------------------------------------------------------------------------------
+
+#' Replacement-level roster the marginal value is measured against
+#'
+#' Uses the replacement levels the existing VORP path already computes, so
+#' bb_value and vorp_base are anchored to the SAME definition of replacement.
+#' Inventing a second one would make the two columns incomparable and every
+#' before/after rank comparison meaningless.
+#'
+#' tau and omega are carried SEPARATELY rather than pre-combined into
+#' sigma_week, because the bar must be drawn by the same two-level process as
+#' the players it is compared against. A bar drawn the old way against players
+#' drawn the new way would make every comparison a comparison of two different
+#' models. [2026-08-03]
+#'
+#' @param projections Tibble with position, r32_posterior_mu,
+#'   r32_posterior_sigma, r32_omega.
+#' @param replacement_ppg Named numeric from .compute_replacement_levels().
+#' @param config league_config.
+#' @return Tibble: position, mu, tau, omega, sigma_week.
+#' @keywords internal
+.build_baseline_roster <- function(projections, replacement_ppg, config) {
+
+  # Dispersion for a replacement player: taken from the real players nearest
+  # the replacement line at that position, not assumed. Medians are taken on
+  # tau and omega independently, then sigma_week is derived, so the identity
+  # sigma_week^2 = tau^2 + omega^2 holds for the baseline as it does for a
+  # real player.
+  nearest <- function(pos) {
+    projections %>%
+      dplyr::filter(.data$position == pos,
+                     !is.na(.data$r32_omega), .data$r32_omega > 0,
+                     !is.na(.data$r32_posterior_sigma)) %>%
+      dplyr::mutate(gap = abs(.data$r32_posterior_mu - replacement_ppg[[pos]])) %>%
+      dplyr::arrange(gap) %>%
+      dplyr::slice_head(n = 10)
+  }
+
+  tau_v <- purrr::map_dbl(VORP_POSITIONS, function(pos) {
+    d <- nearest(pos)
+    if (nrow(d) == 0L) return(NA_real_)
+    stats::median(d$r32_posterior_sigma, na.rm = TRUE)
+  })
+  omega_v <- purrr::map_dbl(VORP_POSITIONS, function(pos) {
+    d <- nearest(pos)
+    if (nrow(d) == 0L) return(NA_real_)
+    stats::median(d$r32_omega, na.rm = TRUE)
+  })
+  names(tau_v)   <- VORP_POSITIONS
+  names(omega_v) <- VORP_POSITIONS
+
+  bad <- !is.finite(omega_v) | omega_v <= 0 | !is.finite(tau_v)
+  if (any(bad)) {
+    stop(".build_baseline_roster(): no usable tau/omega for ",
+         paste(VORP_POSITIONS[bad], collapse = ", "),
+         ". Regenerate R/32 with the omega columns.", call. = FALSE)
+  }
+
+  rows <- list()
+  for (pos in VORP_POSITIONS) {
+    n_slot <- as.integer(config$starters[[pos]])
+    # One spare at each flex-eligible position so the flex slot has a real
+    # contest rather than being filled by whoever is left over.
+    n_extra <- if (pos %in% FLEX_ELIGIBLE) as.integer(config$flex %||% 0L) else 0L
+    n_tot <- n_slot + n_extra
+    if (n_tot <= 0L) next
+    rows[[pos]] <- tibble::tibble(
+      position   = pos,
+      mu         = replacement_ppg[[pos]],
+      tau        = tau_v[[pos]],
+      omega      = omega_v[[pos]],
+      sigma_week = sqrt(tau_v[[pos]]^2 + omega_v[[pos]]^2)
+    ) %>% dplyr::slice(rep(1L, n_tot))
+  }
+  dplyr::bind_rows(rows)
+}
+
+# ------------------------------------------------------------------------------
+# .simulate_bars
+# ------------------------------------------------------------------------------
+
+#' The score a new player must beat, per position, per simulated week
+#'
+#' @param baseline Tibble from .build_baseline_roster().
+#' @param config league_config.
+#' @param shape_table R/50 shape table.
+#' @param n_sims Integer.
+#' @param hierarchical Logical. Must match the value used for the candidates.
+#' @return Numeric matrix, (n_sims * BB_SEASON_WEEKS) rows by position columns.
+#' @keywords internal
+.simulate_bars <- function(baseline, config, shape_table,
+                            n_sims = BB_DEFAULT_SIMS,
+                            hierarchical = BB_HIERARCHICAL) {
+
+  n_draw <- n_sims * BB_SEASON_WEEKS
+
+  # Baseline players sit on unrelated NFL teams, so they are drawn
+  # independently. This is the assumption that makes the bar a property of the
+  # FIELD rather than of any one offense.
+  #
+  # Each baseline player gets his OWN season mean per simulated season, drawn
+  # at level 1, so the bar itself carries season-to-season variation rather
+  # than being a fixed line with weekly noise on it. [2026-08-03]
+  pts <- vapply(seq_len(nrow(baseline)), function(i) {
+    .hier_draw(baseline$position[i], n_sims, BB_SEASON_WEEKS,
+                baseline$mu[i], baseline$tau[i], baseline$omega[i],
+                shape_table, hierarchical = hierarchical)
+  }, numeric(n_draw))
+  if (is.null(dim(pts))) pts <- matrix(pts, nrow = n_draw)
+
+  pos_vec <- baseline$position
+  flex_n  <- as.integer(config$flex %||% 0L)
+
+  bars <- matrix(NA_real_, nrow = n_draw, ncol = length(VORP_POSITIONS),
+                  dimnames = list(NULL, VORP_POSITIONS))
+
+  for (r in seq_len(n_draw)) {
+    row_pts <- pts[r, ]
+    used <- rep(FALSE, length(row_pts))
+
+    # A[s_p] per position, and mark starters used
+    a_sp <- stats::setNames(rep(-Inf, length(VORP_POSITIONS)), VORP_POSITIONS)
+    for (pos in VORP_POSITIONS) {
+      n_slot <- as.integer(config$starters[[pos]])
+      if (n_slot <= 0L) next
+      idx <- which(pos_vec == pos)
+      if (length(idx) == 0L) next
+      ord <- idx[order(row_pts[idx], decreasing = TRUE)]
+      take <- ord[seq_len(min(n_slot, length(ord)))]
+      a_sp[pos] <- row_pts[take[length(take)]]
+      used[take] <- TRUE
+    }
+
+    # F: best remaining flex-eligible score
+    fidx <- which(!used & pos_vec %in% FLEX_ELIGIBLE)
+    F_val <- if (flex_n > 0L && length(fidx) > 0L) max(row_pts[fidx]) else -Inf
+
+    for (pos in VORP_POSITIONS) {
+      bars[r, pos] <- if (pos %in% FLEX_ELIGIBLE && flex_n > 0L) {
+        min(a_sp[pos], F_val)
+      } else {
+        a_sp[pos]
+      }
+    }
+  }
+
+  bars
+}
+
+# ------------------------------------------------------------------------------
+# simulate_best_ball_value
+# ------------------------------------------------------------------------------
+
+#' Best-ball value over replacement, simulated from the weekly distribution
+#'
+#' Returns season points added over a replacement-level roster. Directly
+#' comparable to vorp_base in units (points), but earned rather than assumed:
+#' upside is priced by the lineup mechanics instead of by boom/bust/ceiling
+#' weights.
+#'
+#' @param projections Tibble. R/32 output carrying r32_posterior_mu,
+#'   r32_posterior_sigma (tau) and r32_omega.
+#' @param config league_config.
+#' @param shape_table R/50 shape table.
+#' @param n_sims Integer.
+#' @param seed Integer or NULL.
+#' @param hierarchical Logical. TRUE is the corrected two-level draw. FALSE
+#'   reproduces the pre-2026-08-03 construction and is for A/B only.
+#' @return projections plus bb_value, bb_starts, bb_rank.
+#' @export
+simulate_best_ball_value <- function(projections, config, shape_table,
+                                      n_sims = BB_DEFAULT_SIMS,
+                                      seed = NULL,
+                                      hierarchical = BB_HIERARCHICAL) {
+
+  need <- c("r32_posterior_mu", "r32_posterior_sigma", "r32_omega")
+  miss <- setdiff(need, names(projections))
+  if (length(miss) > 0L) {
+    stop("simulate_best_ball_value(): projections missing ",
+         paste(miss, collapse = ", "),
+         ". The two-level draw needs tau and omega separately, not a ",
+         "pre-combined sigma_week. Regenerate R/32 with the omega columns.",
+         call. = FALSE)
+  }
+  if (!is.null(seed)) set.seed(seed)
+
+  draw_label <- if (isTRUE(hierarchical)) {
+    "two-level: theta once per season, weeks drawn around it"
+  } else {
+    "FLAT pre-2026-08-03 construction. A/B ONLY, not a production board."
+  }
+  message(glue("  draw: {draw_label}"))
+
+  rep_result <- .compute_replacement_levels(projections, config)
+  baseline <- .build_baseline_roster(projections, rep_result$replacement_ppg,
+                                      config)
+
+  message(glue("  simulating baseline bar: {n_sims} seasons x ",
+               "{BB_SEASON_WEEKS} weeks"))
+  bars <- .simulate_bars(baseline, config, shape_table, n_sims = n_sims,
+                          hierarchical = hierarchical)
+  n_draw <- nrow(bars)
+
+  cand <- projections %>%
+    dplyr::filter(.data$position %in% VORP_POSITIONS,
+                   !is.na(.data$r32_posterior_mu),
+                   !is.na(.data$r32_omega),
+                   .data$r32_omega > 0)
+
+  message(glue("  pricing {nrow(cand)} players against the bar"))
+
+  vals <- vapply(seq_len(nrow(cand)), function(i) {
+    pos <- cand$position[i]
+    x <- .hier_draw(pos, n_sims, BB_SEASON_WEEKS,
+                     cand$r32_posterior_mu[i],
+                     cand$r32_posterior_sigma[i],
+                     cand$r32_omega[i],
+                     shape_table, hierarchical = hierarchical)
+    inc <- pmax(0, x - bars[, pos])
+    c(value = mean(inc) * BB_SEASON_WEEKS,
+      starts = mean(inc > 0))
+  }, numeric(2))
+
+  cand %>%
+    dplyr::mutate(
+      bb_value  = as.numeric(vals["value", ]),
+      bb_starts = as.numeric(vals["starts", ])
+    ) %>%
+    dplyr::arrange(dplyr::desc(bb_value)) %>%
+    dplyr::mutate(bb_rank = dplyr::row_number())
+}
+
+# ------------------------------------------------------------------------------
+# simulate_roster_season
+# ------------------------------------------------------------------------------
+
+#' Simulate a full roster's season with team correlation
+#'
+#' Unlike simulate_best_ball_value(), this draws players on the SAME NFL team
+#' together through the R/50 copula, so it can answer stacking questions. Use
+#' it for roster-construction and stacking analysis; use the marginal-value
+#' function for a draft board.
+#'
+#' The roster must carry tau and omega separately. A roster built with only
+#' sigma_week is REJECTED rather than silently simulated the old way, because
+#' a stale analysis script producing pre-2026-08-03 numbers without saying so
+#' is worse than one that fails. [2026-08-03]
+#'
+#' @param roster Tibble: position, team, mu, tau, omega. One row per player.
+#' @param config league_config.
+#' @param shape_table R/50 shape table.
+#' @param pc POSxPOS correlation matrix (calibrated Gaussian inputs).
+#' @param n_sims Integer.
+#' @param weeks Integer. Defaults to the full regular season. Set to 3 to
+#'   simulate only a best-ball tournament playoff window.
+#' @param seed Integer or NULL.
+#' @param hierarchical Logical. FALSE reproduces the pre-fix draw and requires
+#'   sigma_week instead of tau/omega. A/B only.
+#' @return Numeric vector of simulated totals, length n_sims.
+#' @export
+simulate_roster_season <- function(roster, config, shape_table, pc,
+                                    n_sims = 2000L, weeks = BB_SEASON_WEEKS,
+                                    seed = NULL,
+                                    hierarchical = BB_HIERARCHICAL) {
+
+  need <- if (isTRUE(hierarchical)) {
+    c("position", "team", "mu", "tau", "omega")
+  } else {
+    c("position", "team", "mu", "sigma_week")
+  }
+  miss <- setdiff(need, names(roster))
+  if (length(miss) > 0) {
+    stop("simulate_roster_season(): roster missing ",
+         paste(miss, collapse = ", "),
+         if (isTRUE(hierarchical))
+           ". The two-level draw needs tau and omega separately. Add
+  tau = r32_posterior_sigma, omega = r32_omega
+to the roster build." else "",
+         call. = FALSE)
+  }
+  if (!is.null(seed)) set.seed(seed)
+
+  teams <- unique(roster$team)
+  # One prepared copula per NFL team represented on the roster. Players on
+  # different NFL teams are independent, so only within-team blocks need it.
+  preps <- purrr::map(teams, function(tm) {
+    idx <- which(roster$team == tm)
+    list(idx = idx, prep = prepare_copula(roster$position[idx], pc))
+  })
+
+  flex_n <- as.integer(config$flex %||% 0L)
+  n_week_total <- n_sims * weeks
+
+  # Draw every team-week at once per NFL team. Drawing one week at a time was
+  # correct but unusably slow: it made one copula call per team per week per
+  # simulation. The correlation structure is identical across weeks, so the
+  # prepared factorisation is reused and the whole panel comes out in one call.
+  z <- matrix(NA_real_, nrow = n_week_total, ncol = nrow(roster))
+  for (tp in preps) {
+    z[, tp$idx] <- draw_copula_z(tp$prep, shape_table, n_draws = n_week_total)
+  }
+
+  if (isTRUE(hierarchical)) {
+    # LEVEL 1: one season mean per player per simulated season. Drawn
+    # independently across players, team-mates included: the copula below was
+    # calibrated on WEEKLY residuals and there is no season-level estimate to
+    # justify correlating theta. Stated as a limit in the header block.
+    n_p <- nrow(roster)
+    theta <- matrix(
+      stats::rnorm(n_sims * n_p,
+                    mean = rep(roster$mu,  each = n_sims),
+                    sd   = rep(pmax(dplyr::coalesce(roster$tau, 0), 0),
+                                each = n_sims)),
+      nrow = n_sims, ncol = n_p
+    )
+    # Expand season-major: rows 1..weeks are season 1, and so on.
+    theta_rep <- theta[rep(seq_len(n_sims), each = weeks), , drop = FALSE]
+
+    # LEVEL 2: correlated weekly draws around that season's mean.
+    pts <- pmax(
+      theta_rep +
+        matrix(roster$omega, nrow = n_week_total, ncol = n_p, byrow = TRUE) * z,
+      0
+    )
+  } else {
+    # Pre-2026-08-03 construction. A/B only.
+    pts <- pmax(
+      matrix(roster$mu, nrow = n_week_total, ncol = nrow(roster), byrow = TRUE) +
+        matrix(roster$sigma_week, nrow = n_week_total, ncol = nrow(roster),
+                byrow = TRUE) * z,
+      0
+    )
+  }
+
+  wk_scores <- vapply(seq_len(n_week_total), function(r) {
+    .best_ball_week_score(pts[r, ], roster$position, config$starters, flex_n)
+  }, numeric(1))
+
+  colSums(matrix(wk_scores, nrow = weeks, ncol = n_sims))
 }
 
 # ==============================================================================
@@ -640,7 +1332,7 @@ build_configs_from_sleeper_user <- function(username,
 #' ranks by adjusted_vorp.
 #'
 #' @param projections Tibble. R/32 reconciled projections. Required columns:
-#'   nfl_gsis_id, player_name, team, position, r32_posterior_mu,
+#'   player_uid, nfl_gsis_id, player_name, team, position, r32_posterior_mu,
 #'   boom_probability, bust_probability, r32_projection_upper_80.
 #' @param config league_config list.
 #' @return Tibble with one row per player, sorted by overall_rank.
@@ -649,6 +1341,58 @@ compute_vorp_rankings <- function(projections, config) {
 
   if (!inherits(config, "league_config")) {
     stop("config must be a league_config object (use build_league_config()).")
+  }
+
+  # ---------------------------------------------------------------------------
+  # QB AVAILABILITY WEIGHTING  [2026-08-09]
+  # ---------------------------------------------------------------------------
+  # r32_posterior_mu is PPG WHEN PLAYING. R/32 used to multiply backup QBs by a
+  # depth-chart availability factor, which mixed two quantities: it compared a
+  # season-contribution number against a per-game realized rate. Measured on the
+  # 2018-2025 holdout, that made backup projections more than twice as wrong
+  # (MAE 13.05 discounted vs 5.87 undiscounted, n = 44). R/32 no longer applies
+  # it; see QB_DEPTH_DISCOUNT_APPLY_TO_MU there.
+  #
+  # But a DRAFT BOARD does ask the season-contribution question: a QB2 who
+  # scores 20 PPG in the three games he plays is not worth a roster spot ahead
+  # of a starter. VORP is where that question lives, so the factor is applied
+  # HERE instead.
+  #
+  # It is applied BEFORE replacement levels are computed, not after, because
+  # replacement is the first bench player's mu. Leaving backups at starter-level
+  # mu through the replacement calculation would let a QB2 displace a real
+  # starter and move the replacement bar itself.
+  #
+  # Non-QBs and QBs with no depth record carry a factor of 1 and are unchanged.
+  # Set VORP_APPLY_QB_AVAILABILITY to FALSE to neutralize with machinery intact.
+  if (isTRUE(VORP_APPLY_QB_AVAILABILITY) &&
+      "qb_discount_factor" %in% names(projections)) {
+
+    n_adj <- sum(!is.na(projections$qb_discount_factor) &
+                   projections$qb_discount_factor < 1, na.rm = TRUE)
+
+    projections <- projections %>%
+      dplyr::mutate(
+        vorp_availability = dplyr::coalesce(.data$qb_discount_factor, 1),
+        r32_posterior_mu_ppg = .data$r32_posterior_mu,
+        r32_posterior_mu = .data$r32_posterior_mu * .data$vorp_availability
+      )
+
+    message(glue::glue(
+      "  QB availability weighting applied to {n_adj} backup(s); ",
+      "per-game mu retained as r32_posterior_mu_ppg."))
+  } else if ("qb_discount_factor" %in% names(projections)) {
+    projections <- projections %>%
+      dplyr::mutate(vorp_availability = 1,
+                    r32_posterior_mu_ppg = .data$r32_posterior_mu)
+    message("  QB availability weighting DISABLED (VORP_APPLY_QB_AVAILABILITY).")
+  } else {
+    projections <- projections %>%
+      dplyr::mutate(vorp_availability = 1,
+                    r32_posterior_mu_ppg = .data$r32_posterior_mu)
+    warning("compute_vorp_rankings(): no qb_discount_factor column; QB backups ",
+            "will be ranked on per-game PPG with no availability weighting.",
+            call. = FALSE)
   }
 
   # Compute replacement levels
@@ -678,12 +1422,22 @@ compute_vorp_rankings <- function(projections, config) {
       schema_tag    = SCHEMA_TAG_VORP
     )
 
-  # Select final schema columns
+  # Select final schema columns.
+  #
+  # NOTE: this whitelist silently drops any column not named here. If a new
+  # quantity is computed above and does not appear in this list, it will not
+  # reach the caller and the omission produces no error. [2026-08-09]
+  #
+  # r32_posterior_mu in this output is the AVAILABILITY-WEIGHTED value used for
+  # ranking, not the per-game rate. r32_posterior_mu_ppg carries the per-game
+  # number, and vorp_availability is the factor applied. For every non-QB and
+  # every QB1 the two mu columns are identical and the factor is 1.
   vorp_df %>%
     dplyr::select(
-      nfl_gsis_id, player_name, team, position,
+      player_uid, nfl_gsis_id, player_name, team, position,
       league_name, league_format, league_teams,
-      r32_posterior_mu, r32_projection_lower_80, r32_projection_upper_80,
+      r32_posterior_mu, r32_posterior_mu_ppg, vorp_availability,
+      r32_projection_lower_80, r32_projection_upper_80,
       boom_probability, bust_probability,
       replacement_ppg, vorp_base,
       boom_modifier, bust_modifier, ceiling_modifier,
@@ -759,7 +1513,9 @@ compute_multi_league_rankings <- function(projections,
 
   # KEY INSIGHTS
   n_leagues <- dplyr::n_distinct(all_rankings$league_name)
-  n_players <- dplyr::n_distinct(all_rankings$nfl_gsis_id)
+  # n_distinct on player_uid, not nfl_gsis_id: the latter is NA for the
+  # id-less cohort and counts all of them as one player.
+  n_players <- dplyr::n_distinct(all_rankings$player_uid)
   n_rows    <- nrow(all_rankings)
 
   message(glue("\n{strrep('=', 70)}"))

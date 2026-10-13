@@ -331,6 +331,33 @@ QB_COMMITTEES_PATH <- here::here("data", "ref", "qb_committees_2026.csv")
 # Correctness must not depend on source order, so these are now R30_-prefixed.
 # R/34 keeps the unprefixed names; nothing else defines them, so the collision
 # is gone regardless of load order. R/29 already did this with R29_SCHEMA_TAG.
+# ------------------------------------------------------------------------------
+# NAMESPACE, PREFIX AND SEASON RESOLVERS
+# ------------------------------------------------------------------------------
+# SEASON was a file-level constant, so project_team_volumes() could only ever
+# project the one season this file was written for, and its outputs were
+# written to fixed production paths regardless of cache_dir. Two axes are now
+# parameterised: cache_dir (WHERE artifacts live) and out_prefix (WHAT results
+# are called), so a result file identifies its own run from its filename alone.
+# The historical window derives from the season argument. At the defaults every
+# value reproduces the constants exactly.
+
+R30_OUT_PREFIX_DEFAULT <- "s2_week15_"
+
+.r30_historical_seasons <- function(season,
+                                    window = HISTORICAL_WINDOW) {
+  season <- as.integer(season)
+  (season - as.integer(window)):(season - 1L)
+}
+.r30_output_rds_path <- function(cache_dir,
+                                 out_prefix = R30_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "team_volumes.rds"))
+}
+.r30_output_csv_path <- function(cache_dir,
+                                 out_prefix = R30_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "team_volumes.csv"))
+}
+
 R30_OUTPUT_RDS_PATH <- here::here("data", "season2_cache",
                               "s2_week15_team_volumes.rds")
 R30_OUTPUT_CSV_PATH <- here::here("data", "season2_cache",
@@ -2547,13 +2574,19 @@ utils::globalVariables(c(
 project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
                                   coaching_changes_path = COACHING_CHANGES_PATH,
                                   qb_changes_path = QB_CHANGES_PATH,
+                                  qb_committees_path = QB_COMMITTEES_PATH,
+                                  season = SEASON,
+                                  out_prefix = R30_OUT_PREFIX_DEFAULT,
                                   as_of_week = NULL,
                                   current_season_sos = NULL,
                                   save_output = TRUE) {
 
+  season <- as.integer(season)
+  historical_seasons <- .r30_historical_seasons(season)
+
   message(glue("\n{strrep('=', 70)}"))
-  message(glue("R/30: Projecting team volumes for season {SEASON}"))
-  message(glue("Historical window: {paste(HISTORICAL_SEASONS, collapse = ', ')}"))
+  message(glue("R/30: Projecting team volumes for season {season}"))
+  message(glue("Historical window: {paste(historical_seasons, collapse = ', ')}"))
   message(glue("Blend weights: team {TEAM_PATTERN_WEIGHT}, ",
                "coach {COACH_PATTERN_WEIGHT}"))
   if (is.null(as_of_week)) {
@@ -2568,14 +2601,14 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   message("\nSTEP 1/6: Aggregating team historical volume")
   team_history <- .compute_team_historical_volume(
     cache_dir = cache_dir,
-    seasons   = HISTORICAL_SEASONS
+    seasons   = historical_seasons
   )
 
   # STEP 2: Load coaching changes (auto-detect from schedules + CSV override)
-  message("\nSTEP 2/6: Loading 2026 coaching changes")
+  message(glue("\nSTEP 2/6: Loading {season} coaching changes"))
   coaching_changes <- .load_coaching_changes(
     path   = coaching_changes_path,
-    season = SEASON
+    season = season
   )
 
   # STEP 3: Coach prior pattern
@@ -2586,7 +2619,11 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   )
 
   # STEP 4: Blend team + coach
-  message("\nSTEP 4/6: Blending team and coach patterns (70/30)")
+  # Weights are read from the constants rather than restated in prose. The
+  # literal "(70/30)" was stale: TEAM_PATTERN_WEIGHT / COACH_PATTERN_WEIGHT
+  # were neutralized to 1.00 / 0.00 and this line kept printing the old split.
+  message(glue("\nSTEP 4/6: Blending team and coach patterns ",
+               "({TEAM_PATTERN_WEIGHT}/{COACH_PATTERN_WEIGHT})"))
   blended <- .blend_team_and_coach_pattern(
     team_history = team_history,
     coach_prior  = coach_prior
@@ -2601,10 +2638,16 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
 
   # STEP 5: QB quality adjustment
   message("\nSTEP 5/6: Computing QB quality index and applying adjustment")
+  # prior_season MUST be passed. Its default derives from the SEASON constant,
+  # so a run targeting any other season would ask for that season's own pbp as
+  # its "prior" -- reading the year being predicted, or (in a holdout namespace
+  # where the file is absent) failing open and returning a neutral QB quality
+  # for all 32 teams. Both outcomes are silent.
   qb_quality <- .compute_qb_quality_index(
     cache_dir       = cache_dir,
     qb_changes_path = qb_changes_path,
-    season          = SEASON
+    prior_season    = season - 1L,
+    season          = season
   )
   projected <- .apply_qb_quality_adjustment(
     blended    = blended,
@@ -2618,7 +2661,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   # .calibrate_sos_sensitivity for the design). Computed from live data every
   # run -- never hardcoded.
   sens <- .calibrate_sos_sensitivity(
-    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir
+    seasons = historical_seasons, cache_dir = cache_dir
   )
   if (sens$calibrated) {
     message(glue(
@@ -2637,15 +2680,15 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
 
   # Defensive quality per team over the prior-season window (shared lookup).
   def_team_season <- .compute_team_defense_allowed(
-    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir
+    seasons = historical_seasons, cache_dir = cache_dir
   )
   def_quality <- .compute_defense_quality_by_team(def_team_season)
 
   hist_sos <- .compute_historical_sos(
-    seasons = HISTORICAL_SEASONS, cache_dir = cache_dir,
+    seasons = historical_seasons, cache_dir = cache_dir,
     def_quality = def_quality
   )
-  fwd_sos <- .compute_forward_sos(season = SEASON, def_quality = def_quality)
+  fwd_sos <- .compute_forward_sos(season = season, def_quality = def_quality)
 
   message(glue("    SOS inputs: {nrow(def_quality)} defenses scored, ",
                "{nrow(hist_sos)} teams with historical SOS, ",
@@ -2663,7 +2706,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
   # Final output columns in documented order
   output <- projected %>%
     dplyr::mutate(
-      season     = SEASON,
+      season     = season,
       schema_tag = R30_SCHEMA_TAG
     ) %>%
     # Carry the resolved 2026 starter gsis into the output. .compute_qb_quality
@@ -2697,7 +2740,7 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
 
   # Committee QB rooms: fan flagged teams into one row per listed candidate,
   # each valued as a full-time starter (adds committee_group; NA elsewhere).
-  committee <- .load_qb_committees(season = SEASON)
+  committee <- .load_qb_committees(path = qb_committees_path, season = season)
   committee_scored <- .score_committee_candidates(
     committee      = committee,
     qb_stats_2025  = attr(qb_quality, "qb_stats_2025"),
@@ -2707,6 +2750,8 @@ project_team_volumes <- function(cache_dir = CACHE_DIR_DEFAULT,
 
   # Save outputs
   if (save_output) {
+    R30_OUTPUT_RDS_PATH <- .r30_output_rds_path(cache_dir, out_prefix)
+    R30_OUTPUT_CSV_PATH <- .r30_output_csv_path(cache_dir, out_prefix)
     dir.create(dirname(R30_OUTPUT_RDS_PATH), recursive = TRUE, showWarnings = FALSE)
     saveRDS(output, R30_OUTPUT_RDS_PATH)
     readr::write_csv(output, R30_OUTPUT_CSV_PATH)

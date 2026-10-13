@@ -13,26 +13,39 @@
 #   Outcome                 : actual PPR points in week N
 #   Positions               : QB, RB, WR -- analyzed separately
 #   Seasons                 : 2010-2025 (16 seasons, Season 2 cache)
-#   Inference               : Pearson r per predictor, Fisher r-to-z comparison,
+#   Inference               : Pearson r per predictor, Williams t-test for two
+#                             dependent correlations sharing the outcome
+#                             (unpaired Fisher z fallback only when the
+#                             Williams denominator is degenerate),
 #                             Cohen's q effect size, bootstrap 95% CIs,
 #                             Benjamini-Hochberg FDR correction across positions
 #
 # Inclusion criteria (player-week level):
 #   - Regular season weeks only (no postseason)
 #   - Player has >= 3 prior games played in that season (roll3 fully populated)
-#   - Position is QB, RB, or WR (inferred from nflreadr roster via R/05)
-#   - Meets minimum season-to-date touch threshold per position:
-#       QB : >= 30 dropbacks season-to-date
-#       RB : >= 15 rush attempts season-to-date
-#       WR : >= 10 targets season-to-date
-#   These are cumulative through week N-1, not single-week floors.
-#   Low thresholds intentional: multi-season dataset means we want part-time
-#   starters included. Season 1 thresholds were season-totals; these are weekly.
+#   - Roster position is QB, RB, or WR. Position comes from the season-keyed
+#     nflreadr roster joined on GSIS id (R/05 calculate_fantasy_points() with
+#     roster_data). TE and UNK (no roster match) are excluded by this filter.
+#   - No touch thresholds are applied. These three rules are the complete
+#     inclusion criteria as executed.
+#
+#   POSSIBLE FUTURE DESIGN CHANGE (not implemented): an earlier version of this
+#   header described season-to-date touch thresholds (QB >= 30 dropbacks,
+#   RB >= 15 rush attempts, WR >= 10 targets, cumulative through week N-1).
+#   No code ever applied them. Adding them would change the panel and must be
+#   treated as a design change with its own rerun.
 #
 # Scoring:
-#   Standard PPR via calculate_fantasy_points() with all defaults.
-#   use_tiered_ppr = TRUE (Season 1 default, preserved here).
-#   No extended scoring parameters (Week 3 extensions default to 0).
+#   calculate_fantasy_points() (R/05) defaults, except te_premium = FALSE:
+#     Passing   : 0.04/yd, 6/TD, -2/INT, additional -4 per pick-six
+#     Rushing   : 0.1/yd, 6/TD, +0.25 per rush attempt (rush_att_bonus)
+#     Receiving : 0.1/yd, 6/TD, tiered PPR (use_tiered_ppr = TRUE): per
+#                 reception 0 for 0-4 yds, 0.5 for 5-9, 1.0 for 10-19,
+#                 1.5 for 20-29, 2.0 for 30+. The flat ppr = 1 is NOT applied
+#                 while tiered PPR is on.
+#     Fumbles lost: -2. 2-pt conversions: +2 per credited player.
+#     TE premium: OFF (te_premium = FALSE set explicitly in build_ab_panel()).
+#   This is not standard PPR. No R/17 extended scoring parameters are used.
 #
 # NFL Context:
 #   "Recency bias" is a perennial debate in fantasy: should you trust a hot
@@ -70,7 +83,17 @@
 #   dplyr, tidyr, purrr, glue, here  -- core wrangling
 #   zoo                              -- via calculate_rolling_stats() in R/05
 #   pwr                              -- power analysis
+#   nflreadr                         -- load_rosters() for position (build_ab_panel default)
 #   boot                             -- bootstrap CIs on correlations
+#
+# RESULTS INVALIDATED [2026-09-17]: every panel, result, and power file produced
+# before 2026-09-17 is invalid and must be rerun. Two data defects in the
+# scoring layer: (1) player_name was a grouping key in R/05, so name spelling
+# variants split one player-game into two rows, inflating games_played_prior
+# and shifting roll3 windows; (2) with roster_data = NULL, position was the
+# last role table a player appeared in that game (QBs who ran labeled RB, TEs
+# labeled WR). This is in addition to the Williams-t fix noted in
+# run_ab_test_pipeline().
 #
 # Season 2 output prefix : s2_week4_
 # Schema tag             : s2_ab_v1
@@ -138,18 +161,20 @@ MIN_PRIOR_GAMES <- 3L
 #'   }
 #'
 #' @details
-#' Uses cummean() on lagged values. lag() shifts values down by 1 row within
-#' each group so that week N sees only weeks 1 through N-1. The cumulative
-#' mean then runs over all non-NA lagged values.
+#' lag() shifts values down by 1 row within each group so that week N sees
+#' only weeks 1 through N-1. The expanding mean then runs over all non-NA
+#' lagged values.
 #'
 #' By week 2: fantasy_pts_std = week 1 points (n = 1).
 #' By week 4: fantasy_pts_std = mean(weeks 1-3).
 #' This exactly matches the information a fantasy manager has before each week.
 #'
-#' Note: cummean() in dplyr propagates NA if the lagged value is NA (first row
-#' of each group). After the first row, cummean() uses only non-NA values
-#' implicitly because lag() returns NA once and then actual values. This is
-#' correct behavior.
+#' Implementation: dplyr::cummean() is NOT used, because it propagates the NA
+#' that lag() puts on the first row of every group through the whole group.
+#' Instead the function computes a manual expanding mean: a running cumsum of
+#' the lagged points with that first NA coalesced to 0, divided by a running
+#' count of non-NA lagged values. Where that count is 0 (the first game of a
+#' player-season-team stint) the result is NA.
 #'
 #' @seealso \code{\link{calculate_rolling_fantasy}} for fixed-window rolling
 #'   averages (the "treatment" predictor); \code{\link{build_ab_panel}} which
@@ -264,6 +289,9 @@ calculate_season_to_date_avg <- function(fantasy_data) {
 #' @param min_prior_games Integer. Minimum games played before week N for the
 #'   row to be eligible. Default: MIN_PRIOR_GAMES (3L). Ensures roll3 is
 #'   computed from a full 3-game window before the row enters the analysis.
+#' @param roster_loader Function taking one season and returning an nflreadr
+#'   roster (needs season, gsis_id, position). Default loads
+#'   nflreadr::load_rosters(seasons = s).
 #'
 #' @return Tibble with one row per eligible player-week. Columns:
 #'   \describe{
@@ -281,15 +309,17 @@ calculate_season_to_date_avg <- function(fantasy_data) {
 #'   Rows where either predictor is NA are dropped before return.
 #'
 #' @details
-#' Regular season filter: week <= 18 for 2021+, week <= 17 for 2020,
-#' week <= 16 for pre-2020. Postseason rows inflate game counts and introduce
-#' non-representative fantasy scoring patterns.
+#' Regular season filter: week <= 18 for 2021+, week <= 17 for all seasons
+#' before 2021 (16-game seasons spanned weeks 1-17 with one bye). Postseason
+#' rows inflate game counts and introduce non-representative fantasy scoring
+#' patterns.
 #'
-#' Position comes from calculate_fantasy_points() which joins to nflreadr
-#' roster when roster_data is supplied. Here we call without roster_data
-#' (default NULL) so position is inferred from play type. This matches the
-#' Season 1 pattern for single-season scoring and is consistent across all 16
-#' seasons without requiring per-season roster downloads.
+#' Position comes from the season-keyed nflreadr roster, joined on GSIS id
+#' inside calculate_fantasy_points(). Players with no roster match are labeled
+#' "UNK". The position filter keeps QB, RB, WR and therefore excludes TE and
+#' UNK; their pre-filter player-week counts are logged per season and stored
+#' in attr(panel, "position_counts_prefilter"). te_premium = FALSE is set
+#' explicitly so the roster join does not change any scoring.
 #'
 #' @seealso \code{\link{calculate_season_to_date_avg}},
 #'   \code{\link{calculate_rolling_fantasy}},
@@ -308,7 +338,8 @@ calculate_season_to_date_avg <- function(fantasy_data) {
 build_ab_panel <- function(seasons         = SEASONS_S2,
                            cache_dir       = here("data", "season2_cache"),
                            position_filter = c("QB", "RB", "WR"),
-                           min_prior_games = MIN_PRIOR_GAMES) {
+                           min_prior_games = MIN_PRIOR_GAMES,
+                           roster_loader   = function(s) nflreadr::load_rosters(seasons = s)) {
 
   # --- Input validation ---
   if (!is.numeric(seasons) || length(seasons) == 0) {
@@ -332,6 +363,7 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
   message(glue("{'='|>strrep(60)}\n"))
 
   season_panels <- vector("list", length(seasons))
+  prefilter_counts <- vector("list", length(seasons))
 
   for (i in seq_along(seasons)) {
     s <- seasons[i]
@@ -365,8 +397,25 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
     # all 16 seasons without per-season roster downloads).
     # calculate_fantasy_points() internally filters to pass/run play types,
     # excluding kneels, spikes, and special teams plays.
+    # Season-keyed roster for real positions [2026-09-17]. A roster failure
+    # stops the season rather than silently falling back to role inference.
+    roster_s <- tryCatch(
+      roster_loader(s),
+      error = function(e) {
+        warning(glue("Season {s}: roster load failed, skipping: {e$message}"),
+                call. = FALSE)
+        return(NULL)
+      }
+    )
+    if (is.null(roster_s)) { rm(pbp); gc(verbose = FALSE); next }
+
     fantasy_weekly <- tryCatch(
-      calculate_fantasy_points(pbp_data = pbp, season = s),
+      calculate_fantasy_points(
+        pbp_data    = pbp,
+        roster_data = roster_s,
+        season      = s,
+        te_premium  = FALSE   # roster supplies TE; keep TE bonus off
+      ),
       error = function(e) {
         warning(glue(
           "Season {s}: calculate_fantasy_points() failed: {e$message}"
@@ -381,6 +430,13 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
       rm(pbp); gc(verbose = FALSE)
       next
     }
+
+    # Log TE / UNK player-weeks before the position filter removes them
+    prefilter_counts[[i]] <- fantasy_weekly %>% count(season, position)
+    message(glue(
+      "  Season {s}: TE = {sum(fantasy_weekly$position == 'TE')}, ",
+      "UNK = {sum(fantasy_weekly$position == 'UNK')} player-weeks before filter"
+    ))
 
     # Filter to target positions before rolling calculations to reduce
     # memory pressure on large intermediate objects
@@ -466,11 +522,12 @@ build_ab_panel <- function(seasons         = SEASONS_S2,
     season_panels[[i]] <- panel_s
 
     # Free memory before next season -- critical for 16-season loop
-    rm(pbp, fantasy_weekly, fantasy_rolling, panel_s)
+    rm(pbp, roster_s, fantasy_weekly, fantasy_rolling, panel_s)
     gc(verbose = FALSE)
   }
 
   panel <- bind_rows(season_panels)
+  attr(panel, "position_counts_prefilter") <- bind_rows(prefilter_counts)
 
   if (nrow(panel) == 0) {
     stop(paste(

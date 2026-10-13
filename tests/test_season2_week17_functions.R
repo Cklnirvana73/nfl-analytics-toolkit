@@ -5,7 +5,7 @@
 #
 # Tests:
 #   Section A: .curve_value_at_age()            --  6 tests
-#   Section B: .project_aging_multiplier()      --  8 tests
+#   Section B: .project_aging_delta()           --  8 tests
 #   Section C: .scale_prospect_to_vorp_units()  --  5 tests
 #   Section D: .assign_tiers_and_ranks()        --  7 tests
 #   Section E: compute_player_trade_values()    --  8 tests
@@ -168,69 +168,75 @@ test_that("A6: falls back to fitted_quad when fitted_loess is NA at requested ag
 
 
 # ==============================================================================
-# SECTION B: .project_aging_multiplier()
+# SECTION B: .project_aging_delta()
 # ==============================================================================
+# .project_aging_delta(player_age, position, curves, n_seasons) returns the
+# mean PPG delta over the projection horizon (curve value at age+s minus value
+# at current age, averaged over s = 1..n_seasons). It replaced the former
+# .project_aging_multiplier(); floor/ceiling clipping now happens where the
+# delta is consumed (compute_player_trade_values), covered by Section E.
 
-test_that("B1: returns 1.0 when player_age is NA", {
+test_that("B1: returns 0 when player_age is NA", {
   curves <- make_curves_fixture()
-  result <- .project_aging_multiplier(NA, "WR", curves, 1L, 10.0, FALSE)
+  result <- .project_aging_delta(NA, "WR", curves, 1L)
+  expect_equal(result, 0)
+})
+
+test_that("B2: returns 0 when position is not in curves (e.g. K)", {
+  curves <- make_curves_fixture()
+  result <- .project_aging_delta(25L, "K", curves, 1L)
+  expect_equal(result, 0)
+})
+
+test_that("B3: returns 0 when the position's curve_data is NULL", {
+  curves <- make_curves_fixture()
+  curves$WR$curve_data <- NULL
+  result <- .project_aging_delta(25L, "WR", curves, 1L)
+  expect_equal(result, 0)
+})
+
+test_that("B4: single-season (redraft) delta is the one-year curve step", {
+  curves <- make_curves_fixture()
+  # Age 23 -> 24 on the fixture curve: 0 -> 1. Delta = 1.
+  result <- .project_aging_delta(23L, "WR", curves, 1L)
   expect_equal(result, 1.0)
 })
 
-test_that("B2: returns 1.0 when posterior_mu is 0", {
+test_that("B5: positive mean delta for young player on climbing dynasty arc", {
   curves <- make_curves_fixture()
-  result <- .project_aging_multiplier(25L, "WR", curves, 1L, 0.0, FALSE)
+  # Age 23, 3 seasons. Curve: 23->0, 24->1, 25->2, 26->1.
+  # Deltas: 1, 2, 1. Mean = 4/3.
+  result <- .project_aging_delta(23L, "WR", curves, 3L)
+  expect_equal(result, 4 / 3)
+  expect_gt(result, 0)
+})
+
+test_that("B6: negative mean delta for old player on declining arc", {
+  curves <- make_curves_fixture()
+  # Age 31, 3 seasons. Curve: 31->-4, 32->-5, 33->-6, 34->-7.
+  # Deltas: -1, -2, -3. Mean = -2.
+  result <- .project_aging_delta(31L, "RB", curves, 3L)
+  expect_equal(result, -2.0)
+})
+
+test_that("B7: ages beyond the fitted range clamp to the terminal curve value", {
+  curves <- make_curves_fixture()
+  # Age 33, 3 seasons. Curve: 33->-6, 34->-7, 35->-8; age 36 clamps to -8.
+  # Deltas: -1, -2, -2. Mean = -5/3.
+  result <- .project_aging_delta(33L, "RB", curves, 3L)
+  expect_equal(result, -5 / 3)
+})
+
+test_that("B8: NA curve values inside the horizon use the nearest-age fallback", {
+  curves <- make_curves_fixture()
+  # Knock out age 24 in both fits. .curve_value_at_age() falls back to the
+  # nearest age with valid loess data (23, on the which.min tie), value 0.
+  curves$WR$curve_data$fitted_loess[curves$WR$curve_data$age_at_season_start == 24L] <- NA_real_
+  curves$WR$curve_data$fitted_quad [curves$WR$curve_data$age_at_season_start == 24L] <- NA_real_
+  # Age 23, 3 seasons. Deltas: 24->fallback 23 (=0), 25->2 (=2), 26->1 (=1).
+  # Mean = 1.
+  result <- .project_aging_delta(23L, "WR", curves, 3L)
   expect_equal(result, 1.0)
-})
-
-test_that("B3: returns 1.0 when posterior_mu is NA", {
-  curves <- make_curves_fixture()
-  result <- .project_aging_multiplier(25L, "WR", curves, 1L, NA_real_, FALSE)
-  expect_equal(result, 1.0)
-})
-
-test_that("B4: returns 1.0 when position is not in curves (e.g. K)", {
-  curves <- make_curves_fixture()
-  result <- .project_aging_multiplier(25L, "K", curves, 1L, 10.0, FALSE)
-  expect_equal(result, 1.0)
-})
-
-test_that("B5: returns multiplier > 1 for young player on climbing dynasty arc", {
-  curves <- make_curves_fixture()
-  # Age 23, dynasty (3 seasons). Curve: 23->0, 24->1, 25->2, 26->1.
-  # Deltas: 1, 2, 1. Mean = 1.333. Mult = 1 + 1.333/10 = 1.133.
-  result <- .project_aging_multiplier(23L, "WR", curves, 3L, 10.0, TRUE)
-  expect_gt(result, 1.0)
-  expect_lte(result, AGING_MULTIPLIER_DYNASTY_CEILING)
-})
-
-test_that("B6: returns multiplier < 1 for old player on declining arc", {
-  curves <- make_curves_fixture()
-  # Age 31, r32_posterior_mu = 10. Curve: 31->-4, 32->-5, 33->-6.
-  # Dynasty deltas: -1, -2, -3. Mean = -2. Mult = 1 + (-2)/10 = 0.8.
-  result <- .project_aging_multiplier(31L, "RB", curves, 3L, 10.0, TRUE)
-  expect_lt(result, 1.0)
-  expect_gte(result, AGING_MULTIPLIER_FLOOR)
-})
-
-test_that("B7: clips to AGING_MULTIPLIER_FLOOR for extreme decline", {
-  curves <- make_curves_fixture()
-  # Age 33, tiny posterior_mu drives mult far below floor.
-  # Curve: 33->-6, 34->-7, 35->-8. Deltas: -1, -2, -2 (35 clamped twice).
-  # Mean = -1.667. Mult = 1 + (-1.667)/0.5 = -2.33 -> clamped to 0.40.
-  result <- .project_aging_multiplier(33L, "RB", curves, 3L, 0.5, TRUE)
-  expect_equal(result, AGING_MULTIPLIER_FLOOR)
-})
-
-test_that("B8: clips to respective ceiling for extreme youth upside", {
-  curves <- make_curves_fixture()
-  # Same age 23 youth curve but tiny posterior_mu makes mult very large.
-  # Redraft: 1 season, delta = 1. Mult = 1 + 1/0.5 = 3.0 -> capped at 1.05.
-  redraft_result <- .project_aging_multiplier(23L, "WR", curves, 1L, 0.5, FALSE)
-  expect_equal(redraft_result, AGING_MULTIPLIER_REDRAFT_CEILING)
-  # Dynasty: mean_delta = 1.333. Mult = 1 + 1.333/0.5 = 3.67 -> capped at 1.35.
-  dynasty_result <- .project_aging_multiplier(23L, "WR", curves, 3L, 0.5, TRUE)
-  expect_equal(dynasty_result, AGING_MULTIPLIER_DYNASTY_CEILING)
 })
 
 
@@ -572,7 +578,7 @@ cat("TEST SUITE: test_season2_week17_functions.R\n")
 cat("================================================================\n")
 cat("Functions under test:\n")
 cat("  .curve_value_at_age()            Section A  6 tests\n")
-cat("  .project_aging_multiplier()      Section B  8 tests\n")
+cat("  .project_aging_delta()           Section B  8 tests\n")
 cat("  .scale_prospect_to_vorp_units()  Section C  5 tests\n")
 cat("  .assign_tiers_and_ranks()        Section D  7 tests\n")
 cat("  compute_player_trade_values()    Section E  8 tests\n")

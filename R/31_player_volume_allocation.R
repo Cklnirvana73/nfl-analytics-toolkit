@@ -261,7 +261,14 @@ library(glue)
 library(nflreadr)
 
 source(here::here("R", "30_team_volume_projections.R"))
-source(here::here("R", "19_sleeper_api.R"))   # for get_all_sleeper_players()
+source(here::here("R", "19_sleeper_api.R"))
+
+# R/53 supplies pidr_build_authority() / pidr_resolve(). Guarded so a caller
+# that already sourced it is a no-op, and loud if it cannot load: the
+# draft-capital join below cannot function without it.
+if (!exists("pidr_resolve")) {
+  source(here::here("R", "53_player_identity.R"))
+}   # for get_all_sleeper_players()
 
 # compute_prior_weight() (R/29) normally arrives via R/30's guarded source
 # chain above. This guard protects against future refactors of R/30: the
@@ -405,6 +412,66 @@ ROOKIE_CAPITAL_MULTIPLIERS <- c(
   "U"  = 0.45    # undrafted free agent
 )
 
+# ------------------------------------------------------------------------------
+# ROOKIE CAPITAL: FIRST LIVE RUN  [2026-08-10]
+# ------------------------------------------------------------------------------
+# STATUS BEFORE TODAY. This ladder has never produced a number. The join that
+# feeds it matched 0 of 230 draft picks on every run, because R/31 joined the
+# draft table's placeholder gsis_id ("LOV121782") against the depth chart's
+# real one ("00-0041027"). Two nflreadr tables, ids of different vintages,
+# nothing re-linking them. The console reported it as "Rookies in pool: 0",
+# which reads like a clean line and was a total join failure.
+#
+# .correct_rookie_depth_ranks() shares that join and has likewise never fired;
+# "no eligible players (all have Sleeper depth data)" was the same failure
+# wearing a different message.
+#
+# WHAT CHANGED. The join now resolves both sides through R/53 pidr_resolve()
+# before matching. Measured on 2026-08-10: 73 of 74 placeholder-id players
+# recover a real id, and the ambiguity exclusion costs none of them (2 of 2,930
+# authority keys were ambiguous, neither a rookie).
+#
+# THESE MAGNITUDES ARE NOT MEASURED. 1.15 down to 0.45, evenly spaced by 0.10
+# with a 0.45 UDFA floor, is a shape someone chose. Shipped live rather than
+# neutralized because draft capital predicting opportunity is not a contested
+# claim and the ORDERING is almost certainly right, while the SPACING is a
+# guess in both directions. Christian's call, recorded as such.
+#
+# THE MEASUREMENT IS PARKED, NOT ABANDONED. The multiplier has a direct
+# estimator and no new data is required:
+#
+#   for season s, position p, draft round r:
+#     multiplier_hat = realized rookie share / TARGET_SHARE_PRIORS[depth_pos]
+#
+# R/16 supplies realized shares, load_draft_picks() supplies round, and
+# historical seasons carry real gsis ids so the identity defect above is a
+# current-season problem only. Shrink by cell size; rounds 6, 7 and UDFA will
+# be thin.
+#
+# ROOKIE_CAPITAL_SCALE exists so that fit is a one-line change rather than a
+# rewrite. The applied multiplier is
+#
+#     1 + SCALE * (ladder - 1)
+#
+# so SCALE = 1.00 is the ladder exactly as written, SCALE = 0.00 neutralizes it
+# with the machinery intact (same pattern as INJURY_EFFECT_FRACTION and
+# BLEND_SIGMA_VOL_MODE), and any intermediate value compresses it toward
+# neutral without changing the ordering.
+ROOKIE_CAPITAL_SCALE <- 1.00
+
+if (!is.finite(ROOKIE_CAPITAL_SCALE) || ROOKIE_CAPITAL_SCALE < 0) {
+  stop("ROOKIE_CAPITAL_SCALE must be a non-negative number. Got: ",
+       ROOKIE_CAPITAL_SCALE, call. = FALSE)
+}
+
+#' Apply ROOKIE_CAPITAL_SCALE to a raw ladder multiplier
+#' @param m Numeric vector of ladder values.
+#' @return Numeric vector, compressed toward 1.0 by the scale.
+#' @keywords internal
+.r31_scale_capital <- function(m) {
+  1 + ROOKIE_CAPITAL_SCALE * (m - 1)
+}
+
 # Position-specific max depth rank to keep (deeper players get folded into max)
 MAX_DEPTH_RANK <- c("QB" = 3L, "RB" = 4L, "WR" = 5L, "TE" = 3L)
 
@@ -471,7 +538,35 @@ OUTPUT_CSV_PATH_ALLOC <- here::here("data", "season2_cache",
 PANEL_CACHE_PATH_ALLOC <- here::here("data", "season2_cache",
                                       "s2_week15_player_season_panel_cache.rds")
 
-SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v3_5"
+# ------------------------------------------------------------------------------
+# NAMESPACE, PREFIX AND SEASON RESOLVERS
+# ------------------------------------------------------------------------------
+# The path constants above are absolute and ignore any cache namespace, and the
+# season windows below were derived from the SEASON_ALLOC constant rather than
+# from the `season` argument. allocate_player_volumes(season = X) for any X
+# other than SEASON_ALLOC therefore used the wrong carryover season, the wrong
+# QB rush window, and a panel containing seasons at or after X. A live
+# correctness bug for in-season and holdout use alike.
+R31_OUT_PREFIX_DEFAULT <- "s2_week15_"
+
+.r31_panel_cache_path <- function(cache_dir) {
+  file.path(cache_dir, "s2_week15_player_season_panel_cache.rds")
+}
+.r31_output_rds_path <- function(cache_dir,
+                                 out_prefix = R31_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "player_volume_allocation.rds"))
+}
+.r31_output_csv_path <- function(cache_dir,
+                                 out_prefix = R31_OUT_PREFIX_DEFAULT) {
+  file.path(cache_dir, paste0(out_prefix, "player_volume_allocation.csv"))
+}
+.r31_carryover_prior_season <- function(season) as.integer(season) - 1L
+.r31_qb_rush_rate_seasons <- function(season) {
+  season <- as.integer(season)
+  (season - 3L):(season - 1L)
+}
+
+SCHEMA_TAG_ALLOC <- "s2_w15_player_alloc_v3_6"   # v3_6: + season col; rookie capital join live [2026-08-10]
 
 # QB rushing volume window (v3_4). QB expected carries derive from a pooled,
 # game-weighted per-QB rush rate over these seasons (a player trait that
@@ -529,6 +624,7 @@ utils::globalVariables(c(
   "rookie_year", "round", "pos", "side", "season", "week",
   "depth_pos_clean", "depth_rank_raw", "key",
   "cfb_player_name", "position_score", "position_mean", "position_sd",
+  "season", "gsis_raw", "gsis_resolved", "id_source",
   "team_target_sum", "team_rush_sum", "team_target_rescale",
   "team_rush_rescale", "schema_tag",
   "observed_target_share", "observed_rush_share", "share_blend_weight",
@@ -663,6 +759,21 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
     dplyr::filter(.data$team %in% ACTIVE_TEAMS_2026)
 
   # ----- Pass 1: direct gsis_id match -----
+  # RANK PRECEDENCE: nflreadr's depth ordering wins wherever it exists.
+  #
+  # Sleeper's depth_chart_order is largely empty in preseason and the previous
+  # implementation coalesced the blanks to 999, then OVERWROTE nflreadr's rank
+  # with it and re-ranked. That did not fill gaps in the depth chart, it
+  # replaced a real chart with a mostly-absent one. Observed damage on the 2026
+  # board: Miami's WR1 resolved to a player listed 7th by nflreadr, and the
+  # Jets, Carolina and Jacksonville were similarly scrambled. The comment
+  # further down this function already described Sleeper's field as
+  # "often-incomplete pre-season" while using it as the primary source.
+  #
+  # Sleeper is authoritative for the two things it is actually good at: CURRENT
+  # TEAM, and the EXISTENCE of players nflreadr has not listed yet (rookies,
+  # new signings). It is not authoritative for ordering. The Sleeper rank is
+  # therefore carried as its own column and used only where nflreadr has none.
   sleeper_with_gsis <- sleeper_filtered %>%
     dplyr::filter(!is.na(.data$nfl_gsis_id)) %>%
     dplyr::transmute(
@@ -670,9 +781,7 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
       player_name       = .data$player_name,
       team              = .data$team,
       position          = .data$position,
-      depth_rank_raw    = as.integer(dplyr::coalesce(
-        .data$depth_chart_order, 999L
-      )),
+      sleeper_rank      = as.integer(.data$depth_chart_order),
       depth_was_missing = is.na(.data$depth_chart_order)
     ) %>%
     dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
@@ -706,9 +815,7 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
       player_name       = .data$player_name,
       team              = .data$team,
       position          = .data$position,
-      depth_rank_raw    = as.integer(dplyr::coalesce(
-        .data$depth_chart_order, 999L
-      )),
+      sleeper_rank      = as.integer(.data$depth_chart_order),
       depth_was_missing = is.na(.data$depth_chart_order)
     ) %>%
     dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
@@ -721,12 +828,37 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
   # from actual depth chart data, not Sleeper's often-incomplete pre-season
   # depth_chart_order field).
   sleeper_gsis <- sleeper_rows$nfl_gsis_id
+
+  # Players nflreadr lists and Sleeper does not: keep them exactly as-is.
   nflreadr_only <- nflreadr_dc %>%
     dplyr::filter(!.data$nfl_gsis_id %in% sleeper_gsis) %>%
     dplyr::mutate(depth_was_missing = FALSE)
 
-  # Combine and re-rank within team + position
-  unified <- dplyr::bind_rows(nflreadr_only, sleeper_rows) %>%
+  # Players in both: take Sleeper's TEAM (current) and nflreadr's RANK (real).
+  # Sleeper's rank is used only where nflreadr has none.
+  nflreadr_ranks <- nflreadr_dc %>%
+    dplyr::select(nfl_gsis_id, nflreadr_rank = depth_rank_raw)
+
+  sleeper_resolved <- sleeper_rows %>%
+    dplyr::left_join(nflreadr_ranks, by = "nfl_gsis_id") %>%
+    dplyr::mutate(
+      # Rank source, in order: nflreadr, then Sleeper, then unranked. Unranked
+      # players sort last but keep a finite value so they cannot displace a
+      # ranked player, which is what coalescing to 999 BEFORE the join used to
+      # do to everyone at once.
+      depth_rank_raw    = dplyr::coalesce(.data$nflreadr_rank,
+                                          .data$sleeper_rank,
+                                          999L),
+      # TRUE only when NEITHER source ranked the player. Consumed downstream by
+      # the rookie depth-rank correction, which is exactly the population it
+      # should be looking at.
+      depth_was_missing = is.na(.data$nflreadr_rank) & is.na(.data$sleeper_rank)
+    ) %>%
+    dplyr::select(-nflreadr_rank, -sleeper_rank)
+
+  # Combine and re-rank within team + position. The re-rank now compacts an
+  # ordering that is already correct rather than manufacturing a new one.
+  unified <- dplyr::bind_rows(nflreadr_only, sleeper_resolved) %>%
     dplyr::group_by(.data$team, .data$position) %>%
     dplyr::arrange(.data$depth_rank_raw, .data$player_name,
                     .by_group = TRUE) %>%
@@ -761,6 +893,134 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 
 
 # ------------------------------------------------------------------------------
+# .dc_resolve_cols / .dc_snapshot_complete
+# ------------------------------------------------------------------------------
+#
+# SNAPSHOT COMPLETENESS GATE  [2026-08-10]
+#
+# WHAT WENT WRONG. Snapshot selection was max(pre_dt): the newest snapshot
+# dated before the season, with no check that it contained anything. On
+# 2026-08-10 the feed's newest snapshot carried 3,205 rows and, for Buffalo,
+# three quarterbacks and five running backs and ZERO receivers or tight ends.
+# Keon Coleman, Dalton Kincaid and Khalil Shakir appear in 142 of the 143
+# archived snapshots and are absent from exactly the one that was selected.
+# Frank Gore, retired since 2021, appears in all 143 and survived.
+#
+# CONSEQUENCE. Those three reached the board with blend_weight_effective = 0,
+# so they were projected by R/29 with no volume check at all. Worse, R/31
+# rescales team target shares to sum to one, so Buffalo's entire receiving
+# volume was distributed among the players who happened to remain in the
+# truncated file. 52 non-rookie board players were in this state.
+#
+# WHY IT SURVIVED. max(dt) is selection by RECENCY. Recency is a proxy for
+# quality and this feed is published incrementally, so the newest snapshot is
+# the one most likely to be half-written. The fix is to select on CONTENT:
+# walk backward through the candidates and take the first that is actually
+# complete.
+#
+# WHAT "COMPLETE" MEANS HERE. Two independent criteria, both derived from the
+# observed failure rather than chosen for comfort.
+#
+#   1. EVERY team carries EVERY skill position. The 2026-08-10 snapshot had
+#      Buffalo with zero receivers and zero tight ends, which put WR and TE on
+#      31 of 32 teams. The first version of this gate used 28 and passed it.
+#      Any threshold below 32 cannot catch a one-team truncation, and a
+#      one-team truncation is the entire defect. Every NFL club lists QBs, RBs,
+#      WRs and TEs, so 32 is the only defensible value.
+#
+#   2. SIZE against the archive. Presence alone would still pass a team left
+#      with a single receiver. A snapshot carrying far fewer rows than its
+#      neighbours is partially written whatever its team coverage looks like,
+#      so the caller also supplies the median row count across candidates and
+#      the snapshot must reach a fraction of it.
+#
+# Criterion 2 is skipped when no reference size is supplied, so the function
+# remains usable on a single snapshot.
+#
+# @keywords internal
+.dc_resolve_cols <- function(d) {
+  pos_col <- dplyr::case_when(
+    "pos_abb"              %in% names(d) ~ "pos_abb",
+    "depth_position"       %in% names(d) ~ "depth_position",
+    "position"             %in% names(d) ~ "position",
+    "depth_chart_position" %in% names(d) ~ "depth_chart_position",
+    "pos_name"             %in% names(d) ~ "pos_name",
+    TRUE                                  ~ NA_character_
+  )[1]
+  team_col <- dplyr::case_when(
+    "team"      %in% names(d) ~ "team",
+    "club_code" %in% names(d) ~ "club_code",
+    TRUE                       ~ NA_character_
+  )[1]
+  list(pos = pos_col, team = team_col)
+}
+
+#' Is one depth chart snapshot complete enough to project from?
+#'
+#' @param d Tibble. One snapshot (already filtered to a single dt).
+#' @param min_teams Integer. Teams that must appear at all. 32.
+#' @param min_teams_per_pos Integer. Teams that must carry EACH skill position.
+#'   32, because the failure this gate exists to catch is one team short.
+#' @param ref_rows Numeric or NA. Median row count across candidate snapshots.
+#'   When supplied, the snapshot must reach min_row_frac of it.
+#' @param min_row_frac Numeric. Fraction of ref_rows required.
+#' @return list(ok, reason, n_teams, per_pos, n_rows)
+#' @keywords internal
+.dc_snapshot_complete <- function(d,
+                                   min_teams         = 32L,
+                                   min_teams_per_pos = 32L,
+                                   pos_required      = c("QB", "RB", "WR", "TE"),
+                                   ref_rows          = NA_real_,
+                                   min_row_frac      = 0.90) {
+
+  cols <- .dc_resolve_cols(d)
+  if (is.na(cols$pos) || is.na(cols$team)) {
+    return(list(ok = FALSE,
+                reason = "no position or team column",
+                n_teams = NA_integer_, per_pos = NULL, n_rows = nrow(d)))
+  }
+
+  dd <- d %>%
+    dplyr::filter(!is.na(.data[[cols$team]]), !is.na(.data[[cols$pos]]))
+
+  n_teams <- dplyr::n_distinct(dd[[cols$team]])
+
+  per_pos <- vapply(pos_required, function(p) {
+    dplyr::n_distinct(dd[[cols$team]][dd[[cols$pos]] == p])
+  }, integer(1))
+
+  out <- function(ok, reason) {
+    list(ok = ok, reason = reason, n_teams = n_teams,
+         per_pos = per_pos, n_rows = nrow(d))
+  }
+
+  if (n_teams < min_teams) {
+    return(out(FALSE, glue("only {n_teams} of {min_teams} team(s)")))
+  }
+
+  short <- names(per_pos)[per_pos < min_teams_per_pos]
+  if (length(short) > 0L) {
+    return(out(FALSE, glue(
+      "{paste(sprintf('%s on %d/%d teams', short, per_pos[short], min_teams_per_pos), collapse = '; ')}"
+    )))
+  }
+
+  # Size criterion. A snapshot can list every position on every team and still
+  # be partially written; this catches that independently of coverage.
+  if (is.finite(ref_rows) && ref_rows > 0) {
+    if (nrow(d) < min_row_frac * ref_rows) {
+      return(out(FALSE, glue(
+        "{nrow(d)} rows vs archive median {round(ref_rows)} ",
+        "(under {round(100 * min_row_frac)} percent)"
+      )))
+    }
+  }
+
+  out(TRUE, "complete")
+}
+
+
+# ------------------------------------------------------------------------------
 # .load_2026_depth_charts
 # ------------------------------------------------------------------------------
 
@@ -774,7 +1034,8 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 #' @return Tibble: gsis_id, full_name, team, position, depth_position,
 #'   depth_rank.
 #' @keywords internal
-.load_2026_depth_charts <- function(season = SEASON_ALLOC) {
+.load_2026_depth_charts <- function(season = SEASON_ALLOC,
+                                    use_sleeper_overrides = TRUE) {
 
   message(glue("  Loading depth charts for season {season}"))
 
@@ -799,6 +1060,133 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
     }
   }
 
+  # ---------------------------------------------------------------------------
+  # COLLAPSE TO THE MOST RECENT SNAPSHOT
+  # ---------------------------------------------------------------------------
+  # nflreadr's depth chart feed is a DAILY ARCHIVE keyed by `dt`, not a single
+  # current table. For 2026 it carried 141 distinct dt values spanning
+  # 2026-03-22 to 2026-08-08: 413,654 rows for 3,072 players, ~141 each.
+  #
+  # There is no `week` column, so the "no week column, already current" branch
+  # below was accepted at face value and the whole archive fell through to the
+  # slice_min() further down. That takes the LOWEST rank a player held on ANY
+  # DAY SINCE MARCH, not their rank today. A receiver briefly listed first in
+  # April outranks the man listed first in August.
+  #
+  # Observed damage on the 2026 board: Miami's WR1 resolved to a player listed
+  # 7th at the latest snapshot; Washington's WR1 resolved to its WR3; the Jets
+  # and Carolina were similarly inverted. At max(dt) the same feed is clean:
+  # 1.1 rows per player, ranks 1..N, no duplicates.
+  #
+  # `dt` is an ISO-8601 UTC character string, so a lexical comparison is a
+  # chronological one. Guarded for feeds that lack the column.
+  # PRESEASON SELECTION, not "most recent".
+  #
+  # AND NOT "newest preseason" either, as of 2026-08-10. Selection now walks
+  # the preseason candidates newest-first and takes the first that passes
+  # .dc_snapshot_complete(). See that function for the Buffalo evidence.
+  #
+  # This function supplies the depth chart a PRESEASON projection is entitled
+  # to: the chart as it stood immediately before season `season` kicked off.
+  # Taking max(dt) answers a different question ("what does it look like now")
+  # and is correct only by coincidence, when the target season happens to be
+  # the upcoming one.
+  #
+  # Measured damage: for target 2025 the archive spans 2025-08-03 to
+  # 2026-03-14, and max(dt) selected 2026-03-14 -- four months AFTER the season
+  # being projected had finished, and after an offseason of roster churn that
+  # had not happened yet in September 2025. 28 snapshots predate 2025-09-01;
+  # the last of them (2025-08-31) carries 32 teams and 1,938 players.
+  #
+  # For target 2026 today, max(dt) and the last preseason snapshot are the same
+  # file, so production output is unchanged by this fix. That stops being true
+  # the moment the 2026 season starts, at which point max(dt) would begin
+  # pulling in-season charts into a preseason projection.
+  if ("dt" %in% names(dc) && any(!is.na(dc[["dt"]]))) {
+    n_snap      <- dplyr::n_distinct(dc[["dt"]])
+    rows_before <- nrow(dc)
+    # Season start cutoff. NFL week 1 is the Thursday after Labor Day; Sep 1 of
+    # the season year is a safe boundary and needs no schedule lookup.
+    season_cutoff <- paste0(as.integer(season), "-09-01")
+    pre_dt <- dc[["dt"]][substr(dc[["dt"]], 1, 10) < season_cutoff]
+    pre_dt <- pre_dt[!is.na(pre_dt)]
+
+    if (length(pre_dt) > 0) {
+      # SELECT ON CONTENT, NOT ON RECENCY. [2026-08-10]
+      #
+      # This used to be target_dt <- max(pre_dt). See the gate evidence at
+      # .dc_snapshot_complete() for what that cost. The feed is published
+      # incrementally, so the newest snapshot is the one most likely to be
+      # half-written, which makes recency an actively bad proxy here.
+      #
+      # Candidates are walked newest-first and the first COMPLETE one wins.
+      # Every rejection is printed with its reason: a silent fallback would
+      # reproduce the original failure in a new place.
+      cand <- sort(unique(pre_dt), decreasing = TRUE)
+      target_dt <- NA_character_
+      n_rejected <- 0L
+
+      # Reference size for the gate's second criterion: how big a snapshot in
+      # this archive normally is. Median over candidates, so a handful of
+      # truncated files cannot drag the reference down to meet themselves.
+      ref_rows <- stats::median(
+        as.numeric(table(dc[["dt"]][dc[["dt"]] %in% cand])),
+        na.rm = TRUE
+      )
+      message(glue("    Archive median snapshot size: {round(ref_rows)} rows"))
+
+      for (cd in cand) {
+        chk <- .dc_snapshot_complete(dc %>% dplyr::filter(.data$dt == cd),
+                                     ref_rows = ref_rows)
+        if (isTRUE(chk$ok)) {
+          target_dt <- cd
+          break
+        }
+        n_rejected <- n_rejected + 1L
+        message(glue("    REJECTED snapshot {cd}: {chk$reason}"))
+        # Bound the walk. If a long run of snapshots is truncated the feed
+        # itself is broken and that is worth failing on, not papering over.
+        if (n_rejected >= 10L) break
+      }
+
+      if (is.na(target_dt)) {
+        stop(glue(
+          ".load_2026_depth_charts(): no complete preseason depth chart ",
+          "snapshot found in the {n_rejected} most recent candidate(s) before ",
+          "{season_cutoff}. The feed is either truncated or its schema has ",
+          "changed. Projecting from an incomplete chart silently reallocates ",
+          "a team's entire volume among whichever players survived the ",
+          "truncation, so this stops rather than continuing."
+        ), call. = FALSE)
+      }
+
+      dc <- dc %>% dplyr::filter(.data$dt == target_dt)
+      gate <- .dc_snapshot_complete(dc, ref_rows = ref_rows)
+      message(glue("    Snapshot archive: {n_snap} dt value(s); keeping last ",
+                   "COMPLETE preseason snapshot {target_dt} ",
+                   "({rows_before} -> {nrow(dc)} rows)"))
+      message(glue("      gate: {gate$n_teams} teams | ",
+                   "{paste(sprintf('%s %d', names(gate$per_pos), gate$per_pos), collapse = ' | ')}",
+                   " teams per position"))
+      if (n_rejected > 0L) {
+        message(glue("      {n_rejected} more recent snapshot(s) rejected as ",
+                     "incomplete, see above"))
+      }
+    } else {
+      # No snapshot predates the season. Fall back to the EARLIEST available,
+      # which is the closest thing to a preseason chart the feed contains, and
+      # say so loudly rather than silently using a mid-season chart.
+      target_dt <- min(dc[["dt"]], na.rm = TRUE)
+      dc <- dc %>% dplyr::filter(.data$dt == target_dt)
+      warning(glue("R/31: no depth chart snapshot predates {season_cutoff}. ",
+                   "Falling back to earliest available ({target_dt}). This ",
+                   "chart is NOT a preseason information set."), call. = FALSE)
+      message(glue("    Snapshot archive: {n_snap} dt value(s); NO preseason ",
+                   "snapshot, using earliest {target_dt} ",
+                   "({rows_before} -> {nrow(dc)} rows)"))
+    }
+  }
+
   # Identify the latest week available.
   # Pre-season depth charts may not have a week column at all -- in that
   # case the full table is already the most recent snapshot.
@@ -806,8 +1194,26 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
                     any(!is.na(dc[["week"]]))
 
   if (has_week_col) {
-    latest_week <- max(dc[["week"]], na.rm = TRUE)
-    message(glue("    Filtering to week {latest_week}"))
+    # PRESEASON SELECTION, not "most recent". Same principle as the dt branch.
+    #
+    # max(week) is the LAST chart of the season: week 21 or 22, the conference
+    # championship or Super Bowl, when 30 teams have been eliminated and have
+    # no rows at all. Observed on the 2018-2024 holdouts: 24 to 30 players
+    # across 2 teams, versus ~1,650 players across 32 teams at week 1. R/31
+    # then allocated volume for those two teams only and every other player
+    # fell through to R/29 unblended, which silently disabled most of the
+    # pipeline for six of seven backtest seasons.
+    #
+    # Week 1 of the REGULAR season is the preseason chart. game_type is used
+    # rather than a week-number cutoff because the regular season is 17 weeks
+    # through 2020 and 18 from 2021, so week 19 is postseason in one era and
+    # regular season in the other.
+    if ("game_type" %in% names(dc) && any(dc[["game_type"]] == "REG", na.rm = TRUE)) {
+      dc <- dc %>% dplyr::filter(.data$game_type == "REG")
+    }
+    latest_week <- min(dc[["week"]], na.rm = TRUE)
+    message(glue("    Filtering to week {latest_week} (first regular-season ",
+                 "week: preseason information set)"))
     dc_latest <- dc %>%
       dplyr::filter(.data$week == latest_week) %>%
       dplyr::filter(!is.na(.data$gsis_id), nchar(.data$gsis_id) > 0)
@@ -886,9 +1292,12 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
       .data$team %in% ACTIVE_TEAMS_2026,
       !is.na(.data$nfl_gsis_id)
     ) %>%
-    # One row per player: this data has one record per player-formation
-    # combination (167K+ rows total). Keep the row with the lowest depth rank
-    # per player-team-position, which represents their primary role.
+    # One row per player. After the dt filter above this is one record per
+    # player-FORMATION (a player can appear in an offensive package and on
+    # Special Teams), ~1.1 rows per player rather than ~141. Keeping the lowest
+    # rank now selects their primary role WITHIN THE CURRENT SNAPSHOT, which is
+    # what this line always intended. Without the dt filter it instead selected
+    # the best rank across every archived day.
     dplyr::group_by(.data$nfl_gsis_id, .data$team, .data$position) %>%
     dplyr::slice_min(.data$depth_rank_raw, n = 1L, with_ties = FALSE) %>%
     dplyr::ungroup()
@@ -901,8 +1310,25 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
   message(glue("    Depth chart loaded: {nrow(result)} player-positions ",
                "({week_label})"))
 
-  # Apply Sleeper overrides to catch offseason moves nflreadr/PFR has missed
-  result <- .merge_sleeper_depth_overrides(result)
+  # Apply Sleeper overrides to catch offseason moves nflreadr/PFR has missed.
+  #
+  # This reads the LIVE Sleeper player database, which always reflects the
+  # present day. Correct for projecting the upcoming season, wrong for any
+  # historical target season. A holdout run must pass FALSE. It also caches the
+  # Sleeper pull into the production cache directory, so disabling it keeps a
+  # namespaced run from writing outside its namespace.
+  if (isTRUE(use_sleeper_overrides)) {
+    result <- .merge_sleeper_depth_overrides(result)
+  } else {
+    message("    Sleeper depth chart overrides DISABLED (use_sleeper_overrides = FALSE)")
+    # depth_was_missing is created by .merge_sleeper_depth_overrides() and is
+    # consumed by the rookie depth-rank correction. With the merge disabled no
+    # player can be in that state, so it is supplied as FALSE rather than left
+    # absent. Schema stays constant across both paths.
+    if (!"depth_was_missing" %in% names(result)) {
+      result$depth_was_missing <- FALSE
+    }
+  }
 
   result
 }
@@ -979,21 +1405,69 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
     ))
   }
 
-  result <- picks %>%
-    dplyr::filter(!is.na(.data[[id_col]]), nchar(.data[[id_col]]) > 0) %>%
+  # ---------------------------------------------------------------------------
+  # IDENTITY RESOLUTION BEFORE THE JOIN  [2026-08-10]
+  # ---------------------------------------------------------------------------
+  # The draft table and the depth chart are keyed on gsis ids of different
+  # vintages, so joining them raw matched 0 of 230 every run. Both sides are
+  # resolved through R/53 first. See ROOKIE_CAPITAL_SCALE for the full evidence.
+  #
+  # The id filter that used to run HERE now runs AFTER resolution. That is
+  # deliberate: 27 of 257 picks carry no gsis id at all, and dropping them
+  # before the name pass would discard players the roster can identify.
+  auth <- pidr_build_authority(season = season, verbose = FALSE)
+
+  if (nrow(auth) == 0L) {
+    message("    Identity authority unavailable -- falling back to raw id join")
+    picks_resolved <- picks %>%
+      dplyr::mutate(gsis_resolved = as.character(.data[[id_col]]),
+                    id_source     = "native")
+  } else {
+    name_col_p <- dplyr::case_when(
+      "pfr_player_name" %in% names(picks) ~ "pfr_player_name",
+      "player_name"     %in% names(picks) ~ "player_name",
+      "full_name"       %in% names(picks) ~ "full_name",
+      TRUE                                 ~ NA_character_
+    )[1]
+
+    if (is.na(name_col_p)) {
+      message("    Draft table has no name column -- raw id join only")
+      picks_resolved <- picks %>%
+        dplyr::mutate(gsis_resolved = as.character(.data[[id_col]]),
+                      id_source     = "native")
+    } else {
+      picks_resolved <- pidr_resolve(
+        picks, auth,
+        id_col   = id_col,
+        name_col = name_col_p,
+        pos_col  = "position",
+        verbose  = FALSE
+      )
+      n_rec <- sum(picks_resolved$id_source == "recovered_by_name")
+      message(glue("    Identity: {n_rec} of {nrow(picks)} pick(s) resolved to ",
+                   "a real gsis id by name"))
+    }
+  }
+
+  result <- picks_resolved %>%
+    dplyr::filter(!is.na(.data$gsis_resolved),
+                  nchar(.data$gsis_resolved) > 0) %>%
     dplyr::transmute(
-      nfl_gsis_id  = .data[[id_col]],
+      nfl_gsis_id  = .data$gsis_resolved,
       draft_round  = as.integer(.data$round)
     ) %>%
     dplyr::filter(!is.na(.data$draft_round)) %>%
     dplyr::mutate(
       round_key = as.character(.data$draft_round),
       rookie_capital_mult = ROOKIE_CAPITAL_MULTIPLIERS[.data$round_key],
-      rookie_capital_mult = dplyr::coalesce(.data$rookie_capital_mult, 0.55)
+      rookie_capital_mult = dplyr::coalesce(.data$rookie_capital_mult, 0.55),
+      rookie_capital_mult = .r31_scale_capital(.data$rookie_capital_mult)
     ) %>%
+    dplyr::distinct(.data$nfl_gsis_id, .keep_all = TRUE) %>%
     dplyr::select(nfl_gsis_id, draft_round, rookie_capital_mult)
 
-  message(glue("    Loaded {nrow(result)} drafted rookies"))
+  message(glue("    Loaded {nrow(result)} drafted rookies ",
+               "(capital scale {ROOKIE_CAPITAL_SCALE})"))
 
   result
 }
@@ -1548,7 +2022,10 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
       # entry get the UDFA multiplier
       rookie_capital_mult = dplyr::case_when(
         !.data$is_rookie ~ 1.0,
-        is.na(.data$rookie_capital_mult) ~ ROOKIE_CAPITAL_MULTIPLIERS[["U"]],
+        # UDFA. Scaled by the same knob as the drafted ladder, or a sweep
+        # would move drafted players and leave undrafted ones fixed.
+        is.na(.data$rookie_capital_mult) ~ .r31_scale_capital(
+                                             ROOKIE_CAPITAL_MULTIPLIERS[["U"]]),
         TRUE ~ .data$rookie_capital_mult
       ),
       draft_round = dplyr::if_else(
@@ -2471,6 +2948,10 @@ SLEEPER_TO_NFLREADR_TEAM_MAP_R31 <- c(
 allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
                                       dynasty_scores_path = DYNASTY_SCORES_CSV,
                                       season             = SEASON_ALLOC,
+                                      cache_dir          = here::here("data", "season2_cache"),
+                                      out_prefix         = R31_OUT_PREFIX_DEFAULT,
+                                      use_sleeper_overrides = TRUE,
+                                      qb_committees_path = QB_COMMITTEES_PATH_ALLOC,
                                       as_of_week         = NULL,
                                       current_season_volume = NULL,
                                       preseason_carryover = TRUE,
@@ -2513,7 +2994,10 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
 
   # STEP 2: Load 2026 depth charts
   message("\nSTEP 2/7: Loading depth charts")
-  depth_chart <- .load_2026_depth_charts(season = season)
+  depth_chart <- .load_2026_depth_charts(
+    season = season,
+    use_sleeper_overrides = use_sleeper_overrides
+  )
 
   # STEP 3: Load rookie draft capital
   message("\nSTEP 3/7: Loading rookie draft capital")
@@ -2532,7 +3016,9 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   # VETERAN_MIN_EXP) receive an NFL-efficiency talent_z from the R/16 panel.
   message("\nSTEP 4/7: Loading talent inputs and computing talent multipliers")
   scores     <- .load_dynasty_scores(path = dynasty_scores_path)
-  panel      <- .load_player_season_panel()
+  panel      <- .load_player_season_panel(
+    cache_path = .r31_panel_cache_path(cache_dir)
+  )
   roster_exp <- .load_roster_experience(season = season)
   veteran_z  <- .compute_veteran_talent_z(panel, roster_exp, season = season)
   talent     <- .compute_talent_multipliers(scores, veteran_z = veteran_z)
@@ -2554,7 +3040,12 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   # share at the fitted per-position weight. Runs BEFORE the in-season blend so
   # observed data tapers from the carryover baseline. No-op when disabled or
   # when prior-season shares are unavailable.
-  prior_shares <- if (preseason_carryover) .compute_prior_season_shares() else NULL
+  prior_shares <- if (preseason_carryover) {
+    .compute_prior_season_shares(
+      panel_path   = .r31_panel_cache_path(cache_dir),
+      prior_season = .r31_carryover_prior_season(season)
+    )
+  } else NULL
   alloc_with_shares <- .apply_preseason_carryover(
     alloc_table  = alloc_with_shares,
     prior_shares = prior_shares,
@@ -2574,7 +3065,10 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   # STEP 7: Apply team volume to get expected volumes per player
   message("\nSTEP 7/7: Applying team volumes to get expected per-player volumes")
   # v3_4: pooled per-QB rush trait rate (player trait, transfers across moves).
-  qb_rush_rates <- .compute_qb_rush_rate()
+  qb_rush_rates <- .compute_qb_rush_rate(
+    panel_path = .r31_panel_cache_path(cache_dir),
+    seasons    = .r31_qb_rush_rate_seasons(season)
+  )
 
   # v3_5: college-tier fallback for no-history (rookie) QB1s. The CFB panel is
   # built (via lazy-sourced R/21) only when a QB1 actually lacks NFL rush history.
@@ -2587,9 +3081,14 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   if (nrow(no_hist_qb1) > 0L && nrow(qb1_hist_rate) > 0L) {
     nfl_qb1_q <- stats::quantile(qb1_hist_rate$qb_rush_pooled_pg,
                                  c(0.25, 0.50, 0.75), na.rm = TRUE)
+    # seasons MUST be passed: the default derives from SEASON_ALLOC, so any
+    # other target season pooled college play from seasons at or after it. The
+    # college season runs concurrent with the NFL season, so that is future
+    # data relative to a preseason projection.
     rookie_qb_rates <- .compute_rookie_qb_rush_rate(
       rookie_names      = no_hist_qb1$player_name,
-      nfl_qb1_quantiles = nfl_qb1_q
+      nfl_qb1_quantiles = nfl_qb1_q,
+      seasons           = .r31_qb_rush_rate_seasons(season)
     )
     n_tiered <- if (!is.null(rookie_qb_rates)) nrow(rookie_qb_rates) else 0L
     message(glue(
@@ -2607,8 +3106,13 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
 
   # Final output schema
   output <- alloc_final %>%
-    dplyr::mutate(schema_tag = SCHEMA_TAG_ALLOC) %>%
+    dplyr::mutate(schema_tag = SCHEMA_TAG_ALLOC,
+                  # [2026-08-10] R/47 can verify R/30's cache season and not
+                  # R/31's, because R/31 emitted no season column. A stale
+                  # R/31 beside a current R/30 passed every existing check.
+                  season = as.integer(season)) %>%
     dplyr::select(
+      season,
       nfl_gsis_id, player_name, team, position, depth_position, depth_rank,
       is_rookie, draft_round, rookie_capital_mult,
       score_final, talent_z, talent_multiplier, talent_source,
@@ -2628,7 +3132,8 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
   # non-QB1 candidate his own pooled rush rate, so R/32 anchors both as full
   # starters. RB allocation above is unchanged (it used the depth-QB1 subtract).
   output <- output %>%
-    dplyr::left_join(.load_qb_committees_alloc(season = season),
+    dplyr::left_join(.load_qb_committees_alloc(path = qb_committees_path,
+                                               season = season),
                      by = c("team", "nfl_gsis_id" = "qb_id")) %>%
     dplyr::mutate(
       expected_carries_pg = dplyr::if_else(
@@ -2640,6 +3145,8 @@ allocate_player_volumes <- function(team_volumes_path  = TEAM_VOLUMES_RDS,
 
   # Save outputs
   if (save_output) {
+    OUTPUT_RDS_PATH_ALLOC <- .r31_output_rds_path(cache_dir, out_prefix)
+    OUTPUT_CSV_PATH_ALLOC <- .r31_output_csv_path(cache_dir, out_prefix)
     dir.create(dirname(OUTPUT_RDS_PATH_ALLOC), recursive = TRUE,
                showWarnings = FALSE)
     saveRDS(output, OUTPUT_RDS_PATH_ALLOC)

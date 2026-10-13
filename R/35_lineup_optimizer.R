@@ -99,9 +99,24 @@
 #
 #   adds <- suggest_waiver_adds(src, reconciled, vorp, def_proj)
 #
-# SCHEMA TAG: s2_w16_lineup_v1
+# BYE WEEKS (v1.1)
+# ----------------
+# week_matchups holds one row per playing team. A team on bye has no row, so
+# the opponent join returns NA. Through v1.0 those rows kept matchup_factor 1
+# and adj_proj == base_proj, which handed the IP solver a full-strength
+# projection for a player who was not on the field; the solver would start him
+# over a healthy bench player. As of v1.1, a missing opponent under a supplied
+# week sets on_bye TRUE, matchup_factor 0 and adj_proj 0. The rows are zeroed
+# rather than dropped so a thin roster still solves: a bye player can fill a
+# slot when there is genuinely nobody else, but only as the last resort, and
+# on_bye is carried into the output so it is visible.
+# This applies wherever .apply_matchup() runs, so suggest_waiver_adds() gets
+# the same guard. When week is NULL (preseason / neutral), a missing opponent
+# means no schedule was supplied and is NOT treated as a bye.
+#
+# SCHEMA TAG: s3_r35_lineup_v3
 # Author: Christian K. LeBlanc
-# Version: 1.0
+# Version: 1.1
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -145,7 +160,7 @@ if (!exists("get_all_sleeper_players")) {
 # ------------------------------------------------------------------------------
 
 SEASON <- 2026L
-SCHEMA_TAG_LINEUP <- "s2_w16_lineup_v1"
+SCHEMA_TAG_LINEUP <- "s3_r35_lineup_v3"
 
 # Offensive positions we project (DEF handled as a pseudo-player).
 LINEUP_OFFENSE_POSITIONS <- c("QB", "RB", "WR", "TE")
@@ -163,9 +178,72 @@ SLOT_ELIGIBILITY <- list(
   DEF = c("DEF")
 )
 
-# DvP / DEF-matchup factor cap. Factors are clamped to [1 - cap, 1 + cap] so a
+# DvP / DEF-matchup factor caps. Factors are clamped to [1 - cap, 1 + cap] so a
 # matchup tilts a projection without ever swamping it.
-DVP_CAP <- 0.25
+#
+# NEUTRALIZED 2026-09-09: the OFFENSE cap is set to 0.00, which collapses every
+# offensive dvp_factor to exactly 1.0 and makes adj_proj == base_proj for
+# QB/RB/WR/TE. The code path is preserved and still executes; only the magnitude
+# is zero. Do not delete compute_dvp_factors() or .apply_matchup().
+#
+# GATE EVIDENCE. compute_dvp_factors() defaults to seasons = SEASON - 1L, so the
+# quantity it builds is prior-season fantasy points allowed to a position,
+# relative to the league mean for that position. That quantity was tested
+# directly (as `dvp_prev`) against a baseline of prior points + prior share +
+# prior snap share, fit on 2019-2024 and held out on 2025, n = 28,601
+# player-games, 95% intervals bootstrapped over 1,000 replicates clustered by
+# game:
+#
+#   position   delta R2    95% interval          share of replicates > 0
+#   QB          +0.00457   (-0.00234, 0.01106)   91.9%
+#   RB          +0.00121   (-0.00212, 0.00466)   76.9%
+#   TE          +0.00025   (-0.00027, 0.00077)   82.6%
+#   WR          -0.00005   (-0.00058, 0.00049)   40.5%
+#
+# The interval includes zero at all four positions. In-sample the coefficient is
+# not significant for WR (p = 0.235) or TE (p = 0.553). A model carrying all five
+# matchup signals tested also failed to clear at every position. Scaling a
+# projection by up to +/- 25% on a signal that does not predict out of sample is
+# not supportable, so the supported magnitude is zero rather than "smaller" --
+# there is no fitted value to shrink toward.
+#
+# REVIVE CONDITION. Restore a non-zero offense cap only when a matchup signal
+# clears the same baseline out of sample with a 95% interval excluding zero, AND
+# the cap is set to a fitted magnitude rather than a chosen one. Candidates that
+# did clear on 2025 holdout, and so are the place to start: opponent generic
+# defensive strength (QB +0.01662, CI 0.00752 to 0.02612; TE +0.00334, CI
+# 0.00071 to 0.00624) and in-season DvP at QB (+0.00991, CI 0.00308 to 0.01721).
+# Note that none of those are the prior-season quantity this function computes,
+# and that no combined model cleared, so reviving this path means changing what
+# it measures, not just its cap.
+#
+# NEUTRALIZED 2026-10-01: the DEF/ST cap is set to 0.00, which collapses every
+# def_matchup_factor to exactly 1.0 and makes adj_proj == base_proj for DEF.
+# compute_def_matchup_factors() and .apply_matchup() are preserved and still
+# execute; only the magnitude is zero.
+#
+# GATE EVIDENCE. R/66 (66_def_gate.R) tested this factor as production built it
+# (prior-season DEF points conceded by the opponent offense, standard scoring,
+# cap 0.25, applied multiplicatively to R/34) against R/34 alone,
+# leave-one-season-out 2023-2025, 1,632 team-games, team-cluster bootstrap:
+#   pooled RMSE improvement 0.051, 90% CI -0.007 to 0.109 (FAILED)
+#   per holdout: 2023 0.010, 2024 0.122 (passed), 2025 0.029
+# The opponent Vegas implied total, tested in the same run, passed at 0.218
+# (CI 0.167 to 0.269), and adding this factor on top of it made things worse:
+# RMSE 5.56 (Vegas alone) vs 5.63 (factor then Vegas); within-week Spearman
+# 0.293 vs 0.269. The line carries what this factor carries, and more. The
+# Vegas shift is wired in R/34 (v2.0), not here.
+#
+# REVIVE CONDITION. Restore a non-zero DEF cap only when a re-run of R/66 on an
+# added season passes the pooled gate AND the factor's increment over the
+# Vegas shift is not wholly below zero; or when a factor built from in-season
+# conceded points (weeks before W) passes both.
+DVP_CAP_OFFENSE <- 0.00
+DVP_CAP_DEF     <- 0.00
+
+# Back-compat alias. Retained so any caller passing cap = DVP_CAP still resolves.
+# [2026-10-01] Both caps are now 0, so this is 0 as well.
+DVP_CAP <- DVP_CAP_DEF
 
 # Fixed PPG gap used for the DEF slot confidence flag (offense uses intervals).
 DEF_GAP_THRESHOLD <- 1.5
@@ -227,7 +305,7 @@ utils::globalVariables(c(
   "def_proj_ppg", "is_reserve", "status", "injury_status", "is_free_agent",
   "availability_status", "on_user_roster", "is_available", "ros_value",
   "forward_score", "value", "fantasy_pts_roll3", "score_final", "age",
-  "lower_80", "upper_80", "slot", "confidence_flag", "player_id",
+  "lower_80", "upper_80", "slot", "confidence_flag", "on_bye", "player_id",
   "sleeper_player_id", "roster_id", "match_method", "match_confidence",
   "gsis_id", "full_name", "sp_name", "sp_pos", "name_key", "pool_key",
   "dynasty_value", "value_gain", "forward_score", "forward_vorp"
@@ -558,7 +636,7 @@ load_availability <- function(source, availability_path = NULL) {
 compute_dvp_factors <- function(seasons = SEASON - 1L,
                                 roster_data = NULL,
                                 cache_dir = CACHE_DIR_DEFAULT,
-                                cap = DVP_CAP) {
+                                cap = DVP_CAP_OFFENSE) {
 
   per_game <- purrr::map_dfr(seasons, function(s) {
     pbp <- .reg_season_pbp(load_normalized_season(s, cache_dir = cache_dir))
@@ -679,7 +757,7 @@ compute_dvp_factors <- function(seasons = SEASON - 1L,
 #' @export
 compute_def_matchup_factors <- function(seasons = SEASON - 1L,
                                         cache_dir = CACHE_DIR_DEFAULT,
-                                        cap = DVP_CAP) {
+                                        cap = DVP_CAP_DEF) {
 
   per_game <- purrr::map_dfr(seasons, function(s) {
     pbp    <- .reg_season_pbp(load_normalized_season(s, cache_dir = cache_dir))
@@ -738,8 +816,12 @@ compute_def_matchup_factors <- function(seasons = SEASON - 1L,
 .apply_matchup <- function(pool, week_matchups, dvp, def_factors) {
 
   if (is.null(week_matchups)) {
+    # No week supplied: preseason or neutral evaluation. A missing opponent
+    # here means "no schedule was provided", NOT "this team is on bye", so
+    # on_bye is FALSE and the projection is untouched.
     return(dplyr::mutate(pool,
                          opponent       = NA_character_,
+                         on_bye         = FALSE,
                          matchup_factor = 1,
                          adj_proj       = .data$base_proj))
   }
@@ -772,8 +854,20 @@ compute_def_matchup_factors <- function(seasons = SEASON - 1L,
     def <- dplyr::mutate(def, matchup_factor = 1)
   }
 
+  # BYE WEEKS. A week WAS supplied, so every playing team has a row in
+  # week_matchups. A team with no row is not playing, and its players score
+  # zero. Before this guard those rows kept matchup_factor 1 and
+  # adj_proj == base_proj, i.e. a full projection for a player who is not on
+  # the field, which the IP solver would happily start. Zeroing adj_proj rather
+  # than dropping the rows keeps a thin roster solvable: a bye player can still
+  # fill a slot when there is genuinely nobody else, but only ever as the last
+  # resort, and on_bye marks it so downstream code can see what happened.
   dplyr::bind_rows(off, def) %>%
-    dplyr::mutate(adj_proj = .data$base_proj * .data$matchup_factor)
+    dplyr::mutate(
+      on_bye         = is.na(.data$opponent),
+      matchup_factor = dplyr::if_else(.data$on_bye, 0, .data$matchup_factor),
+      adj_proj       = .data$base_proj * .data$matchup_factor
+    )
 }
 
 # ------------------------------------------------------------------------------
@@ -883,8 +977,29 @@ assemble_player_pool <- function(source, reconciled, vorp, def_proj,
       dplyr::select(-fantasy_pts_roll3)
   }
 
+  # na_matches = "never" is load-bearing, not defensive tidying.
+  #
+  # dplyr's default (na_matches = "na") treats NA as a joinable value. Both
+  # sides of this join carry rows whose nfl_gsis_id is NA -- Sleeper players
+  # that never resolved to a GSIS id, plus K and DEF rows that have no GSIS id
+  # by construction. Under the default every NA row on the left matches every
+  # NA row on the right, which is a Cartesian product: it emitted an
+  # "unexpected many-to-many relationship" warning on the first live run and,
+  # more importantly, duplicated unresolved players in the pool handed to the
+  # IP solver and to the alternatives set.
+  #
+  # Verified on the King of Kings week 1 run: nfl_gsis_id is unique across all
+  # non-NA values in both `vorp` and the reconciled board, so the ONLY source
+  # of multiplicity here was NA-to-NA matching. An NA gsis means "this player
+  # was never identified", which can never be a real join key.
+  #
+  # relationship = "one-to-one" then asserts what should now hold, so a genuine
+  # duplicate-key regression upstream in R/32 or R/33 fails loudly here rather
+  # than silently inflating the pool.
   vorp_lk <- vorp %>% dplyr::select(nfl_gsis_id, adjusted_vorp)
-  off <- dplyr::left_join(off, vorp_lk, by = "nfl_gsis_id")
+  off <- dplyr::left_join(off, vorp_lk, by = "nfl_gsis_id",
+                          na_matches = "never",
+                          relationship = "one-to-one")
 
   def <- def_proj %>%
     dplyr::transmute(
@@ -1374,6 +1489,7 @@ optimize_lineup <- function(source, reconciled, vorp, def_proj,
       matchup_factor = round(.data$matchup_factor, 3),
       adj_proj       = round(.data$adj_proj, 2),
       adjusted_vorp  = round(.data$adjusted_vorp, 1),
+      on_bye         = .data$on_bye,
       confidence_flag,
       schema_tag     = SCHEMA_TAG_LINEUP
     )
@@ -1395,10 +1511,36 @@ optimize_lineup <- function(source, reconciled, vorp, def_proj,
   message(glue("\n{strrep('=', 70)}"))
   message(glue("R/35: Optimal lineup ({wk_label}, {source$format})"))
   message(glue("{strrep('=', 70)}"))
-  message(glue("  Slots filled:        {nrow(out_tbl)}"))
-  message(glue("  Projected total:     {format(round(total_pts, 1), nsmall = 1)} pts"))
+  # The toolkit projects offense and DEF only. It has no kicker projections, so
+  # a league with a K slot returns a SHORT lineup and a total that covers fewer
+  # slots than the league actually starts. Labeling that is deliberate: the
+  # alternative considered was filling K with a flat constant, which was
+  # rejected because an invented number would enter the saved snapshots and
+  # eventually be read back as a projection. An understated total that says so
+  # is preferable to a complete-looking total that is partly fabricated.
+  slot_caps_req <- .build_slot_caps(source)
+  n_required    <- sum(unlist(slot_caps_req), na.rm = TRUE)
+  n_short       <- max(0L, as.integer(n_required) - nrow(out_tbl))
+
+  message(glue("  Slots filled:        {nrow(out_tbl)} of {n_required}"))
+  if (n_short > 0L) {
+    message(glue("  Projected total:     ",
+                 "{format(round(total_pts, 1), nsmall = 1)} pts ",
+                 "(covers {nrow(out_tbl)} slots; NOT the league total)"))
+    message(glue("  UNPROJECTED SLOTS:   {n_short} -- no projections exist ",
+                 "for these positions. Totals and risk scores below cover ",
+                 "the filled slots only."))
+  } else {
+    message(glue("  Projected total:     ",
+                 "{format(round(total_pts, 1), nsmall = 1)} pts"))
+  }
   message(glue("  Close-call slots:    {n_close}"))
   message(glue("  Unavailable held:    {nrow(unavailable)}"))
+  n_bye <- sum(out_tbl$on_bye %in% TRUE)
+  if (n_bye > 0L) {
+    message(glue("  ON BYE in lineup:    {n_bye} (projected 0; roster is ",
+                 "too thin to fill the slot otherwise)"))
+  }
   message(glue("{strrep('=', 70)}\n"))
 
   list(starters = out_tbl, bench = bench, unavailable = unavailable,

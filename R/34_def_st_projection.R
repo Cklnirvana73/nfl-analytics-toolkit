@@ -61,10 +61,32 @@
 #   def_proj <- project_def_st(as_of_week = 8)           # in-season, week 8
 #   def_proj <- project_def_st(as_of_week = 8,
 #                              league_id = "123456789")  # league scoring
+#   def_proj <- project_def_st(as_of_week = 3, week = 4) # + Vegas shift (v2.0)
 #
-# SCHEMA TAG: s2_w16_def_st_v1
+# VEGAS SHIFT (v2.0, 2026-10-01)
+# --------------------------------
+# R/66 (66_def_gate.R) gated the Vegas implied total of the OPPONENT against
+# this file's projection, leave-one-season-out 2023-2025, 1,632 team-games:
+# RMSE improvement 0.218, 90% CI 0.167 to 0.269, passing in every holdout
+# (slope -0.39 to -0.44 per implied point). Within-week Spearman 0.112 -> 0.293.
+# When `week` is supplied, project_def_st() pulls that week's lines from
+# nflreadr::load_schedules() and adds
+#   vegas_shift = b * (opp_implied - center)
+# with b and center read from the R/66 gate object (never hardcoded here).
+# def_proj_ppg becomes the shifted value so R/35 consumes it unchanged;
+# def_proj_ppg_base keeps the pre-shift projection. A team with no line (bye or
+# not yet posted) gets vegas_shift 0, and the console counts them. The shift is
+# applied only when the run's DEF scoring is identical to the scoring R/66 was
+# fit under; otherwise it is off for the run, with a message.
+# LIMIT: the gate used CLOSING lines; an in-week run sees the lines current at
+# run time. lines_pulled_at is written on every row so the forward scoreboard
+# can check whether early lines underperform.
+# week = NULL (the default) reproduces v1.0 exactly.
+#
+# SCHEMA TAG: s2_w16_def_st_v2 (v1 columns plus def_proj_ppg_base, week,
+#   opp_implied, vegas_shift, lines_pulled_at)
 # Author: Christian K. LeBlanc
-# Version: 1.0
+# Version: 2.0
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -154,7 +176,12 @@ OUTPUT_RDS_PATH <- here::here("data", "season2_cache",
 OUTPUT_CSV_PATH <- here::here("data", "season2_cache",
                               "s2_week16_def_st_projections.csv")
 
-SCHEMA_TAG <- "s2_w16_def_st_v1"
+SCHEMA_TAG <- "s2_w16_def_st_v2"
+
+# [2026-10-01] R/66 DEF gate object. The Vegas shift parameters are read from
+# here; R/34 does not source R/66.
+R66_DEF_GATE_PATH   <- here::here("data", "season3_cache", "s3_r66_def_gate.rds")
+R66_DEF_GATE_SCHEMA <- "s3_r66_def_gate_v1"
 
 # ==============================================================================
 # PURE HELPERS (no I/O -- unit tested)
@@ -548,6 +575,68 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
     dplyr::rename(def_observed_ppg = def_ppg, n_observed_games = n_games)
 }
 
+# ------------------------------------------------------------------------------
+# .load_r66_vegas_params  [2026-10-01]
+# ------------------------------------------------------------------------------
+
+#' Vegas-shift parameters from the R/66 DEF gate, if it passed
+#'
+#' @param scoring List DEF scoring config the run uses.
+#' @param path Character. R/66 gate object.
+#' @return list(b, center) or NULL (absent, malformed, not passed, or fit under
+#'   a different DEF scoring). NULL means no shift.
+#' @keywords internal
+.load_r66_vegas_params <- function(scoring, path = R66_DEF_GATE_PATH) {
+  if (!file.exists(path)) {
+    message(glue("  Vegas shift OFF: no R/66 gate object at {basename(path)}"))
+    return(NULL)
+  }
+  g <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(g) || !identical(g$schema_tag, R66_DEF_GATE_SCHEMA) ||
+      is.null(g$decisions) || is.null(g$params_all_seasons)) {
+    message("  Vegas shift OFF: R/66 gate object unreadable or wrong schema")
+    return(NULL)
+  }
+  d <- g$decisions[g$decisions$test == "c2_vegas_implied", , drop = FALSE]
+  if (nrow(d) != 1L || !isTRUE(d$wiring_eligible)) {
+    message("  Vegas shift OFF: R/66 did not pass c2_vegas_implied")
+    return(NULL)
+  }
+  if (!isTRUE(all.equal(g$provenance$def_scoring, scoring))) {
+    message("  Vegas shift OFF: this run's DEF scoring differs from the scoring R/66 was fit under")
+    return(NULL)
+  }
+  p <- g$params_all_seasons
+  if (!is.finite(p$b2[1]) || !is.finite(p$center[1])) return(NULL)
+  list(b = p$b2[1], center = p$center[1])
+}
+
+# ------------------------------------------------------------------------------
+# .week_opp_implied  [2026-10-01]
+# ------------------------------------------------------------------------------
+
+#' Opponent implied total per team for one week (same construction as R/66)
+#'
+#' spread_line > 0 means the home team is favored:
+#'   home implied = (total + spread) / 2, away implied = (total - spread) / 2.
+#' @return Tibble team, opp_implied (one row per team playing that week; NA
+#'   where the line is not posted). Empty tibble when the schedule cannot load.
+#' @keywords internal
+.week_opp_implied <- function(season, week) {
+  sch <- tryCatch(nflreadr::load_schedules(season), error = function(e) {
+    message(glue("  load_schedules({season}) failed: {conditionMessage(e)}"))
+    NULL
+  })
+  if (is.null(sch)) return(tibble::tibble(team = character(), opp_implied = numeric()))
+  sch <- dplyr::filter(sch, .data$game_type == "REG", .data$week == !!week)
+  dplyr::bind_rows(
+    dplyr::transmute(sch, team = home_team,
+                     opp_implied = (total_line - spread_line) / 2),
+    dplyr::transmute(sch, team = away_team,
+                     opp_implied = (total_line + spread_line) / 2)
+  )
+}
+
 # ==============================================================================
 # PUBLIC ENTRY POINT
 # ==============================================================================
@@ -572,6 +661,10 @@ SCHEMA_TAG <- "s2_w16_def_st_v1"
 #'   when supplied (mainly for testing).
 #' @param cache_dir Character. R/15 cache directory.
 #' @param save_output Logical. Write RDS and CSV when TRUE.
+#' @param week Integer or NULL. [2026-10-01] The week being projected. When
+#'   supplied, the R/66-gated Vegas shift for that week is added (see header).
+#'   NULL = no shift, identical to v1.0. as_of_week is unchanged by this; the
+#'   usual pairing is as_of_week = week - 1.
 #' @return Tibble, one row per team, sorted by def_proj_ppg descending.
 #' @seealso calculate_def_st_points, compute_prior_weight (R/29);
 #'   connect_sleeper_league (R/19)
@@ -583,7 +676,8 @@ project_def_st <- function(season = SEASON,
                            regression_strength = REGRESSION_STRENGTH,
                            scoring = NULL,
                            cache_dir = CACHE_DIR_DEFAULT,
-                           save_output = TRUE) {
+                           save_output = TRUE,
+                           week = NULL) {
 
   message(glue("\n{strrep('=', 70)}"))
   message(glue("R/34: Projecting DEF/ST PPG for season {season}"))
@@ -643,10 +737,45 @@ project_def_st <- function(season = SEASON,
       as_of_week     = if (is.null(as_of_week)) NA_integer_ else as.integer(as_of_week),
       scoring_source = as.character(scoring_source),
       schema_tag     = SCHEMA_TAG
-    ) %>%
+    )
+
+  # [2026-10-01] Vegas shift (R/66). def_proj_ppg_base is the v1.0 projection.
+  out <- dplyr::mutate(out,
+                       def_proj_ppg_base = .data$def_proj_ppg,
+                       week = if (is.null(week)) NA_integer_ else as.integer(week),
+                       opp_implied = NA_real_, vegas_shift = 0,
+                       lines_pulled_at = as.POSIXct(NA))
+  if (!is.null(week)) {
+    message(glue("\nVEGAS SHIFT: week {week}"))
+    vp <- .load_r66_vegas_params(scoring)
+    if (!is.null(vp)) {
+      lines <- .week_opp_implied(season, as.integer(week))
+      pulled <- Sys.time()
+      out <- out %>%
+        dplyr::select(-opp_implied) %>%
+        dplyr::left_join(lines, by = "team", relationship = "one-to-one") %>%
+        dplyr::mutate(
+          vegas_shift     = dplyr::if_else(is.na(.data$opp_implied), 0,
+                                           vp$b * (.data$opp_implied - vp$center)),
+          def_proj_ppg    = .data$def_proj_ppg_base + .data$vegas_shift,
+          lines_pulled_at = pulled
+        )
+      n_line <- sum(!is.na(out$opp_implied))
+      message(glue("  b = {round(vp$b, 4)}, center = {round(vp$center, 2)}; ",
+                   "{n_line} of {nrow(out)} teams with a line, ",
+                   "{nrow(out) - n_line} without (shift 0: bye or not posted)"))
+      if (n_line > 0) {
+        message(glue("  shift range {round(min(out$vegas_shift), 2)} to ",
+                     "{round(max(out$vegas_shift), 2)} PPG"))
+      }
+    }
+  }
+
+  out <- out %>%
     dplyr::select(
-      season, as_of_week, team, def_prior_ppg, def_observed_ppg,
-      n_observed_games, prior_weight, def_proj_ppg, scoring_source, schema_tag
+      season, as_of_week, week, team, def_prior_ppg, def_observed_ppg,
+      n_observed_games, prior_weight, def_proj_ppg_base, opp_implied,
+      vegas_shift, def_proj_ppg, lines_pulled_at, scoring_source, schema_tag
     ) %>%
     dplyr::arrange(dplyr::desc(def_proj_ppg))
 

@@ -1093,25 +1093,43 @@ robustness_l2_efficiency <- function(frame, arm = c("a1", "a2"),
 # zero across 0.30 to 0.45, L2 dilutes to neutral and the wire-in is optional.
 # ==============================================================================
 
-# Dated copy of live R/32 v2.2 BLEND_WEIGHTS_BY_PRIOR_SOURCE (RB/WR/TE). Used
-# ONLY when R/32 is not sourced; prefer the live constant.
-L2_BLEND_WEIGHTS_DEFAULT <- c(
-  "blended"               = 0.30,
-  "veteran_history_only"  = 0.45,
-  "history_only_fallback" = 0.55,
-  "translation_only"      = 0.65,
-  "score_final_fallback"  = 0.85
-)
-L2_BLEND_DEFAULT_W <- 0.50   # unrecognized prior_source (R/32 DEFAULT_R31_WEIGHT)
+# [2026-08-13] THE DATED FALLBACK COPY IS DELETED. Do not restore it, and do
+# not "sync" it to current values -- a synced copy is the same drift with a
+# later start date, and this file proved the failure mode. What was here:
+#
+#   L2_BLEND_WEIGHTS_DEFAULT <- c(blended = 0.30, veteran_history_only = 0.45,
+#     history_only_fallback = 0.55, translation_only = 0.65,
+#     score_final_fallback = 0.85)
+#
+# Four of those five keys (blended, history_only_fallback, translation_only,
+# score_final_fallback) stopped existing at R/32's prior_source rekey and were
+# never updated here. The fifth read 0.45 against a live 0.275. So the fallback
+# had been dead since the rekey: on fall-through, four lookups would miss and
+# silently coalesce to 0.50 while one returned a superseded weight. R/45's copy
+# WAS updated at the rekey, which is how the two files came to disagree.
+#
+# Both the weight table and the unrecognized-key default now come from R/32
+# only. If R/32 is not sourced this file stops, loudly.
 
-# Resolve blend weights: caller override > live R/32 constant > dated copy.
+# Resolve blend weights: caller override > live R/32 constant > hard error.
 .l2_resolve_blend_weights <- function(blend_weights = NULL) {
   if (!is.null(blend_weights)) return(blend_weights)
-  if (exists("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)) {
-    return(get("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE))
+  if (!exists("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)) {
+    stop("R/43 Stage B: BLEND_WEIGHTS_BY_PRIOR_SOURCE not found. Source ",
+         "R/32_projection_reconciliation.R first. There is deliberately no ",
+         "local fallback copy of R/32's blend weights.", call. = FALSE)
   }
-  message("  Stage B: R/32 not sourced; using dated L2_BLEND_WEIGHTS_DEFAULT.")
-  L2_BLEND_WEIGHTS_DEFAULT
+  get("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)
+}
+
+# Weight for an unrecognized prior_source. R/32's DEFAULT_R31_WEIGHT, resolved
+# live for the same reason as the table above.
+.l2_default_blend_w <- function() {
+  if (!exists("DEFAULT_R31_WEIGHT", inherits = TRUE)) {
+    stop("R/43 Stage B: DEFAULT_R31_WEIGHT not found. Source ",
+         "R/32_projection_reconciliation.R first.", call. = FALSE)
+  }
+  get("DEFAULT_R31_WEIGHT", inherits = TRUE)
 }
 
 # Position-aligned core points for each component row (RB adds rushing core).
@@ -1189,8 +1207,24 @@ assemble_l2_stageb <- function(frame, components,
     sb$career_prior_seasons >= 4L ~ "veteran_history_only",
     TRUE                          ~ "blended"
   )
+  # [2026-08-13] OPEN ITEM, NOT FIXED HERE. Two of the three proxy labels above
+  # ("score_final_fallback", "blended") are pre-rekey names that no longer exist
+  # in R/32's live BLEND_WEIGHTS_BY_PRIOR_SOURCE, so those rows miss the lookup
+  # and take the default weight even when R/32 IS sourced. Remapping them to
+  # current keys is a modeling judgment (rookie -> translation_capped_rookie?
+  # blended -> phased_out_history_only?), so the mapping is left unchanged and
+  # the fall-through is now REPORTED instead of silent. Do not remap without a
+  # decision on record.
   w_proxy <- unname(bw[sb$prior_source_proxy])
-  w_proxy[is.na(w_proxy)] <- L2_BLEND_DEFAULT_W
+  unmatched <- is.na(w_proxy)
+  if (any(unmatched)) {
+    bad_keys <- sort(unique(sb$prior_source_proxy[unmatched]))
+    message(glue(
+      "  Stage B: {sum(unmatched)} of {length(w_proxy)} rows have a ",
+      "prior_source_proxy absent from R/32's weight table and fall back to ",
+      "DEFAULT_R31_WEIGHT. Keys: {paste(bad_keys, collapse = ', ')}"))
+  }
+  w_proxy[unmatched] <- .l2_default_blend_w()
   sb$w_proxy <- w_proxy
 
   if (verbose) {

@@ -78,21 +78,55 @@
 #       draft_round, draft_pick, position, draft_year, nfl_gsis_id,
 #       cfb_player_name, draft_class_type)
 #   data/season2_cache/s2_week10_models.rds               (v1 fitted models:
-#       models_base, models_enriched, base_feature_cols, impute_medians)
+#       models_base, models_enriched, base_feature_cols, impute_medians,
+#       models_components_base, models_components_enriched, stat_components)
 #   data/season2_cache/s2_week10_predictions.rds          (v1 training LOCO
 #       predictions: nfl_gsis_id, draft_year, draft_position, ppr_per_game_y13,
-#       pred_base, pred_enriched, is_hit)
+#       pred_base, pred_enriched, is_hit, plus pred_base_* / pred_enriched_*
+#       component columns)
 #
 # OUTPUT (written to season3_cache -- the Season 3 convention)
 # ------------------------------------------------------------
 #   data/season3_cache/s3_r39_translation_preds_augmented.rds   (R/29 consumes)
 #   data/season3_cache/s3_r39_translation_preds_augmented.csv   (eyeball twin)
 #
-# OUTPUT SCHEMA (player_uid + R/24 loco_predictions schema + peak + pred_type)
+# OUTPUT SCHEMA (player_uid + R/24 loco_predictions schema + peak + pred_type
+#                + Wave A2 stat-line components)
 # --------------------------------------------------------
 #   player_uid, nfl_gsis_id, draft_year, draft_position, ppr_per_game_y13,
 #   pred_base, pred_enriched, is_hit, peak_ppr_per_game, peak_career_year,
-#   pred_type
+#   pred_type,
+#   pred_base_<component> x8, pred_enriched_<component> x8
+#
+# WAVE A2: STAT-LINE COMPONENTS
+# -----------------------------
+# The scalar pred_base / pred_enriched columns are PPR/game points produced by
+# a model fit directly on points, under R/24's REFERENCE_SCORING (a 4-point
+# pass TD PPR line). They are fixed-scale: they cannot answer what a player is
+# worth under any other scoring, and rescaling them requires a conversion
+# factor that must be estimated per format.
+#
+# The component columns carry the same prediction decomposed into the eight
+# stat quantities scoring actually operates on (pass yd/td/int, rush yd/td,
+# rec/rec yd/rec td). A consumer applies its own scoring to that stat line and
+# gets a scoring-responsive point estimate with no conversion factor and no
+# refit. This is what lets R/29 build a prior that responds to league scoring
+# instead of blending fixed-PPR units with scoring-responsive history.
+#
+# The scalar columns are RETAINED, not replaced. Existing consumers (R/40, the
+# Shiny rookie tab, comparable-player lookups) keep working unchanged, and the
+# scalars remain the correct thing to use wherever reference-scoring points are
+# what is wanted. Backtesting established the two carry equal accuracy; the
+# components are preferred for their scoring behaviour, not their error.
+#
+# Component columns are NOT invented here. For training rows they are copied
+# from the LOCO file exactly as the scalars are. For rookies they are predicted
+# live from R/24's per-component models, by the same mechanics and the same
+# imputation policy used for the scalars.
+#
+# OBSERVED component columns (y13_*, no pred_ prefix) are deliberately NOT
+# carried. They exist only for training rows and are outcomes, not predictions;
+# a consumer wanting truth should read the LOCO file directly.
 #
 # player_uid is the never-NA identity key. It equals nfl_gsis_id for any player
 # who has one (all training players, and any rookie already assigned a gsis),
@@ -131,6 +165,7 @@ library(readr)
 library(tibble)
 library(purrr)
 library(glue)
+library(rlang)   # for !!! splicing of component predictions into tibble()
 library(here)
 
 if (!requireNamespace("glmnet", quietly = TRUE)) {
@@ -175,19 +210,50 @@ OUTPUT_CSV_DEFAULT <- file.path(
   OUTPUT_DIR_DEFAULT, "s3_r39_translation_preds_augmented.csv"
 )
 
-# Output schema column order (R/24 loco schema + pred_type + player_uid).
+# Scalar (pre-A2) portion of the output schema, in column order.
 # player_uid is the never-NA identity key (see .build_player_uid): real
 # nfl_gsis_id when present, a deterministic synthetic for rookies who have no
 # NFL gsis yet. Downstream consumers join on player_uid, NOT nfl_gsis_id, so a
 # rookie cohort with NA gsis can never collide NA-on-NA or be silently dropped.
-OUTPUT_SCHEMA <- c(
+OUTPUT_SCHEMA_SCALAR <- c(
   "player_uid",
   "nfl_gsis_id", "draft_year", "draft_position", "ppr_per_game_y13",
   "pred_base", "pred_enriched", "is_hit",
   "peak_ppr_per_game", "peak_career_year", "pred_type"
 )
 
-R39_SCHEMA_TAG <- "s3_r39_v1"
+# Backward-compatible alias. Anything that referenced OUTPUT_SCHEMA before A2
+# wanted the scalar column set, which is what this still is.
+OUTPUT_SCHEMA <- OUTPUT_SCHEMA_SCALAR
+
+# Prediction-column prefixes, one per model variant. Component prediction
+# columns are "<prefix><component>", matching R/24's loco_predictions naming
+# exactly so training rows carry through with no renaming.
+VARIANT_PREFIXES <- c(base = "pred_base_", enriched = "pred_enriched_")
+
+# ------------------------------------------------------------------------------
+# .component_pred_cols / .build_output_schema
+#
+# The component list is NOT hardcoded. It is read from the model object's own
+# stat_components slot at runtime, exactly as base_feature_cols and
+# impute_medians already are, so a change to R/24's STAT_COMPONENTS is followed
+# automatically instead of silently disagreeing with a copy kept here.
+# ------------------------------------------------------------------------------
+.component_pred_cols <- function(stat_components, variant) {
+  paste0(VARIANT_PREFIXES[[variant]], stat_components)
+}
+
+.build_output_schema <- function(stat_components) {
+  c(
+    OUTPUT_SCHEMA_SCALAR,
+    .component_pred_cols(stat_components, "base"),
+    .component_pred_cols(stat_components, "enriched")
+  )
+}
+
+# v2: adds the Wave A2 component prediction columns. Scalar columns unchanged,
+# so a v1 consumer reading this file by name still finds everything it expects.
+R39_SCHEMA_TAG <- "s3_r39_v2"
 
 
 # ==============================================================================
@@ -278,14 +344,19 @@ R39_SCHEMA_TAG <- "s3_r39_v1"
 # hardcoded, so a feature-set change in a rebuilt model is followed
 # automatically.
 #
-# @param pos_data data.frame. One position's rows from the feature matrix.
-# @param models   list. The v1 model object (models_base, models_enriched,
-#                 base_feature_cols, impute_medians).
-# @param pos      character. "QB" / "RB" / "WR" / "TE".
-# @return list(pred_base = <numeric>, pred_enriched = <numeric>), each of length
-#         nrow(pos_data), in PPR/game units.
+# @param pos_data        data.frame. One position's rows from the feature matrix.
+# @param models          list. The v1 model object (models_base, models_enriched,
+#                        base_feature_cols, impute_medians, and the Wave A2
+#                        slots models_components_base / _enriched).
+# @param pos             character. "QB" / "RB" / "WR" / "TE".
+# @param stat_components character. Component names, read from the model
+#                        object's stat_components slot by the caller.
+# @return named list: pred_base and pred_enriched (PPR/game), plus one element
+#         per component per variant named pred_base_<cmp> / pred_enriched_<cmp>
+#         in that component's own stat units. Every element has length
+#         nrow(pos_data).
 # @keywords internal
-.predict_cohort_ppg <- function(pos_data, models, pos) {
+.predict_cohort_ppg <- function(pos_data, models, pos, stat_components) {
 
   mdl_base     <- models$models_base[[pos]]
   mdl_enriched <- models$models_enriched[[pos]]
@@ -327,7 +398,92 @@ R39_SCHEMA_TAG <- "s3_r39_v1"
     stats::predict(mdl_enriched, newx = X_enr, s = "lambda.min")
   )
 
-  list(pred_base = raw_base, pred_enriched = raw_enriched)
+  # --- Wave A2: per-component stat-line predictions ---------------------------
+  # One model per component per variant, fit by R/24 on the same feature sets
+  # and scored on the same imputed matrices, so a component prediction is on
+  # identical footing with the scalar prediction beside it.
+  #
+  # A component R/24 short-circuited (nonzero fraction below
+  # MIN_COMPONENT_NONZERO_FRAC, e.g. TE pass TDs at 0.0000) has no fitted model.
+  # .predict_one_component handles that by emitting the stored constant, which
+  # is the correct prediction for a degenerate component and keeps the column
+  # present rather than absent. See its comments for the storage forms handled.
+  n_rows <- nrow(pos_data)
+
+  comp_base <- lapply(stat_components, function(cmp) {
+    .predict_one_component(
+      models$models_components_base[[pos]][[cmp]],
+      X_base, n_rows, pos, cmp, "base"
+    )
+  })
+  names(comp_base) <- .component_pred_cols(stat_components, "base")
+
+  comp_enriched <- lapply(stat_components, function(cmp) {
+    .predict_one_component(
+      models$models_components_enriched[[pos]][[cmp]],
+      X_enr, n_rows, pos, cmp, "enriched"
+    )
+  })
+  names(comp_enriched) <- .component_pred_cols(stat_components, "enriched")
+
+  c(
+    list(pred_base = raw_base, pred_enriched = raw_enriched),
+    comp_base,
+    comp_enriched
+  )
+}
+
+# ------------------------------------------------------------------------------
+# .predict_one_component
+#
+# Score a single stat component for one position, tolerating the two legitimate
+# forms R/24 can leave in models_components_*:
+#
+#   - a fitted cv.glmnet object  -> predict at lambda.min, same as the scalars
+#   - a bare numeric constant    -> the component was short-circuited (its
+#     nonzero fraction fell below MIN_COMPONENT_NONZERO_FRAC), so R/24 stored
+#     the constant it collapsed to instead of fitting. Recycling that constant
+#     across every row IS the model's prediction.
+#   - NULL                       -> treated as a zero constant, warned once, on
+#     the reading that an absent model for a degenerate component means the
+#     component contributes nothing.
+#
+# Anything else stops. A silent wrong-shaped prediction here would flow into
+# scoring and be invisible, so an unrecognised storage form is a hard error
+# with the object class named, not a guess.
+# ------------------------------------------------------------------------------
+.predict_one_component <- function(mdl, X, n_rows, pos, component, variant) {
+
+  if (is.null(mdl)) {
+    warning(glue(
+      "No component model for {pos} / {component} ({variant}); predicting 0 ",
+      "for all rows. Expected either a fitted model or a stored constant. ",
+      "Verify R/24's short-circuit path if this is unexpected."
+    ), call. = FALSE)
+    return(rep(0, n_rows))
+  }
+
+  if (inherits(mdl, c("cv.glmnet", "glmnet"))) {
+    return(as.vector(stats::predict(mdl, newx = X, s = "lambda.min")))
+  }
+
+  if (is.numeric(mdl) && length(mdl) == 1L) {
+    return(rep(as.numeric(mdl), n_rows))
+  }
+
+  if (is.list(mdl) && !is.null(mdl$constant) &&
+      is.numeric(mdl$constant) && length(mdl$constant) == 1L) {
+    return(rep(as.numeric(mdl$constant), n_rows))
+  }
+
+  stop(glue(
+    "Unrecognised component model form for {pos} / {component} ({variant}): ",
+    "class {paste(class(mdl), collapse = '/')}, length {length(mdl)}. ",
+    "R/39 handles a fitted cv.glmnet, a length-1 numeric constant, or a list ",
+    "with a numeric $constant. Inspect ",
+    "str(models$models_components_{variant}${pos}${component}) and extend ",
+    ".predict_one_component() to match."
+  ), call. = FALSE)
 }
 
 # ------------------------------------------------------------------------------
@@ -357,13 +513,48 @@ R39_SCHEMA_TAG <- "s3_r39_v1"
 
   models <- readRDS(models_path)
   required_slots <- c("models_base", "models_enriched",
-                      "base_feature_cols", "impute_medians")
+                      "base_feature_cols", "impute_medians",
+                      "models_components_base", "models_components_enriched",
+                      "stat_components")
   missing_slots <- setdiff(required_slots, names(models))
   if (length(missing_slots) > 0L) {
     stop(glue(
       "Models object is missing required slot(s): ",
       "{paste(missing_slots, collapse = ', ')}.\n",
-      "Expected the train_translation_model() return structure."
+      "Expected the train_translation_model() return structure. The component ",
+      "slots arrived with the Wave A2 R/24 rewrite; a models file predating it ",
+      "will fail here. Regenerate with run_week10_pipeline()."
+    ), call. = FALSE)
+  }
+
+  # Every position must carry every component in both variants. A partially
+  # populated component list would produce a ragged output schema, which the
+  # select() at bind time would turn into a confusing missing-column error far
+  # from the real cause. Catch it here and name the gaps.
+  stat_components <- models$stat_components
+  if (length(stat_components) == 0L) {
+    stop("models$stat_components is empty; nothing to score.", call. = FALSE)
+  }
+
+  comp_gaps <- character(0)
+  for (variant in c("base", "enriched")) {
+    slot <- models[[paste0("models_components_", variant)]]
+    for (pos in POSITIONS) {
+      have <- names(slot[[pos]])
+      gap  <- setdiff(stat_components, have)
+      if (length(gap) > 0L) {
+        comp_gaps <- c(comp_gaps, glue(
+          "  {variant} / {pos}: {paste(gap, collapse = ', ')}"
+        ))
+      }
+    }
+  }
+  if (length(comp_gaps) > 0L) {
+    stop(glue(
+      "Component models missing for some position/component pairs:\n",
+      "{paste(comp_gaps, collapse = '\n')}\n\n",
+      "Every component in models$stat_components must be present for every ",
+      "position in both variants. Regenerate with run_week10_pipeline()."
     ), call. = FALSE)
   }
 
@@ -458,9 +649,16 @@ score_prediction_cohort <- function(
   features <- readr::read_csv(features_path, show_col_types = FALSE)
   loco     <- readRDS(loco_preds_path)
 
+  # Component vocabulary comes from the model object, never from a local copy.
+  stat_components <- models$stat_components
+  output_schema   <- .build_output_schema(stat_components)
+  component_cols  <- setdiff(output_schema, OUTPUT_SCHEMA_SCALAR)
+
   if (verbose) {
     message(glue("  Feature rows: {format(nrow(features), big.mark = ',')}"))
     message(glue("  LOCO rows:    {format(nrow(loco), big.mark = ',')}"))
+    message(glue("  Stat components ({length(stat_components)}): ",
+                 "{paste(stat_components, collapse = ', ')}"))
   }
 
   # --- Step 2: split prediction vs training in the feature matrix ---
@@ -508,7 +706,7 @@ score_prediction_cohort <- function(
       next
     }
 
-    preds <- .predict_cohort_ppg(pos_data, models, pos)
+    preds <- .predict_cohort_ppg(pos_data, models, pos, stat_components)
 
     # Training LOCO range for this position (clamp bound reference).
     loco_pos <- dplyr::filter(loco, .data$draft_position == pos)
@@ -534,7 +732,11 @@ score_prediction_cohort <- function(
       is_hit           = NA_integer_,
       peak_ppr_per_game = NA_real_,    # rookies have no career peak yet
       peak_career_year  = NA_integer_,
-      pred_type        = "final_model"
+      pred_type        = "final_model",
+      # Wave A2 component predictions, spliced in under the same names R/24
+      # uses in loco_predictions so the training bind needs no renaming.
+      # component_cols is built once above from the model's own vocabulary.
+      !!!preds[component_cols]
     )
 
     # Distribution shape for both variants (min/median/mean/max).
@@ -612,34 +814,56 @@ score_prediction_cohort <- function(
   # --- Step 4: bring training LOCO predictions through unchanged ---
   if (verbose) message("\n[5/6] Carrying training LOCO predictions through...")
 
+  # Component predictions for training rows are COPIED, never recomputed. These
+  # players were in the fit, so re-scoring them against the final model would
+  # make them in-sample and break the same backtest guarantee the scalar
+  # columns preserve. The LOCO file's component columns are the honest
+  # out-of-sample ones and are carried through untouched.
   loco_cols_needed <- c("nfl_gsis_id", "draft_year", "draft_position",
                         "ppr_per_game_y13", "pred_base", "pred_enriched",
-                        "is_hit", "peak_ppr_per_game", "peak_career_year")
+                        "is_hit", "peak_ppr_per_game", "peak_career_year",
+                        .component_pred_cols(stat_components, "base"),
+                        .component_pred_cols(stat_components, "enriched"))
   missing_loco <- setdiff(loco_cols_needed, names(loco))
   if (length(missing_loco) > 0L) {
     stop(glue(
       "LOCO predictions file missing expected column(s): ",
-      "{paste(missing_loco, collapse = ', ')}.\n  {loco_preds_path}"
+      "{paste(missing_loco, collapse = ', ')}.\n  {loco_preds_path}\n",
+      "Component columns arrived with the Wave A2 R/24 rewrite; a predictions ",
+      "file predating it will fail here. Regenerate with run_week10_pipeline()."
     ), call. = FALSE)
   }
 
   training_preds <- loco |>
     dplyr::select(dplyr::all_of(loco_cols_needed)) |>
-    dplyr::mutate(
-      pred_type  = "loco",
-      # Training players have all played, so nfl_gsis_id is the natural uid.
-      # The LOCO file carries no name, so a synthetic cannot be built here; a
-      # training row with NA gsis is a data fault, surfaced below rather than
-      # silently carried as an NA key.
-      player_uid = as.character(nfl_gsis_id)
-    )
+    dplyr::mutate(pred_type = "loco")
+
+  # player_uid: prefer the key R/24 built upstream, where cfb_player_name is
+  # available and a synthetic can be constructed for a gsis-less player. Fall
+  # back to nfl_gsis_id only for a LOCO file predating that change, which
+  # cannot key those rows at all -- the fallback is compatibility, not a
+  # correct path, and it warns below when it leaves an NA behind.
+  if ("player_uid" %in% names(loco)) {
+    training_preds$player_uid <- as.character(loco$player_uid)
+    if (verbose) message("  player_uid: read from LOCO file (R/24 upstream).")
+  } else {
+    training_preds$player_uid <- as.character(loco$nfl_gsis_id)
+    if (verbose) {
+      message(
+        "  player_uid: LOCO file carries none; derived from nfl_gsis_id. ",
+        "Regenerate R/24 to get upstream keys for gsis-less training rows."
+      )
+    }
+  }
 
   na_uid_train <- sum(is.na(training_preds$player_uid))
   if (na_uid_train > 0L) {
     warning(glue(
-      "{na_uid_train} training LOCO row(s) have NA nfl_gsis_id and therefore ",
-      "NA player_uid. Training players should always carry a gsis; inspect ",
-      "the LOCO predictions file."
+      "{na_uid_train} training LOCO row(s) have NA player_uid. If the LOCO ",
+      "file carries a player_uid column, R/24 failed to build one (likely an ",
+      "NA cfb_player_name on a gsis-less row). If it does not, regenerate ",
+      "R/24: the nfl_gsis_id fallback cannot key a player who never reached ",
+      "an NFL roster."
     ), call. = FALSE)
   }
 
@@ -650,7 +874,7 @@ score_prediction_cohort <- function(
 
   # --- Step 5: bind, order, sanity-check ---
   augmented <- dplyr::bind_rows(training_preds, rookie_preds) |>
-    dplyr::select(dplyr::all_of(OUTPUT_SCHEMA))
+    dplyr::select(dplyr::all_of(output_schema))
 
   # player_uid is the join key downstream and must be unique within the file. A
   # collision means two rows will fan out on join -- exactly the failure mode
@@ -690,6 +914,41 @@ score_prediction_cohort <- function(
                    "{format(type_counts$n[i], big.mark = ',')}"))
     }
     message(glue("    total: {format(nrow(augmented), big.mark = ',')}"))
+  }
+
+  # --- Component sanity: negative predictions -----------------------------
+  # Elastic net is unconstrained, so a component model can predict a negative
+  # number of receptions or yards for a low-projection player. That is not a
+  # bug in R/39 and it is NOT clamped here: clamping is a modelling decision
+  # about R/24's component models and belongs with Christian, not buried in a
+  # scoring script. It is reported instead, because a negative stat line will
+  # flow into any scoring a consumer applies and would otherwise be invisible.
+  #
+  # Note the sign asymmetry: a negative interception prediction ADDS points
+  # under any scoring with a negative pass_int, so this is not merely cosmetic.
+  neg_counts <- vapply(component_cols, function(cl) {
+    sum(augmented[[cl]] < 0, na.rm = TRUE)
+  }, integer(1))
+  neg_counts <- neg_counts[neg_counts > 0L]
+
+  if (verbose) {
+    if (length(neg_counts) == 0L) {
+      message("\n  No negative component predictions.")
+    } else {
+      message(glue(
+        "\n  NEGATIVE component predictions in {length(neg_counts)} column(s) ",
+        "(not clamped, reported only):"
+      ))
+      neg_tbl <- tibble::tibble(
+        column = names(neg_counts),
+        n_negative = as.integer(neg_counts),
+        min_value = round(vapply(names(neg_counts), function(cl) {
+          min(augmented[[cl]], na.rm = TRUE)
+        }, numeric(1)), 3)
+      ) |>
+        dplyr::arrange(dplyr::desc(.data$n_negative))
+      print(as.data.frame(neg_tbl))
+    }
   }
 
   # --- Step 6: write ---

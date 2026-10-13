@@ -7,8 +7,9 @@
 # --------
 #   .compute_volume_implied_ppg  -- schema, sack adjustment, QB gets NA,
 #                                   WR formula correctness
-#   .determine_blend_weights     -- QB always 0, known prior_source mapping,
-#                                   unrecognized falls back to DEFAULT
+#   .determine_blend_weights     -- QB w/o depth info 0, QB1 uses QB table,
+#                                   known prior_source mapping, unrecognized
+#                                   falls back to DEFAULT
 #   .blend_projections           -- blend equation, NA volume -> weight 0,
 #                                   negative clamp, interval shift width
 #   .apply_qb_depth_discount     -- QB1=1.0 no change, QB2=0.15 uses r29_mu,
@@ -22,8 +23,8 @@
 #   .blend_projections expects columns already renamed from R/29 conventions:
 #     posterior_mu -> r29_posterior_mu (done by orchestrator before calling blend)
 #   .apply_qb_depth_discount receives depth_position pre-joined into reconciled.
-#   The r31 argument to .apply_qb_depth_discount is unused in the function body
-#   (kept for signature symmetry) so tests pass an empty tibble.
+#   The former r31 argument was removed from .apply_qb_depth_discount (it was
+#   never used in the function body), so tests call it with reconciled only.
 #
 # DEPENDENCIES
 # ------------
@@ -46,6 +47,8 @@ suppressPackageStartupMessages({
 # ==============================================================================
 
 #' Build a minimal R/31 alloc tibble for .compute_volume_implied_ppg.
+#' team + depth_position are required by the v3 QB1-anchor path; NA depth
+#' means "not an anchored QB1", which keeps the legacy expectations valid.
 make_alloc_r32 <- function(gsis_ids             = c("00-wr", "00-rb", "00-qb"),
                             positions            = c("WR", "RB", "QB"),
                             expected_targets_pg  = c(8.0, 3.0, 0.0),
@@ -53,9 +56,26 @@ make_alloc_r32 <- function(gsis_ids             = c("00-wr", "00-rb", "00-qb"),
   tibble::tibble(
     nfl_gsis_id         = gsis_ids,
     position            = positions,
+    team                = rep("KC", length(gsis_ids)),
+    depth_position      = rep(NA_character_, length(gsis_ids)),
     expected_targets_pg = expected_targets_pg,
     expected_carries_pg = expected_carries_pg
   )
+}
+
+#' Empty R/30 team-volume frame: no QB anchor fires, WR/RB paths unaffected.
+make_team_vol_r32 <- function() {
+  tibble::tibble(
+    team                  = character(),
+    qb_id                 = character(),
+    projected_pass_yds_pg = numeric(),
+    projected_pass_tds_pg = numeric()
+  )
+}
+
+#' Minimal QB rush-efficiency row (values irrelevant for non-anchored tests).
+make_qb_rush_eff_r32 <- function() {
+  list(yards_per_carry = 5.0, td_per_carry = 0.02)
 }
 
 #' Build a minimal R/29 tibble for .determine_blend_weights.
@@ -136,7 +156,7 @@ make_reconciled_r32 <- function(gsis_ids        = "00-qb1",
 
 test_that("[R/32] .compute_volume_implied_ppg returns required schema columns", {
   alloc <- make_alloc_r32()
-  out   <- .compute_volume_implied_ppg(alloc)
+  out   <- .compute_volume_implied_ppg(alloc, make_team_vol_r32(), make_qb_rush_eff_r32())
   expect_true(all(c("nfl_gsis_id", "r31_true_targets_pg",
                      "volume_implied_ppg_v2") %in% names(out)),
     info = paste("Missing:", setdiff(c("nfl_gsis_id", "r31_true_targets_pg",
@@ -146,14 +166,14 @@ test_that("[R/32] .compute_volume_implied_ppg returns required schema columns", 
 test_that("[R/32] .compute_volume_implied_ppg r31_true_targets_pg applies SACK_ADJUSTMENT to expected_targets_pg", {
   alloc <- make_alloc_r32(gsis_ids = "00-wr", positions = "WR",
                            expected_targets_pg = 8.0, expected_carries_pg = 0.0)
-  out   <- .compute_volume_implied_ppg(alloc)
+  out   <- .compute_volume_implied_ppg(alloc, make_team_vol_r32(), make_qb_rush_eff_r32())
   expect_equal(out$r31_true_targets_pg, 8.0 * SACK_ADJUSTMENT, tolerance = 1e-10)
 })
 
 test_that("[R/32] .compute_volume_implied_ppg QB gets NA volume_implied_ppg_v2 (not in RECON_POSITIONS)", {
   alloc <- make_alloc_r32(gsis_ids = "00-qb", positions = "QB",
                            expected_targets_pg = 0.0, expected_carries_pg = 0.0)
-  out   <- .compute_volume_implied_ppg(alloc)
+  out   <- .compute_volume_implied_ppg(alloc, make_team_vol_r32(), make_qb_rush_eff_r32())
   expect_true(is.na(out$volume_implied_ppg_v2),
     info = "QB is excluded from RECON_POSITIONS -- volume_implied must be NA")
 })
@@ -169,7 +189,7 @@ test_that("[R/32] .compute_volume_implied_ppg WR implied PPG matches ppr_per_tar
 
   alloc <- make_alloc_r32(gsis_ids = "00-wr", positions = "WR",
                            expected_targets_pg = 8.0, expected_carries_pg = 0.0)
-  out   <- .compute_volume_implied_ppg(alloc)
+  out   <- .compute_volume_implied_ppg(alloc, make_team_vol_r32(), make_qb_rush_eff_r32())
   expect_equal(out$volume_implied_ppg_v2, expected_implied, tolerance = 1e-10)
 })
 
@@ -178,41 +198,59 @@ test_that("[R/32] .compute_volume_implied_ppg WR implied PPG matches ppr_per_tar
 # .determine_blend_weights
 # ==============================================================================
 
-test_that("[R/32] .determine_blend_weights QB position always gets weight 0 regardless of prior_source", {
+test_that("[R/32] .determine_blend_weights QB without depth info gets weight 0 regardless of prior_source", {
   r29 <- make_r29_r32(gsis_ids = c("00-q1", "00-q2"),
                        positions = c("QB", "QB"),
-                       prior_source = c("blended", "translation_only"))
-  out <- .determine_blend_weights(r29)
+                       prior_source = c("veteran_history_only", "translation_active"))
+  # r31 with no depth_position / committee_group columns: QBs cannot be
+  # identified as QB1s, so the QB anchor never fires and weight is 0.
+  r31 <- tibble::tibble(nfl_gsis_id = c("00-q1", "00-q2"))
+  out <- .determine_blend_weights(r29, r31)
   expect_true(all(out$blend_weight_r31 == 0),
-    info = "QBs must always get blend_weight_r31 = 0")
+    info = "QBs without depth info must get blend_weight_r31 = 0")
+})
+
+test_that("[R/32] .determine_blend_weights QB1 depth uses the QB blend table (fallback = QB_DEFAULT_WEIGHT)", {
+  known_key <- names(QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE)[1]
+  r29 <- make_r29_r32(gsis_ids  = c("00-q1", "00-q2"),
+                       positions = c("QB", "QB"),
+                       prior_source = c(known_key, "unknown_source"))
+  r31 <- tibble::tibble(nfl_gsis_id    = c("00-q1", "00-q2"),
+                        depth_position = c("QB1", "QB1"))
+  # Unknown prior_source on a QB1 triggers the drift-guard warning by design.
+  out <- suppressWarnings(.determine_blend_weights(r29, r31))
+  expect_equal(unname(out$blend_weight_r31[out$nfl_gsis_id == "00-q1"]),
+               unname(QB_BLEND_WEIGHTS_BY_PRIOR_SOURCE[[known_key]]))
+  expect_equal(unname(out$blend_weight_r31[out$nfl_gsis_id == "00-q2"]),
+               QB_DEFAULT_WEIGHT)
 })
 
 test_that("[R/32] .determine_blend_weights maps recognized prior_source values correctly", {
+  keys <- names(BLEND_WEIGHTS_BY_PRIOR_SOURCE)
+  ids  <- sprintf("00-%02d", seq_along(keys))
   r29 <- make_r29_r32(
-    gsis_ids     = c("00-a", "00-b", "00-c", "00-d", "00-e"),
-    positions    = c("WR", "WR", "RB", "TE", "WR"),
-    prior_source = c("blended", "veteran_history_only", "history_only_fallback",
-                     "translation_only", "score_final_fallback")
+    gsis_ids     = ids,
+    positions    = rep("WR", length(keys)),
+    prior_source = keys
   )
-  out <- .determine_blend_weights(r29)
-  expect_equal(unname(out %>% dplyr::filter(nfl_gsis_id == "00-a") %>%
-                 dplyr::pull(blend_weight_r31)), 0.30)
-  expect_equal(unname(out %>% dplyr::filter(nfl_gsis_id == "00-b") %>%
-                 dplyr::pull(blend_weight_r31)), 0.45)
-  expect_equal(unname(out %>% dplyr::filter(nfl_gsis_id == "00-c") %>%
-                 dplyr::pull(blend_weight_r31)), 0.55)
-  expect_equal(unname(out %>% dplyr::filter(nfl_gsis_id == "00-d") %>%
-                 dplyr::pull(blend_weight_r31)), 0.65)
-  expect_equal(unname(out %>% dplyr::filter(nfl_gsis_id == "00-e") %>%
-                 dplyr::pull(blend_weight_r31)), 0.85)
+  r31 <- tibble::tibble(nfl_gsis_id = ids)
+  out <- .determine_blend_weights(r29, r31)
+  for (i in seq_along(keys)) {
+    expect_equal(
+      unname(out$blend_weight_r31[out$nfl_gsis_id == ids[i]]),
+      unname(BLEND_WEIGHTS_BY_PRIOR_SOURCE[[keys[i]]]),
+      info = paste0("prior_source = ", keys[i])
+    )
+  }
 })
 
 test_that("[R/32] .determine_blend_weights unrecognized prior_source falls back to DEFAULT_R31_WEIGHT", {
   r29 <- make_r29_r32(gsis_ids = "00-x", positions = "WR",
                        prior_source = "completely_unknown_source")
-  out <- .determine_blend_weights(r29)
+  r31 <- tibble::tibble(nfl_gsis_id = "00-x")
+  out <- .determine_blend_weights(r29, r31)
   expect_equal(unname(out$blend_weight_r31), DEFAULT_R31_WEIGHT,
-    info = "Unrecognized prior_source should fall back to DEFAULT_R31_WEIGHT (0.50)")
+    info = "Unrecognized prior_source should fall back to DEFAULT_R31_WEIGHT")
 })
 
 
@@ -279,7 +317,7 @@ test_that("[R/32] .blend_projections intervals shift by r32_delta and preserve w
 test_that("[R/32] .apply_qb_depth_discount QB1 gets factor 1.0 and r32_mu is unchanged", {
   rec <- make_reconciled_r32(position = "QB", depth_position = "QB1",
                                r29_mu = 25.0, r32_mu = 25.0)
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_equal(out$qb_discount_factor, QB_DEPTH_DISCOUNT_MULT[["QB1"]])
   expect_equal(out$r32_posterior_mu, 25.0, tolerance = 1e-10,
     info = "QB1 factor = 1.0 means no change to r32_posterior_mu")
@@ -288,7 +326,7 @@ test_that("[R/32] .apply_qb_depth_discount QB1 gets factor 1.0 and r32_mu is unc
 test_that("[R/32] .apply_qb_depth_discount QB2 gets factor 0.15 applied to r29_posterior_mu", {
   rec <- make_reconciled_r32(position = "QB", depth_position = "QB2",
                                r29_mu = 24.0, r32_mu = 24.0)
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_equal(out$qb_discount_factor, QB_DEPTH_DISCOUNT_MULT[["QB2"]])
   expect_equal(out$r32_posterior_mu,
     24.0 * QB_DEPTH_DISCOUNT_MULT[["QB2"]],
@@ -299,7 +337,7 @@ test_that("[R/32] .apply_qb_depth_discount QB2 gets factor 0.15 applied to r29_p
 test_that("[R/32] .apply_qb_depth_discount QB3 gets factor 0.05", {
   rec <- make_reconciled_r32(position = "QB", depth_position = "QB3",
                                r29_mu = 22.0, r32_mu = 22.0)
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_equal(out$qb_discount_factor, QB_DEPTH_DISCOUNT_MULT[["QB3"]])
   expect_equal(out$r32_posterior_mu,
     22.0 * QB_DEPTH_DISCOUNT_MULT[["QB3"]],
@@ -309,7 +347,7 @@ test_that("[R/32] .apply_qb_depth_discount QB3 gets factor 0.05", {
 test_that("[R/32] .apply_qb_depth_discount non-QB position gets NA factor and r32_mu unchanged", {
   rec <- make_reconciled_r32(position = "WR", depth_position = "WR1",
                                r29_mu = 16.0, r32_mu = 15.0)
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_true(is.na(out$qb_discount_factor),
     info = "Non-QB players must get qb_discount_factor = NA")
   expect_equal(out$r32_posterior_mu, 15.0, tolerance = 1e-10,
@@ -319,7 +357,7 @@ test_that("[R/32] .apply_qb_depth_discount non-QB position gets NA factor and r3
 test_that("[R/32] .apply_qb_depth_discount QB with NA depth_position gets NA factor (no R/31 record)", {
   rec <- make_reconciled_r32(position = "QB", depth_position = NA_character_,
                                r29_mu = 20.0, r32_mu = 20.0)
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_true(is.na(out$qb_discount_factor),
     info = "QB with no R/31 depth record should get NA factor (kept at R/29)")
   expect_equal(out$r32_posterior_mu, 20.0, tolerance = 1e-10)
@@ -327,7 +365,7 @@ test_that("[R/32] .apply_qb_depth_discount QB with NA depth_position gets NA fac
 
 test_that("[R/32] .apply_qb_depth_discount removes depth_position column from output", {
   rec <- make_reconciled_r32(position = "QB", depth_position = "QB1")
-  out <- .apply_qb_depth_discount(rec, tibble::tibble())
+  out <- .apply_qb_depth_discount(rec)
   expect_false("depth_position" %in% names(out),
     info = "depth_position is a working join column and must be removed from output")
 })

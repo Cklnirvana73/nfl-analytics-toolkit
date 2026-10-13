@@ -77,8 +77,12 @@ library(here)
 # Sleeper API base URL -- no trailing slash
 SLEEPER_BASE_URL <- "https://api.sleeper.app/v1"
 
-# Most recently completed NFL regular season.
-# Update to 2027 when the 2027 season completes.
+# The NFL season the toolkit is currently operating on. This is the season
+# passed to Sleeper league lookups, so during the 2026 season it must read
+# 2026, not the most recently COMPLETED season. Update to 2027 when the 2027
+# league year opens on Sleeper.
+# (A prior comment here described this as the most recently completed season,
+# which contradicted the value. The value was and is correct.)
 CURRENT_NFL_SEASON <- 2026L
 
 # Cache directory -- shared with R/15 and R/16 pipeline artifacts
@@ -1854,5 +1858,181 @@ get_user_leagues <- function(username, season = CURRENT_NFL_SEASON) {
   })
 
   message(glue("  {nrow(leagues_tbl)} league(s) found for season {season}."))
+
+  # The resolved Sleeper user_id is carried back as an attribute so callers do
+  # not have to re-hit /user/{username} just to join rosters by owner_id.
+  # Retrieve with attr(leagues_tbl, "sleeper_user_id"). Attributes survive the
+  # tibble print and are dropped by dplyr verbs, so read it before filtering.
+  attr(leagues_tbl, "sleeper_user_id") <- user_id
+  attr(leagues_tbl, "sleeper_display_name") <- display_name
+
   return(leagues_tbl)
+}
+
+
+# ==============================================================================
+# NFL STATE AND ROSTER OWNERSHIP
+# ==============================================================================
+
+#' Get the current NFL state from Sleeper
+#'
+#' Wraps GET /state/nfl. This is the only source in the toolkit for "what week
+#' is it right now" -- nothing else calls it, and nflverse data lags live games,
+#' so it cannot be inferred from pbp.
+#'
+#' Field semantics, confirmed against a live response:
+#'   week          -- the week Sleeper is currently scoring or about to score
+#'   display_week  -- the week Sleeper shows in its UI. Diverges from `week`
+#'                    between the end of a week's games and the rollover, and
+#'                    during the postseason.
+#'   leg           -- the leg within the season_type
+#'   season_type   -- "pre", "regular", or "post"
+#'   season        -- character, e.g. "2026"
+#'
+#' For start/sit the week you want to SET a lineup for is `display_week`
+#' during the regular season, because it advances ahead of `week` once the
+#' current week's games are done. This function returns both and leaves the
+#' choice to the caller.
+#'
+#' @return A list with season (integer), season_type, week (integer),
+#'   display_week (integer), and leg (integer). NULL if the request fails.
+#'
+#' @examples
+#' st <- get_nfl_state()
+#' st$display_week
+#'
+#' @export
+get_nfl_state <- function() {
+
+  raw <- .sleeper_get("/state/nfl")
+
+  if (is.null(raw)) {
+    warning("Could not reach Sleeper /state/nfl.", call. = FALSE)
+    return(NULL)
+  }
+
+  .int <- function(x) {
+    v <- suppressWarnings(as.integer(x %||% NA))
+    if (length(v) == 0L) NA_integer_ else v[[1L]]
+  }
+
+  out <- list(
+    season       = .int(raw$season),
+    season_type  = as.character(raw$season_type %||% NA_character_),
+    week         = .int(raw$week),
+    display_week = .int(raw$display_week),
+    leg          = .int(raw$leg)
+  )
+
+  message(glue(
+    "NFL state: {out$season} {out$season_type} | ",
+    "week {out$week} | display_week {out$display_week}"
+  ))
+
+  out
+}
+
+
+#' Resolve which roster in a league belongs to a user
+#'
+#' Joins get_sleeper_rosters() on owner_id. Returns a single roster_id.
+#'
+#' Co-ownership is NOT handled: Sleeper records co-owners in a separate
+#' co_owners field that get_sleeper_rosters() does not parse, so a co-owned
+#' roster whose primary owner is someone else will not be found here. If this
+#' function ever returns more than one match, or zero for a league you know you
+#' are in, that is the reason and R/19 needs the co_owners field parsed.
+#'
+#' @param league_id Character or numeric Sleeper league id.
+#' @param user_id Character Sleeper user_id (NOT the username). Get it from
+#'   attr(get_user_leagues(...), "sleeper_user_id").
+#' @param rosters Optional. An already-fetched get_sleeper_rosters() tibble for
+#'   this league, to avoid a second API call.
+#'
+#' @return Integer roster_id, or NA_integer_ if no roster matches.
+#'
+#' @examples
+#' lg  <- get_user_leagues("YOUR_SLEEPER_USERNAME")
+#' uid <- attr(lg, "sleeper_user_id")
+#' resolve_user_roster_id(lg$league_id[1], uid)
+#'
+#' @export
+resolve_user_roster_id <- function(league_id, user_id, rosters = NULL) {
+
+  league_id <- as.character(league_id)
+  user_id   <- as.character(user_id)
+
+  if (is.na(user_id) || nchar(user_id) == 0L) {
+    stop("user_id is required and must be a Sleeper user_id, not a username.",
+         call. = FALSE)
+  }
+
+  rosters <- rosters %||% get_sleeper_rosters(league_id)
+
+  if (is.null(rosters) || nrow(rosters) == 0L) {
+    warning(glue("No rosters returned for league {league_id}."), call. = FALSE)
+    return(NA_integer_)
+  }
+
+  matched <- unique(rosters$roster_id[rosters$owner_id %in% user_id])
+  matched <- matched[!is.na(matched)]
+
+  if (length(matched) == 0L) {
+    warning(glue(
+      "User {user_id} owns no roster in league {league_id}. ",
+      "If this league is co-owned, get_sleeper_rosters() does not parse ",
+      "Sleeper's co_owners field."
+    ), call. = FALSE)
+    return(NA_integer_)
+  }
+
+  if (length(matched) > 1L) {
+    warning(glue(
+      "User {user_id} matched {length(matched)} rosters in league ",
+      "{league_id}; using the first. This should not happen in a standard ",
+      "league."
+    ), call. = FALSE)
+  }
+
+  as.integer(matched[[1L]])
+}
+
+
+#' Attach each league's user roster_id to a league table
+#'
+#' Convenience wrapper: takes the get_user_leagues() tibble and adds a
+#' user_roster_id column, which is the remaining argument build_league_source()
+#' needs. One API call per league.
+#'
+#' @param leagues The tibble returned by get_user_leagues().
+#' @param user_id Character user_id. Defaults to the attribute
+#'   get_user_leagues() attached.
+#'
+#' @return `leagues` with an integer user_roster_id column added.
+#'
+#' @export
+attach_user_roster_ids <- function(leagues,
+                                   user_id = attr(leagues, "sleeper_user_id")) {
+
+  if (is.null(leagues) || nrow(leagues) == 0L) {
+    stop("leagues is empty.", call. = FALSE)
+  }
+  if (is.null(user_id) || is.na(user_id)) {
+    stop("user_id not supplied and not present as an attribute on `leagues`. ",
+         "Pass it explicitly.", call. = FALSE)
+  }
+
+  ids <- vapply(leagues$league_id, function(id) {
+    resolve_user_roster_id(id, user_id)
+  }, integer(1), USE.NAMES = FALSE)
+
+  leagues$user_roster_id <- ids
+
+  n_missing <- sum(is.na(ids))
+  if (n_missing > 0L) {
+    warning(glue("{n_missing} league(s) resolved to no user roster."),
+            call. = FALSE)
+  }
+
+  leagues
 }

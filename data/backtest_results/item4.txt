@@ -1,0 +1,68 @@
+=== COEFFICIENTS ===
+$WR
+$WR$catch_rate
+[1] 0.6306887
+
+$WR$yards_per_catch
+[1] 12.56268
+
+$WR$td_per_target
+[1] 0.04808782
+
+$WR$yards_per_carry
+[1] 0
+
+$WR$td_per_carry
+[1] 0
+
+
+$TE
+$TE$catch_rate
+[1] 0.7076785
+
+$TE$yards_per_catch
+[1] 10.29607
+
+$TE$td_per_target
+[1] 0.05184052
+
+$TE$yards_per_carry
+[1] 0
+
+$TE$td_per_carry
+[1] 0
+
+
+$RB
+$RB$catch_rate
+[1] 0.7789642
+
+$RB$yards_per_catch
+[1] 7.391611
+
+$RB$td_per_target
+[1] 0.03011509
+
+$RB$yards_per_carry
+[1] 4.304719
+
+$RB$td_per_carry
+[1] 0.03081465
+
+
+
+=== ORACLE ===
+# A tibble: 2 × 5
+  position     n mae_r29 mae_vol mae_oracle
+  <chr>    <int>   <dbl>   <dbl>      <dbl>
+1 TE         311    2.50    3.57       1.66
+2 WR         638    2.73    3.61       1.38
+
+=== TE TIERS ===
+# A tibble: 4 × 5
+   tier     n   act   vol   r29
+  <int> <int> <dbl> <dbl> <dbl>
+1     1    78 14.8   8.01 10.5 
+2     2    78  9.2   6.44  8.01
+3     3    78  5.94  4.46  5.67
+4     4    77  3.47  4.01  4.36

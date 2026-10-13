@@ -33,14 +33,14 @@
 #' @param week_min Optional. Minimum week number (inclusive)
 #' @param week_max Optional. Maximum week number (inclusive)
 #' 
-#' @param use_tiered_ppr Use tiered PPR scoring based on reception yardage (default = TRUE)
-#' @param te_premium Add 0.5 points per TE reception (default = TRUE)
-#' @param rush_att_bonus Points per rushing attempt (default = 0.25)
-#' 
+#' @param use_tiered_ppr Use tiered PPR scoring based on reception yardage (default = FALSE)
+#' @param te_premium Add 0.5 points per TE reception (default = FALSE)
+#' @param rush_att_bonus Points per rushing attempt (default = 0)
+#'
 #' @param pass_yd Points per passing yard (default = 0.04)
-#' @param pass_td Points per passing TD (default = 6)
+#' @param pass_td Points per passing TD (default = 4)
 #' @param pass_int Points per interception (default = -2)
-#' @param pick6_penalty Additional penalty when INT returned for TD (default = -4)
+#' @param pick6_penalty Additional penalty when INT returned for TD (default = 0)
 #' 
 #' @param rush_yd Points per rushing yard (default = 0.1)
 #' @param rush_td Points per rushing TD (default = 6)
@@ -74,15 +74,16 @@
 #' **Rush Attempt Bonus:**
 #' 
 #' Awards points per rushing attempt regardless of outcome. Common settings:
-#' - 0.25 pts/attempt (default, favors volume backs)
+#' - 0 pts/attempt (default, no bonus)
 #' - 0.1 pts/attempt (moderate bonus)
-#' - 0 pts/attempt (no bonus)
-#' 
+#' - 0.25 pts/attempt (favors volume backs)
+#'
 #' **Pick-6 Penalty:**
-#' 
+#'
 #' Additional penalty when a QB's interception is returned for a touchdown.
 #' Standard interception penalty PLUS pick-6 penalty = total deduction.
-#' Example: pass_int = -2, pick6_penalty = -4 → Pick-6 costs -6 total
+#' Default is 0 (no extra penalty). Example with a league that sets it:
+#' pass_int = -2, pick6_penalty = -4 means a pick-6 costs -6 total.
 #'
 #' **Two-Point Conversions:**
 #'
@@ -96,29 +97,26 @@
 #' **Quick League Setup Examples:**
 #' 
 #' ```r
-#' # League 1: Your default (tiered PPR, TE premium, 6pt pass TDs)
+#' # Default: flat full PPR (1 per reception, 4pt pass TDs, no bonuses)
 #' fantasy <- calculate_fantasy_points(pbp, roster)
-#' 
-#' # League 2: Standard scoring (no PPR, no bonuses, 4pt pass TDs)
+#'
+#' # Custom league: tiered PPR, TE premium, 6pt pass TDs, rush bonus, pick-6
 #' fantasy <- calculate_fantasy_points(pbp, roster,
-#'                                     use_tiered_ppr = FALSE,
-#'                                     te_premium = FALSE,
-#'                                     rush_att_bonus = 0,
-#'                                     ppr = 0,
-#'                                     pass_td = 4)
-#' 
-#' # League 3: Half-PPR with no bonuses
+#'                                     use_tiered_ppr = TRUE,
+#'                                     te_premium = TRUE,
+#'                                     rush_att_bonus = 0.25,
+#'                                     pass_td = 6,
+#'                                     pick6_penalty = -4)
+#'
+#' # Standard scoring (no PPR, no bonuses, 4pt pass TDs)
+#' fantasy <- calculate_fantasy_points(pbp, roster, ppr = 0)
+#'
+#' # Half-PPR with no bonuses
+#' fantasy <- calculate_fantasy_points(pbp, roster, ppr = 0.5)
+#'
+#' # Full PPR with high rush bonus
 #' fantasy <- calculate_fantasy_points(pbp, roster,
-#'                                     use_tiered_ppr = FALSE,
-#'                                     te_premium = FALSE,
-#'                                     rush_att_bonus = 0,
-#'                                     ppr = 0.5)
-#' 
-#' # League 4: Full PPR with high rush bonus
-#' fantasy <- calculate_fantasy_points(pbp, roster,
-#'                                     use_tiered_ppr = FALSE,
-#'                                     rush_att_bonus = 0.5,
-#'                                     ppr = 1)
+#'                                     rush_att_bonus = 0.5)
 #' ```
 #'
 #' @examples
@@ -126,8 +124,8 @@
 #' # Load data
 #' pbp <- load_and_validate_pbp(2024)
 #' roster <- get_roster_data(2024)
-#' 
-#' # Calculate with your default settings
+#'
+#' # Calculate with default flat PPR
 #' fantasy <- calculate_fantasy_points(pbp, roster, season = 2024)
 #' 
 #' # View top scorers
@@ -142,6 +140,33 @@
 #' \code{\link{calculate_rolling_stats}} for rolling averages on raw statistics
 #'
 #' @export
+#' Resolve one display name per player_id per season (internal)
+#'
+#' Most frequent spelling across the player's passer/rusher/receiver name
+#' appearances in the season; ties broken alphabetically. Added 2026-09-17 so
+#' player_name is an attribute of player_id, never a grouping key.
+#' @keywords internal
+.resolve_display_names <- function(pbp) {
+  dplyr::bind_rows(
+    pbp %>%
+      dplyr::filter(!is.na(passer_player_id), !is.na(passer_player_name)) %>%
+      dplyr::transmute(season, player_id = passer_player_id,
+                       player_name = passer_player_name),
+    pbp %>%
+      dplyr::filter(!is.na(rusher_player_id), !is.na(rusher_player_name)) %>%
+      dplyr::transmute(season, player_id = rusher_player_id,
+                       player_name = rusher_player_name),
+    pbp %>%
+      dplyr::filter(!is.na(receiver_player_id), !is.na(receiver_player_name)) %>%
+      dplyr::transmute(season, player_id = receiver_player_id,
+                       player_name = receiver_player_name)
+  ) %>%
+    dplyr::count(season, player_id, player_name, name = "n_appearances") %>%
+    dplyr::arrange(season, player_id, dplyr::desc(n_appearances), player_name) %>%
+    dplyr::distinct(season, player_id, .keep_all = TRUE) %>%
+    dplyr::select(season, player_id, player_name)
+}
+
 calculate_fantasy_points <- function(pbp_data,
                                      roster_data = NULL,
                                      season = NULL,
@@ -149,15 +174,20 @@ calculate_fantasy_points <- function(pbp_data,
                                      week_max = NULL,
                                      
                                      # Scoring features
-                                     use_tiered_ppr = TRUE,
-                                     te_premium = TRUE,
-                                     rush_att_bonus = 0.25,
-                                     
+                                     # [2026-09-30] Defaults are flat full PPR.
+                                     # Previously tiered PPR, TE premium, 0.25
+                                     # rush-attempt bonus, 6pt pass TD and -4
+                                     # pick-six: one league's settings, now
+                                     # passed explicitly when wanted.
+                                     use_tiered_ppr = FALSE,
+                                     te_premium = FALSE,
+                                     rush_att_bonus = 0,
+
                                      # Passing scoring
                                      pass_yd = 0.04,
-                                     pass_td = 6,
+                                     pass_td = 4,
                                      pass_int = -2,
-                                     pick6_penalty = -4,
+                                     pick6_penalty = 0,
                                      
                                      # Rushing scoring
                                      rush_yd = 0.1,
@@ -280,11 +310,18 @@ calculate_fantasy_points <- function(pbp_data,
     if (!"position" %in% names(roster_data)) {
       stop("roster_data must contain 'position' column")
     }
+    if (!"season" %in% names(roster_data)) {
+      stop("roster_data must contain 'season' column (position lookup is season-keyed)")
+    }
     
+    # Season-keyed lookup [2026-09-17]. Previously distinct(player_id) kept one
+    # row per player across ALL seasons supplied, so a multi-season roster
+    # assigned every season the first season's position. One row per
+    # season + player_id; the first roster row within a season is kept.
     position_lookup <- roster_data %>%
       filter(!is.na(gsis_id), !is.na(position)) %>%
-      select(player_id = gsis_id, actual_position = position) %>%
-      distinct(player_id, .keep_all = TRUE)
+      select(season, player_id = gsis_id, actual_position = position) %>%
+      distinct(season, player_id, .keep_all = TRUE)
     
     message(glue("  • Using roster data for {n_distinct(position_lookup$player_id)} players"))
   } else {
@@ -305,7 +342,10 @@ calculate_fantasy_points <- function(pbp_data,
   # Only proceed if there's passing data
   if (nrow(passing_fantasy) > 0) {
     passing_fantasy <- passing_fantasy %>%
-      group_by(season, week, game_id, passer_player_id, passer_player_name) %>%
+      # [2026-09-17] player_name removed from the grouping key. nflfastR spells
+      # some players differently across plays; grouping on name split one
+      # player-game into two rows. Grain: season, week, game_id, player_id.
+      group_by(season, week, game_id, passer_player_id) %>%
       summarise(
         position_inferred = "QB",
         team = last(posteam),
@@ -330,13 +370,15 @@ calculate_fantasy_points <- function(pbp_data,
         
         .groups = "drop"
       ) %>%
-      rename(player_id = passer_player_id, player_name = passer_player_name)
+      rename(player_id = passer_player_id)
     
     # Apply position lookup
     if (!is.null(position_lookup)) {
       passing_fantasy <- passing_fantasy %>%
-        left_join(position_lookup, by = "player_id") %>%
-        mutate(position = coalesce(actual_position, position_inferred)) %>%
+        # [2026-09-17] Season-keyed join. With a roster, position comes from
+        # the roster only; no match -> "UNK", never the inferred role.
+        left_join(position_lookup, by = c("season", "player_id")) %>%
+        mutate(position = coalesce(actual_position, "UNK")) %>%
         select(-actual_position, -position_inferred)
     } else {
       passing_fantasy <- passing_fantasy %>%
@@ -350,7 +392,6 @@ calculate_fantasy_points <- function(pbp_data,
       week = integer(),
       game_id = character(),
       player_id = character(),
-      player_name = character(),
       position = character(),
       team = character(),
       pass_yards = numeric(),
@@ -380,7 +421,10 @@ calculate_fantasy_points <- function(pbp_data,
     has_rush_attempt <- "rush_attempt" %in% names(rushing_fantasy)
     
     rushing_fantasy <- rushing_fantasy %>%
-      group_by(season, week, game_id, rusher_player_id, rusher_player_name) %>%
+      # [2026-09-17] player_name removed from the grouping key. nflfastR spells
+      # some players differently across plays; grouping on name split one
+      # player-game into two rows. Grain: season, week, game_id, player_id.
+      group_by(season, week, game_id, rusher_player_id) %>%
       summarise(
         position_inferred = "RB",
         team = last(posteam),
@@ -403,13 +447,15 @@ calculate_fantasy_points <- function(pbp_data,
         
         .groups = "drop"
       ) %>%
-      rename(player_id = rusher_player_id, player_name = rusher_player_name)
+      rename(player_id = rusher_player_id)
     
     # Apply position lookup
     if (!is.null(position_lookup)) {
       rushing_fantasy <- rushing_fantasy %>%
-        left_join(position_lookup, by = "player_id") %>%
-        mutate(position = coalesce(actual_position, position_inferred)) %>%
+        # [2026-09-17] Season-keyed join. With a roster, position comes from
+        # the roster only; no match -> "UNK", never the inferred role.
+        left_join(position_lookup, by = c("season", "player_id")) %>%
+        mutate(position = coalesce(actual_position, "UNK")) %>%
         select(-actual_position, -position_inferred)
     } else {
       rushing_fantasy <- rushing_fantasy %>%
@@ -423,7 +469,6 @@ calculate_fantasy_points <- function(pbp_data,
       week = integer(),
       game_id = character(),
       player_id = character(),
-      player_name = character(),
       position = character(),
       team = character(),
       rush_yards = numeric(),
@@ -465,7 +510,10 @@ calculate_fantasy_points <- function(pbp_data,
     }
     
     receiving_fantasy <- receiving_fantasy %>%
-      group_by(season, week, game_id, receiver_player_id, receiver_player_name) %>%
+      # [2026-09-17] player_name removed from the grouping key. nflfastR spells
+      # some players differently across plays; grouping on name split one
+      # player-game into two rows. Grain: season, week, game_id, player_id.
+      group_by(season, week, game_id, receiver_player_id) %>%
       summarise(
         position_inferred = "WR",
         team = last(posteam),
@@ -482,13 +530,15 @@ calculate_fantasy_points <- function(pbp_data,
         
         .groups = "drop"
       ) %>%
-      rename(player_id = receiver_player_id, player_name = receiver_player_name)
+      rename(player_id = receiver_player_id)
     
     # Apply position lookup (needed for TE premium)
     if (!is.null(position_lookup)) {
       receiving_fantasy <- receiving_fantasy %>%
-        left_join(position_lookup, by = "player_id") %>%
-        mutate(position = coalesce(actual_position, position_inferred)) %>%
+        # [2026-09-17] Season-keyed join. With a roster, position comes from
+        # the roster only; no match -> "UNK", never the inferred role.
+        left_join(position_lookup, by = c("season", "player_id")) %>%
+        mutate(position = coalesce(actual_position, "UNK")) %>%
         select(-actual_position, -position_inferred)
     } else {
       receiving_fantasy <- receiving_fantasy %>%
@@ -528,7 +578,6 @@ calculate_fantasy_points <- function(pbp_data,
       week = integer(),
       game_id = character(),
       player_id = character(),
-      player_name = character(),
       position = character(),
       team = character(),
       receptions = numeric(),
@@ -551,10 +600,18 @@ calculate_fantasy_points <- function(pbp_data,
     rushing_fantasy,
     receiving_fantasy
   ) %>%
-    group_by(season, week, game_id, player_id, player_name) %>%
+    # [2026-09-17] player_name removed from the grouping key (see role tables).
+    group_by(season, week, game_id, player_id) %>%
     summarise(
-      # Take position and team from most recent activity
+      # NOTE: last(position) does NOT return the player's position. The rows
+      # arrive in bind order passing -> rushing -> receiving, so last() returns
+      # the LAST ROLE TABLE the player appears in that game: "WR" if they had
+      # any target-credited reception row, else "RB" if they had any rush, else
+      # "QB". Without roster_data this labels a role, not a position (a QB who
+      # scrambles is "RB"; every TE is "WR"). With roster_data every role row
+      # already carries the same roster position (or "UNK"), so last() is safe.
       position = last(position),
+      # A game fixes the team, so last(team) within the player-game is safe.
       team = last(team),
       
       # Sum all fantasy point components
@@ -579,6 +636,31 @@ calculate_fantasy_points <- function(pbp_data,
       
       .groups = "drop"
     )
+
+  # ============================================================================
+  # ATTACH ONE DISPLAY NAME PER PLAYER PER SEASON [2026-09-17]
+  # ============================================================================
+
+  # Rule: the most frequent spelling of the player's name across that player's
+  # play-role appearances (passer, rusher, receiver name columns) in the season,
+  # counted on the scored plays (pbp_filtered). Ties broken alphabetically.
+  name_lookup <- .resolve_display_names(pbp_filtered)
+
+  all_fantasy <- all_fantasy %>%
+    left_join(name_lookup, by = c("season", "player_id")) %>%
+    relocate(player_name, .after = player_id)
+
+  if (!is.null(position_lookup)) {
+    unk_by_season <- all_fantasy %>%
+      group_by(season) %>%
+      summarise(n_unk = sum(position == "UNK"), .groups = "drop")
+    for (i in seq_len(nrow(unk_by_season))) {
+      message(glue(
+        "  • Season {unk_by_season$season[i]}: {unk_by_season$n_unk[i]} ",
+        "player-games with no roster match (position = 'UNK')"
+      ))
+    }
+  }
 
   # ============================================================================
   # ADD 2-PT CONVERSION POINTS (scored separately from yardage stats)

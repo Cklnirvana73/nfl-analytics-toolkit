@@ -1,0 +1,53 @@
+rows: 1816 
+# A tibble: 3 × 2
+  position     n
+  <chr>    <int>
+1 RB         497
+2 TE         443
+3 WR         876
+
+=== 1. TARGET SHARE spread ===
+# A tibble: 2 × 9
+  position     n mean_proj mean_act sd_proj sd_act sd_ratio slope   rho
+  <chr>    <int>     <dbl>    <dbl>   <dbl>  <dbl>    <dbl> <dbl> <dbl>
+1 TE         443    0.0748   0.0949  0.0479 0.06      0.798 0.711 0.566
+2 WR         876    0.132    0.135   0.0478 0.0755    0.633 0.805 0.491
+
+=== 2. RUSH SHARE, RB ===
+# A tibble: 1 × 4
+      n sd_ratio slope   rho
+  <int>    <dbl> <dbl> <dbl>
+1   497    0.891 0.737  0.67
+
+=== 3. BY DEPTH RANK ===
+# A tibble: 8 × 6
+  position depth_rank     n   proj    act    miss
+  <chr>         <int> <int>  <dbl>  <dbl>   <dbl>
+1 TE                1   228 0.115  0.123   0.0076
+2 TE                2   150 0.041  0.0719  0.0309
+3 TE                3    61 0.0114 0.0515  0.0401
+4 TE                4     4 0.009  0.0346  0.0256
+5 WR                1   455 0.157  0.175   0.0181
+6 WR                2   293 0.119  0.0937 -0.0255
+7 WR                3    84 0.0872 0.089   0.0018
+8 WR                4    22 0.0493 0.088   0.0387
+
+=== 4. BY REALIZED TIER ===
+# A tibble: 8 × 6
+  position  tier     n   proj    act ratio
+  <chr>    <int> <int>  <dbl>  <dbl> <dbl>
+1 TE           1   111 0.115  0.181  0.635
+2 TE           2   111 0.0838 0.105  0.798
+3 TE           3   111 0.0556 0.0609 0.913
+4 TE           4   110 0.0446 0.0324 1.38 
+5 WR           1   219 0.165  0.241  0.686
+6 WR           2   219 0.136  0.153  0.885
+7 WR           3   219 0.124  0.0974 1.28 
+8 WR           4   219 0.101  0.0476 2.12 
+
+=== 5. SPREAD OR ORDERING? ===
+# A tibble: 2 × 4
+  position     n mae_raw mae_stretched
+  <chr>    <int>   <dbl>         <dbl>
+1 TE         443  0.0431        0.0435
+2 WR         876  0.054         0.0604

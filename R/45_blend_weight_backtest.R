@@ -519,25 +519,33 @@ build_vi_arm <- function(target_years,
 # re-fits the translation model per year.
 # ==============================================================================
 
-# Dated copy of live R/32 weights [2026-07-27, post-rekey]; prefer the live
-# constant when R/32 is sourced.
-BLEND_WEIGHTS_DEFAULT_R45 <- c(
-  "veteran_history_only"         = 0.275,
-  "phased_out_history_only"      = 0.325,
-  "translation_active"           = 0.50,
-  "translation_capped_rookie"    = 0.50,
-  "phaseout_no_history_fallback" = 0.50,
-  "calibrated_fallback"          = 0.50
-)
-BLEND_DEFAULT_W_R45 <- 0.50
+# [2026-08-13] THE DATED FALLBACK COPY IS DELETED. Do not restore it, and do
+# not "sync" it to current values -- a synced copy is the same drift with a
+# later start date. What was here was a 2026-07-27 post-rekey copy of
+# BLEND_WEIGHTS_BY_PRIOR_SOURCE plus a local 0.50 default. It was correct on
+# the day it was written; R/43's equivalent copy was not updated at the rekey,
+# and the two files ended up reporting different production weights for the
+# same key (0.275 here, 0.45 there) with nothing in either file able to detect
+# the disagreement.
+#
+# This file's whole output is "what weight does production actually use," so a
+# local copy of that answer is the one thing it must never carry. Both the
+# table and the unrecognized-key default now come from R/32 only, and this
+# file stops loudly if R/32 is not sourced.
 
 # Current EFFECTIVE weight, replicating R/32's coalesce-to-default keying.
 .resolve_current_weight <- function(prior_source) {
-  bw <- if (exists("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)) {
-    get("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)
-  } else BLEND_WEIGHTS_DEFAULT_R45
-  w <- unname(bw[prior_source])
-  w[is.na(w)] <- BLEND_DEFAULT_W_R45
+  miss <- c("BLEND_WEIGHTS_BY_PRIOR_SOURCE", "DEFAULT_R31_WEIGHT")
+  miss <- miss[!vapply(miss, exists, logical(1), inherits = TRUE)]
+  if (length(miss) > 0L) {
+    stop(glue("R/45: {paste(miss, collapse = ', ')} not found. Source ",
+              "R/32_projection_reconciliation.R first. There is deliberately ",
+              "no local fallback copy of R/32's blend weights."),
+         call. = FALSE)
+  }
+  bw <- get("BLEND_WEIGHTS_BY_PRIOR_SOURCE", inherits = TRUE)
+  w  <- unname(bw[prior_source])
+  w[is.na(w)] <- get("DEFAULT_R31_WEIGHT", inherits = TRUE)
   w
 }
 

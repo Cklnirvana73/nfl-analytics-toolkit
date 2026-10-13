@@ -147,6 +147,15 @@ if (!exists("run_aging_curve_pipeline")) {
 if (!exists("get_all_sleeper_players")) {
   source(here::here("R", "19_sleeper_api.R"))
 }
+# Wave A2. R/24 supplies score_stat_line(), STAT_COMPONENTS and
+# STAT_COMPONENT_SCORING_KEY -- the single definition of how a predicted stat
+# line becomes points under a given scoring. Sourcing rather than duplicating
+# keeps one vocabulary: if R/24's component set changes, R/29 follows instead
+# of silently disagreeing. R/24 has no file-scope execution, so this only
+# defines functions.
+if (!exists("score_stat_line")) {
+  source(here::here("R", "24_translation_model.R"))
+}
 
 # ==============================================================================
 # CONSTANTS
@@ -177,6 +186,61 @@ MIN_WEEKS_OBSERVED <- 3L
 # anomalies and statistical noise.
 PRIOR_WEIGHT_START <- 1.0
 PRIOR_WEIGHT_FLOOR <- 0.05
+
+# [2026-09-18] Games-based YTD weight, gated by R/58.
+#
+# The linear schedule above is keyed to the CALENDAR week, so a player with two
+# observed games and a player with one get the same observed weight, and the
+# crossover at week 9 was never fitted to anything. R/58 (58_ytd_weight_backtest.R)
+# scores that schedule against an empirical-Bayes weight
+#   observed_weight = ytd_n / (ytd_n + k)
+# on held-out seasons and writes a per-position k table to YTD_K_PATH ONLY when
+# the games-based form beats the linear schedule out of sample. When the table is
+# absent, update_projection_with_ytd() runs the linear schedule exactly as before
+# and says so. The linear path is retained, not deleted: set
+# YTD_WEIGHT_MODE_DEFAULT <- "linear" to force it.
+#
+# R/32's blend-weight decay still calls compute_prior_weight(as_of_week); that
+# decay is a separate, still-calendar-based question and is NOT gated by R/58.
+YTD_K_PATH              <- here::here("data", "season3_cache", "s3_r58_ytd_k.rds")
+YTD_WEIGHT_MODE_DEFAULT <- "auto"    # "auto" (games if gated table exists) | "linear" | "games"
+
+# [2026-09-30] R/63 feature gate: expected fantasy points (xFP) in the YTD
+# update. R/63 (63_feature_gate_backtest.R) gated three candidates against the
+# production update rule; only C1 (xFP) at WR passed the pooled LOSO gate
+# (+0.029 RMSE, 90% CI 0.005 to 0.052). For a wired position the observed
+# mean becomes
+#   a * ytd_mean + (1 - a) * (map_a0 + map_b1 * ytd_xfp_raw_mean)
+# with the games-based weight n / (n + k1), where a, k1 and the map are read
+# from the R/63 gate object (all-season fit), never hardcoded here.
+#
+# Positions that did not pass are NOT wired. Their C1 posterior is written as
+# shadow_c1_posterior_mu for the forward scoreboard and read by nothing
+# downstream. shadow_unwired_posterior_mu carries the posterior exactly as the
+# pre-R/63 rule computes it, so wired vs unwired can be scored on the real
+# production prior (which includes the volume blend the R/63 proxy lacked).
+#
+# xFP source: nflreadr::load_ff_opportunity(stat_type = "weekly"), pinned to
+# R29_EP_MODEL_VERSION (identical to "latest" on 2022-2025 per R/63; models
+# documented as trained on 2006-2020). If it cannot be loaded, wiring is off
+# for the run and every position uses the pre-R/63 rule, with a message.
+#
+# [2026-10-01] PER-SCORING GATE TABLES. YTD_K_PATH and R63_GATE_PATH_R29 are
+# the DEFAULT (flat PPR) paths. Both gates are now fit per scoring: under any
+# other scoring R/58 and R/63 write to scoring_gate_path(<path>, scoring), which
+# inserts .r29_scoring_key(scoring) before the extension, and the loaders read
+# that path and reject an object fit under a different scoring. Before this,
+# every scoring (FanDuel included) read the flat-PPR k table and the flat-PPR
+# WR xFP map. A scoring with no gated table runs linear weights, xFP off.
+R63_GATE_PATH_R29    <- here::here("data", "season3_cache", "s3_r63_feature_gate.rds")
+R63_GATE_SCHEMA      <- "s3_r63_feature_gate_v1"
+R29_EP_MODEL_VERSION <- "v1.0.0"
+
+# [2026-09-18] Season pbp cache staleness gate. R/29 previously tested only
+# whether pbp_normalized_{season}.rds EXISTED; a cache holding week 1 would be
+# used silently in week 8. The gate reads max(week) from the cache and compares
+# it to the requested week. "stop" halts the run; "warn" continues.
+R29_PBP_STALE_ACTION <- "stop"       # "stop" | "warn"
 
 # Week 4 finding: volume/opportunity features (rushing yards, receptions,
 # target share) significantly outpredict efficiency features (EPA per play,
@@ -269,6 +333,144 @@ SUPPORTED_POSITIONS <- c("QB", "RB", "WR", "TE")
   sigmas
 }
 
+
+# ------------------------------------------------------------------------------
+# .r29_build_player_uid
+#
+# Never-NA identity key, byte-identical to R/39's construction.
+#
+# WHY THE NORMALIZATION IS INLINED
+# --------------------------------
+# R/24 and R/29 each define a function called .normalize_player_name() and the
+# two DISAGREE: R/24's strips to [a-z] (no spaces), R/29's keeps spaces because
+# it feeds a different matching path. R/29 sources R/24, so whichever
+# definition loads last wins, and a uid builder that calls the shared name
+# silently changes behaviour depending on source order. That produced
+# "rk_carson beck_2026_QB" on the prospect side against
+# "rk_carsonbeck_2026_QB" from R/39, so the two halves failed to join and the
+# rookie cohort fell to the calibrated fallback -- a silent miss, no error.
+#
+# Inlining removes the dependency. This function's output must stay identical
+# to R/39's .build_player_uid(); if either changes, both change.
+#
+# @param nfl_gsis_id Character vector, NA where the player has no NFL id.
+# @param cfb_player_name Character vector of college names.
+# @param draft_year Integer vector.
+# @param position Character vector.
+# @return Character vector, never NA.
+# ------------------------------------------------------------------------------
+.r29_build_player_uid <- function(nfl_gsis_id, cfb_player_name, draft_year,
+                                  position) {
+  nm <- tolower(as.character(cfb_player_name))
+  nm <- gsub("\\b(jr|sr|ii|iii|iv|v)\\b\\.?", "", nm)
+  nm <- gsub("[^a-z]", "", nm)
+  nm <- trimws(nm)
+  syn <- paste0("rk_", nm, "_", draft_year, "_", position)
+  ifelse(!is.na(nfl_gsis_id), as.character(nfl_gsis_id), syn)
+}
+
+
+# ------------------------------------------------------------------------------
+# .compute_translation_sigmas_scored
+#
+# WAVE A2. Variant-matched translation sigma computed UNDER A GIVEN SCORING,
+# from R/24's leave-one-class-out component predictions.
+#
+# WHY THIS REPLACES .load_translation_sigmas()
+# --------------------------------------------
+# The sigma is the uncertainty of the translation prior, and it sets that
+# prior's precision in .blend_prior_components(). The legacy sigma is the v1
+# LOCO RMSE recorded in s2_week10_performance.rds, which is an error in
+# REFERENCE-SCORING POINTS. Under any other scoring the prior's error is a
+# different number: raise the pass TD from 4 to 6 and QB errors grow, zero out
+# receptions and RB/WR errors shrink. Reusing the reference-scoring RMSE
+# therefore mis-weights the prior against a scoring-responsive history mean --
+# the same class of unit mismatch the component path exists to remove, sitting
+# in the denominator instead of the numerator.
+#
+# HOW
+# ---
+# s2_week10_predictions.rds carries, for every training player, the observed
+# stat line (STAT_COMPONENTS) and the LOCO-predicted stat line
+# (pred_<variant>_<component>). Scoring both under the target scoring and
+# taking the RMSE of the difference gives the honest out-of-sample error of
+# the translation prior in that scoring's own points. No refit: the
+# predictions are already out-of-sample by construction.
+#
+# The variant is matched per position exactly as the legacy loader does, via
+# ROOKIE_TRANSLATION_VARIANT, so the sigma always describes the prediction
+# actually being used.
+#
+# @param preds_path Character. Path to s2_week10_predictions.rds.
+# @param scoring_settings List. R/17-schema scoring to compute the sigma under.
+# @return Named numeric vector (QB, RB, WR, TE) of scoring-specific RMSE.
+# ------------------------------------------------------------------------------
+.compute_translation_sigmas_scored <- function(preds_path, scoring_settings) {
+
+  if (!file.exists(preds_path)) {
+    stop(
+      ".compute_translation_sigmas_scored(): predictions file not found at: ",
+      preds_path,
+      "\n  Run run_week10_pipeline() (R/24) to regenerate it.",
+      call. = FALSE
+    )
+  }
+  if (!exists("STAT_COMPONENTS") || !exists("score_stat_line")) {
+    stop(
+      ".compute_translation_sigmas_scored(): R/24 must be sourced for ",
+      "STAT_COMPONENTS and score_stat_line().",
+      call. = FALSE
+    )
+  }
+
+  lp <- readRDS(preds_path)
+
+  positions <- names(ROOKIE_TRANSLATION_VARIANT)
+  need_obs  <- STAT_COMPONENTS
+  missing_obs <- setdiff(c("draft_position", need_obs), names(lp))
+  if (length(missing_obs) > 0L) {
+    stop(
+      ".compute_translation_sigmas_scored(): predictions file missing ",
+      "column(s): ", paste(missing_obs, collapse = ", "),
+      "\n  Component columns arrived with the Wave A2 R/24 rewrite; a file ",
+      "predating it cannot produce a scoring-aware sigma.",
+      call. = FALSE
+    )
+  }
+
+  truth <- score_stat_line(lp[, STAT_COMPONENTS, drop = FALSE],
+                           scoring_settings)
+
+  sigmas <- vapply(positions, function(pos) {
+    variant   <- ROOKIE_TRANSLATION_VARIANT[[pos]]
+    pred_cols <- paste0("pred_", variant, "_", STAT_COMPONENTS)
+    if (!all(pred_cols %in% names(lp))) {
+      stop(sprintf(
+        ".compute_translation_sigmas_scored(): missing %s component ",
+        variant), "predictions for ", pos, call. = FALSE)
+    }
+    idx <- lp$draft_position == pos
+    if (sum(idx, na.rm = TRUE) < 2L) {
+      stop(sprintf(
+        ".compute_translation_sigmas_scored(): fewer than 2 rows for %s", pos),
+        call. = FALSE)
+    }
+    pc <- lp[idx, pred_cols, drop = FALSE]
+    names(pc) <- STAT_COMPONENTS
+    pred <- score_stat_line(pc, scoring_settings)
+    rm <- sqrt(mean((truth[idx] - pred)^2, na.rm = TRUE))
+    if (is.na(rm) || rm <= 0) {
+      stop(sprintf(
+        ".compute_translation_sigmas_scored(): non-positive sigma for %s", pos),
+        call. = FALSE)
+    }
+    rm
+  }, numeric(1L))
+
+  names(sigmas) <- positions
+  sigmas
+}
+
 # ------------------------------------------------------------------------------
 # Translation lifecycle constants (Season 3 Wave A1)
 # ------------------------------------------------------------------------------
@@ -317,21 +519,34 @@ ROOKIE_TRUST_CAP           <- 0.85
 # Default Sleeper PPR scoring settings (passed to calculate_fantasy_points_ext)
 # ------------------------------------------------------------------------------
 
-# These match the Sleeper PPR default. Users override per-league via the
+# Flat full PPR, Sleeper-style. Users override per-league via the
 # scoring_settings argument to run_projection_engine().
+#
+# [2026-09-30] FLAT PPR IS THE DEFAULT. This list previously carried three
+# settings from one specific league: use_tiered_ppr = TRUE, te_premium = TRUE
+# and pick6_penalty = -4, while its comment claimed to match the Sleeper
+# default. Every run that relied on the default (the R/58 gate and its k
+# table included) was scored in that league's custom format. A league's own
+# settings are passed explicitly per run (R/19 / R/42 build them); they are
+# never baked into this default. R/05 and R/17 argument defaults were changed
+# to the same flat PPR in the same pass.
+#
+# Anything fit or cached under the old default must be refit: the R/58 k
+# table (rerun run_ytd_weight_backtest()), and aging curves refit once
+# automatically because the cache is keyed on scoring.
 DEFAULT_SCORING_SETTINGS <- list(
   pass_yd              = 0.04,
   pass_td              = 4,       # Sleeper default is 4 (use 6 for superflex)
-  pass_int             = -2,
-  pick6_penalty        = -4,
+  pass_int             = -2,      # Sleeper default (-1 vs -2) not verified
+  pick6_penalty        = 0,       # was -4 (league-specific)
   rush_yd              = 0.1,
   rush_td              = 6,
   rec_yd               = 0.1,
   rec_td               = 6,
   ppr                  = 1,
   fumbles              = -2,
-  use_tiered_ppr       = TRUE,
-  te_premium           = TRUE,
+  use_tiered_ppr       = FALSE,   # was TRUE (league-specific)
+  te_premium           = FALSE,   # was TRUE (league-specific)
   rush_att_bonus       = 0,       # not standard Sleeper
   first_down_points    = 0,
   # [2026-07-16] long_td_bonus + long_td_threshold -> long_td_tiers.
@@ -407,24 +622,379 @@ OUTPUT_DEF_ST_PATH <- here::here(
 # ------------------------------------------------------------------------------
 
 # Cached outputs from R/16 and R/23 -- built on first run, reused after.
-# The aging curve file stores the curves_boxscore list from R/23 pipeline,
-# keyed by position with curve_data tibbles giving cumulative production
-# delta by age. The panel file stores the full 16-season player panel from
-# R/16 which is the input to the aging curve fitting.
+# The panel file stores the full 16-season player panel from R/16 which is the
+# input to the aging curve fitting. It is scoring-independent: it holds raw box
+# score stats, so one panel serves every scoring.
+#
+# The CURVE file is NOT scoring-independent and is keyed accordingly. See
+# .aging_curves_cache_path() below.
 
 AGING_PANEL_CACHE_PATH <- here::here(
   "data", "season2_cache", "s2_week15_player_season_panel_cache.rds"
 )
 
-AGING_CURVES_CACHE_PATH <- here::here(
+# ------------------------------------------------------------------------------
+# NAMESPACE AND PREFIX RESOLVERS
+# ------------------------------------------------------------------------------
+# The path constants above are absolute: they ignore cache_dir, so a caller
+# pointing cache_dir at an alternate namespace still read and wrote production.
+# For a temporal-holdout backtest that silently reintroduced held-out seasons
+# through the panel cache.
+#
+# Two separate axes are now parameterised:
+#   cache_dir   WHERE artifacts live.
+#   out_prefix  WHAT results are called. A result file must identify its own
+#               run from its filename alone, so a file that leaves its
+#               directory can never be mistaken for a production artifact.
+#
+# Inputs (panel, curves) keep the historic unprefixed names: they are shared
+# scoring/season-keyed caches, not run results, and are distinguished by
+# cache_dir and by the season window in the curve key.
+
+R29_OUT_PREFIX_DEFAULT <- "s2_week15_"
+
+.r29_panel_cache_path <- function(cache_dir = CACHE_DIR_DEFAULT) {
+  file.path(cache_dir, "s2_week15_player_season_panel_cache.rds")
+}
+
+# EXPLICIT OVERRIDE WINS.
+#
+# R/46 .build_boards() redirects R/29's output to a tempfile by reassigning the
+# global OUTPUT_PROJECTIONS_PATH, then hands that same tempfile to R/32 as
+# r29_path. Deriving the write path purely from cache_dir/out_prefix silently
+# broke that contract: R/29 wrote to production, R/32 read an empty tempfile,
+# and the failure surfaced two stages downstream as "projections not found".
+#
+# These resolvers therefore honour an explicit path argument first, then the
+# global if a caller has reassigned it away from its own default, and only
+# then fall back to the derived namespaced path. Namespacing still works for
+# callers that pass cache_dir/out_prefix and never touch the globals.
+.r29_output_projections_path <- function(cache_dir = CACHE_DIR_DEFAULT,
+                                          out_prefix = R29_OUT_PREFIX_DEFAULT,
+                                          override = NULL) {
+  if (!is.null(override) && nzchar(override)) return(override)
+  derived_default <- file.path(CACHE_DIR_DEFAULT,
+                               paste0(R29_OUT_PREFIX_DEFAULT,
+                                      "player_projections.csv"))
+  if (exists("OUTPUT_PROJECTIONS_PATH", envir = .GlobalEnv)) {
+    g <- get("OUTPUT_PROJECTIONS_PATH", envir = .GlobalEnv)
+    if (is.character(g) && length(g) == 1L && nzchar(g) &&
+        !identical(normalizePath(g, mustWork = FALSE),
+                   normalizePath(derived_default, mustWork = FALSE))) {
+      return(g)
+    }
+  }
+  file.path(cache_dir, paste0(out_prefix, "player_projections.csv"))
+}
+
+.r29_output_def_st_path <- function(cache_dir = CACHE_DIR_DEFAULT,
+                                     out_prefix = R29_OUT_PREFIX_DEFAULT,
+                                     override = NULL) {
+  if (!is.null(override) && nzchar(override)) return(override)
+  derived_default <- file.path(CACHE_DIR_DEFAULT,
+                               paste0(R29_OUT_PREFIX_DEFAULT,
+                                      "def_st_scores.csv"))
+  if (exists("OUTPUT_DEF_ST_PATH", envir = .GlobalEnv)) {
+    g <- get("OUTPUT_DEF_ST_PATH", envir = .GlobalEnv)
+    if (is.character(g) && length(g) == 1L && nzchar(g) &&
+        !identical(normalizePath(g, mustWork = FALSE),
+                   normalizePath(derived_default, mustWork = FALSE))) {
+      return(g)
+    }
+  }
+  file.path(cache_dir, paste0(out_prefix, "def_st_scores.csv"))
+}
+
+# Aging panel window derived from the target season rather than hardcoded.
+# 16 completed seasons ending the year before the target, which reproduces
+# 2010:2025 at season = 2026.
+#
+# This is a DEFAULT, not a rule: the window it returns can reach back further
+# than the pbp actually available in a given cache_dir (season = 2025 asks for
+# 2009, which predates the toolkit's earliest normalized season). Callers that
+# know their real coverage pass panel_seasons explicitly. This matters because
+# the window is now part of the aging-curve cache key: a run that fits curves
+# on 2010-2024 must not label them 2009-2024, or a later run with genuine 2009
+# data would collide with a file that never contained it.
+.r29_aging_panel_seasons <- function(season) {
+  season <- as.integer(season)
+  (season - 16L):(season - 1L)
+}
+
+# Legacy, scoring-blind curve cache. Retained ONLY so an existing file is
+# recognised and can be migrated or ignored; nothing writes to this path any
+# more. The curves it holds were fit on R/23's hardcoded PPR scale.
+AGING_CURVES_LEGACY_PATH <- here::here(
   "data", "season2_cache", "s2_week15_aging_curves_cache.rds"
 )
+
+# ------------------------------------------------------------------------------
+# .r29_scoring_key  [2026-10-01]
+#
+# The one place R/29 turns a scoring list into a key. Extracted unchanged from
+# .aging_curves_cache_path(), which now calls it, so the aging-curve cache, the
+# R/58 k table and the R/63 feature gate all key a given scoring identically.
+# Before this, only the aging curves were keyed on scoring; the gate tables sat
+# at fixed paths and were read for EVERY scoring (finding 2026-10-01: a
+# FanDuel run used the flat-PPR k table and the flat-PPR WR xFP map).
+# ------------------------------------------------------------------------------
+.r29_scoring_key <- function(scoring_settings) {
+  if (!exists(".scoring_settings_key", mode = "function")) {
+    stop(
+      ".scoring_settings_key() not found. R/16_player_season_panel.R must be ",
+      "sourced before anything can be keyed on scoring.",
+      call. = FALSE
+    )
+  }
+  # Key on the RESOLVED list, not the raw argument. A caller may pass a partial
+  # scoring list; two partial lists that resolve to the same effective scoring
+  # must produce the same key, or one scoring ends up with two curve caches.
+  # This mirrors the modifyList() resolution used elsewhere in this file.
+  resolved <- utils::modifyList(
+    DEFAULT_SCORING_SETTINGS, scoring_settings %||% list()
+  )
+
+  # Then DROP NULL entries before hashing. Two things conspire without this:
+  # modifyList() DELETES an element whose supplied value is NULL, while
+  # .scoring_settings_key() serializes a present-NULL as the literal "NULL" and
+  # an absent name not at all. So a scoring carrying long_td_tiers = NULL
+  # resolves to a list MISSING that name, whereas the same scoring with the
+  # entry omitted resolves to a list CONTAINING it as NULL -- identical
+  # scorings, two different keys, two curve caches.
+  #
+  # Dropping NULLs is safe because present-NULL and absent mean the same thing
+  # to the scorer: .long_td_pts() returns zeros for a NULL or zero-length tier
+  # spec, and the tiered-reception path behaves the same way. This normalizes
+  # only the KEY; the scoring list handed to any fit is untouched.
+  resolved <- resolved[!vapply(resolved, is.null, logical(1))]
+
+  .scoring_settings_key(resolved)
+}
+
+# TRUE when scoring_settings resolves to DEFAULT_SCORING_SETTINGS (flat PPR).
+.r29_is_default_scoring <- function(scoring_settings) {
+  identical(.r29_scoring_key(scoring_settings),
+            .r29_scoring_key(DEFAULT_SCORING_SETTINGS))
+}
+
+#' Path of a gate output for a given scoring  [2026-10-01]
+#'
+#' Default (flat PPR) scoring keeps the original, unkeyed path, so every
+#' existing flat-PPR file stays where it is and is still read. Any other
+#' scoring gets the scoring key inserted before the extension, e.g.
+#' s3_r58_ytd_k.rds -> s3_r58_ytd_k_<key>.rds.
+#'
+#' @param base_path Character. The default-scoring path.
+#' @param scoring_settings List in R/17's schema.
+#' @return Character path.
+#' @export
+scoring_gate_path <- function(base_path, scoring_settings) {
+  if (.r29_is_default_scoring(scoring_settings)) return(base_path)
+  ext  <- tools::file_ext(base_path)
+  stem <- sub(paste0("\\.", ext, "$"), "", base_path)
+  paste0(stem, "_", .r29_scoring_key(scoring_settings), ".", ext)
+}
+
+# Does a loaded gate object belong to this scoring? Objects written from
+# 2026-10-01 carry scoring_key and must match. Older objects carry none: they
+# were all fit under flat PPR (R/58 and R/63 were run on the default), so they
+# are accepted only when the run's scoring is the default.
+.r29_gate_matches_scoring <- function(obj, scoring_settings) {
+  if (!is.null(obj$scoring_key)) {
+    return(identical(obj$scoring_key, .r29_scoring_key(scoring_settings)))
+  }
+  .r29_is_default_scoring(scoring_settings)
+}
+
+# ------------------------------------------------------------------------------
+# .aging_curves_cache_path
+#
+# WHY CURVES ARE KEYED ON SCORING
+# -------------------------------
+# An aging curve is a trajectory of FANTASY POINTS by age. Fantasy points are a
+# function of the league's scoring, so the curve is too. Fitting once on a
+# hardcoded PPR scale and reusing it for every league silently asserts that a
+# 30-year-old declines by the same number of points in a superflex 6-point-pass-
+# TD league as in a standard one, which is false whenever the scoring weights
+# the stats that age differently.
+#
+# R/23's run_aging_curve_oos_gate() measured this directly on 2016-2025 with a
+# player-clustered bootstrap. Curves fit on the league's own scoring beat curves
+# fit on the hardcode for RB (-0.0020 RMSE, CI [-0.0032, -0.0004]) and WR
+# (-0.0029, CI [-0.0045, -0.0010]), and were never significantly worse for any
+# position. That was measured on a scoring only mildly different from the
+# hardcode, so it is a floor on the benefit, not an estimate of it.
+#
+# The key is .scoring_settings_key() from R/16, the same serializer that keys
+# the game panels, so a given scoring produces the same key everywhere in the
+# pipeline. First call for a new scoring pays the fit; later calls hit cache.
+# ------------------------------------------------------------------------------
+.aging_curves_cache_path <- function(scoring_settings,
+                                     cache_dir = CACHE_DIR_DEFAULT,
+                                     panel_seasons = AGING_PANEL_SEASONS) {
+  # [2026-10-01] Key construction moved to .r29_scoring_key() (unchanged
+  # logic, documented there) so gate tables share it.
+  key <- .r29_scoring_key(scoring_settings)
+
+  # The season window is part of the key, with no exception for any particular
+  # window. Without it, curves fit on 2010-2025 and curves fit on 2010-2024
+  # collide on one filename under identical scoring: a changed window silently
+  # reuses the stale fit and the change appears to have no effect. That is a
+  # correctness bug independent of any backtest.
+  #
+  # This renames every curve cache. Existing unsuffixed files are orphaned and
+  # the next run refits once per scoring. That cost is accepted deliberately:
+  # a keying rule with a special case for one hardcoded window would go stale
+  # the moment the window advances, and would fail silently when it did.
+  win <- sprintf("%d_%d", min(panel_seasons), max(panel_seasons))
+  file.path(cache_dir, sprintf("s2_week15_aging_curves_%s_%s.rds", key, win))
+}
+
+# ------------------------------------------------------------------------------
+# HISTORY RECENCY WEIGHT
+# ------------------------------------------------------------------------------
+# hist_mean was an UNWEIGHTED mean of season_mean across the 3-season history
+# window, so a player's most recent season counted no more than his oldest.
+# Measured consequence, from the 2025 temporal holdout: the history step cut
+# top-12 prior-season players by 3.21 PPG (RB) while reality cut them 2.05, and
+# it left mid-tier players untouched (-0.18). An ascending player is dragged
+# toward his own past; a flat veteran is not. That is the whole of the observed
+# over-regression at the top of every skill position.
+#
+# HIST_RECENCY_LAMBDA applies geometric decay by seasons-before-target:
+#   w = lambda ^ (target_season - season - 1)
+# lambda = 1.00 reproduces the unweighted mean EXACTLY, so this is a
+# neutralizable parameter, not a rewrite.
+#
+# ADOPTED 0.55 on the 2025 temporal holdout, and ONLY in combination with
+# TRANSLATION_OBSERVED_DECAY. Acceptance rule, fixed before the numbers were
+# seen: both Spearman and MAE must improve overall AND no position may degrade
+# on either metric, at min 8 games. Factorial result:
+#
+#   lambda  decay   verdict   why
+#   1.00    FALSE   baseline
+#   1.00    TRUE    FAIL      RB MAE +0.0016
+#   0.55    FALSE   FAIL      TE MAE +0.0059
+#   0.55    TRUE    PASS      all four positions improve on both metrics
+#   0.40    TRUE    FAIL      RB rho -0.0003, TE rho -0.0065
+#
+# Neither change passes alone. Recency lifts the history mean but the college
+# arm outvotes it; the decay removes the college arm but leaves a history mean
+# that is already too low. Adopted cell: Spearman +0.0027, MAE -0.024, holding
+# at min 6, 8 and 12 games.
+#
+# The margin is small and rests on ONE holdout season. 0.40 failing on RB and TE
+# rank correlation is the evidence against pushing recency harder. Set to 1.00
+# to neutralize the recency weighting with the machinery intact.
+HIST_RECENCY_LAMBDA <- 0.55
+
+# ------------------------------------------------------------------------------
+# STALE-HISTORY LOOKBACK  [G3]
+# ------------------------------------------------------------------------------
+# The historical window is season-3 .. season-1 and is unchanged. This is a
+# SECOND, wider window used for one purpose only: separating "never played in
+# the NFL" from "played, was bad, and stopped playing".
+#
+# Before this, both populations reached the lifecycle gate with zero history
+# rows and both were routed to phaseout_no_history_fallback, which prices a
+# player off the position-average calibrated line. That is correct for a
+# rookie and inverted for a veteran: the longer a player had been out of the
+# league, the more generous the prior he received. Observed case, 2026: a
+# WR7 with no qualifying season since 2023 carried a prior of 10.9 PPG, in
+# the same neighbourhood as starting tight ends, against an R/31 volume
+# estimate of 0.64 targets per game.
+#
+# Six seasons, not career. Long enough to separate the two populations;
+# short enough that a season played under different rules, by a different
+# player, is not treated as evidence about the target season. Whatever does
+# enter is decayed by HIST_RECENCY_LAMBDA and charged drift at its own
+# horizon via pred_lag, so a distant season contributes little on its own.
+#
+# NOT VALIDATED OUT OF SAMPLE AS OF THIS COMMIT. Set to 3L to collapse the
+# wide window onto the narrow one, which disables the stale-history state
+# entirely and restores the previous behaviour with the machinery intact.
+HIST_STALE_LOOKBACK <- 6L
+
+# ------------------------------------------------------------------------------
+# TRANSLATION ARM DECAY BY OBSERVED TARGET WINDOW
+# ------------------------------------------------------------------------------
+# R/24's regression outcome is the mean PPG across NFL years 1-3:
+#   nfl_seasons <- d_year:(d_year + 2L);  ppr_per_game_y13 = avg_ppr
+# So sigma_translation is an out-of-sample RMSE against a THREE-SEASON MEAN,
+# and mu_translation is a prediction OF THAT WINDOW.
+#
+# .blend_prior_components() gave that arm a constant precision while the
+# history arm's precision decays with prediction lag (the chg^2 term). Measured
+# consequence on the 2025 holdout, weight on the translation arm among players
+# with NFL history:
+#        1 season   2 seasons   3 seasons
+#   RB     0.480      0.528       0.574
+#   WR     0.361      0.392       0.432
+# The college model's share RISES as NFL evidence accumulates. A back with 41
+# NFL games had 57% of his projection driven by a prediction of a window that
+# had already been watched.
+#
+# The fix ties the translation arm's strength to how much of its own target
+# window remains unobserved:
+#   observed_fraction = min(n_nfl_seasons, W) / W
+#   precision_translation <- precision_translation * (1 - observed_fraction)
+# with W = TRANSLATION_TARGET_WINDOW read off R/24's outcome definition, not
+# fitted. A player with no NFL seasons gets the arm at full strength; one whose
+# entire years 1-3 window has been observed gets none of it, because history
+# now measures directly what the translation was guessing at.
+#
+# The rate is structural, not tuned: W comes from R/24's outcome definition,
+# not from a sweep. Verified on the 2025 holdout, with the weight on the
+# translation arm read from INSIDE the blend rather than reconstructed:
+#
+#            1 season   2 seasons   3 seasons
+#   RB  before   0.480     0.528       0.574    (rising: the defect)
+#   RB  after    0.384     0.255       0.000    (monotone: fixed)
+#   TE  after    0.410     0.213       0.000
+#   WR  after    0.275     0.167       0.000
+#   QB  after    0.129     0.058       0.000
+#
+# Adopted TRUE together with HIST_RECENCY_LAMBDA = 0.55; see the note there for
+# the acceptance rule and the factorial. Set to FALSE to neutralize the whole
+# mechanism with the machinery intact.
+TRANSLATION_TARGET_WINDOW  <- 3L
+TRANSLATION_OBSERVED_DECAY <- TRUE
 
 # Seasons used to build the aging panel. Matches R/23 default.
 AGING_PANEL_SEASONS <- 2010:2025
 
 # Position groups supported by aging curves (R/23 fits these four)
 AGING_POSITIONS <- c("QB", "RB", "WR", "TE")
+
+# ------------------------------------------------------------------------------
+# AGING_POSITION_WEIGHTS -- per-position multiplier on the aging delta
+#
+# NEUTRALIZE PATTERN. The machinery stays; the weight goes to zero and the
+# reason is written down. Nothing is deleted, so reviving a position is a
+# one-number edit backed by a re-run of the gate.
+#
+# QB = 0.00. R/23's out-of-sample gate (expanding window, 2016-2025, 430 QB
+# transitions, 200 player-clustered bootstrap resamples) could not distinguish
+# QB aging from applying no adjustment at all:
+#
+#   legacy_minus_null  point -0.0143  CI [-0.0511, +0.0236]   crosses zero
+#   scored_minus_null  point -0.0118  CI [-0.0550, +0.0273]   crosses zero
+#
+# and the by-season table has the aged arm WORSE than null in 6 of the 10 test
+# seasons (2017, 2018, 2020, 2022, 2023, 2024). An adjustment that cannot beat
+# doing nothing does not get to move a prior. Applying it anyway adds variance
+# and, because the delta is a fixed point amount, contributes to the unit
+# mismatch that scoring-aware curves exist to remove.
+#
+# RB / WR / TE = 1.00. All three separate from null with CIs clear of zero:
+#   RB  legacy_minus_null -0.1062  CI [-0.1377, -0.0707]
+#   WR  legacy_minus_null -0.1385  CI [-0.1692, -0.1093]
+#   TE  legacy_minus_null -0.0350  CI [-0.0599, -0.0045]
+#
+# Revisit when the gate is re-run on a scoring that differs materially from
+# the one tested, or when the QB training population changes.
+# ------------------------------------------------------------------------------
+AGING_POSITION_WEIGHTS <- c(QB = 0.00, RB = 1.00, WR = 1.00, TE = 1.00)
 
 # ------------------------------------------------------------------------------
 # Injury proximity cache paths and constants (Build 2 integration)
@@ -570,7 +1140,7 @@ RAMP_VETERAN_THRESHOLD <- 2L
 # Schema tag
 # ------------------------------------------------------------------------------
 
-R29_SCHEMA_TAG <- "s3_r29_v1"
+R29_SCHEMA_TAG <- "s3_r29_v2"   # v2: + blend_used_history [2026-08-10]
 
 # ------------------------------------------------------------------------------
 # Null-coalescing operator (defined early; used throughout)
@@ -584,26 +1154,40 @@ R29_SCHEMA_TAG <- "s3_r29_v1"
 
 if (getRversion() >= "2.15.1") {
   utils::globalVariables(c(
+  "hist_centroid", "pred_lag", "phi2", "n_pairs_total",
+  "lag", "d2", "samp", "n_pairs", "change_var", "change_sigma",
+  "s_a", "s_b", "m_a", "m_b", "sd_a", "sd_b", "n_a", "n_b",
     "nfl_gsis_id", "cfb_player_name", "player_name", "player_id", "position",
     "team", "season", "week", "game_id", "pos", "fantasypros_id",
     "score_final", "score_v1", "score_base", "score_enriched",
     "pred_base", "pred_enriched", "draft_year", "draft_position",
+    "pred_base_scored", "pred_enriched_scored", "outcome_scored",
+    "player_uid",
     "ppr_per_game_y13", "is_hit",
     "total_fantasy_points", "pass_fantasy_points", "rush_fantasy_points",
     "rec_fantasy_points",
     "ecr", "sd", "best", "worst", "tier", "pos_rank", "player_owned_avg",
     "n_games", "n_games_total", "ppr_per_game", "ppr_var",
     "prior_mu", "prior_sigma", "ytd_mean", "ytd_sigma", "ytd_n",
-    "posterior_mu", "posterior_sigma",
+    "posterior_mu", "posterior_sigma", "ytd_obs_weight", "ytd_weight_mode",
     # Season 3 Wave A1 lifecycle columns and temporaries
     "draft_year", "pred_type", "years_exp", "lifecycle_state",
     "pred_selected", "has_prediction", "mu_fallback", "mu_translation",
     "sigma_translation", "has_translation", "has_history",
-    ".variant", ".phased_out", ".is_rookie", ".has_hist_raw",
+    ".variant", ".phased_out", ".is_rookie", ".has_hist_raw", ".stale_only",
+    # G3 stale-history gate
+    ".has_hist_stale", "stale_hist_mean", "stale_hist_sigma",
+    "stale_n_nfl_seasons", "stale_n_games_total", "stale_change_sigma",
+    ".hist_mean_eff", ".hist_sigma_eff", ".n_seasons_eff",
+    ".n_games_eff", ".change_sigma_eff",
+    "hist_centroid", "phi2", "pred_lag", "change_sigma",
     ".fb_intercept", ".fb_slope",
     ".mu_for_blend", "ppr_per_game_y13",
     "current_age", "effective_historical_age", "aging_delta_ppg",
+    "aging_delta_raw", "aging_weight",
     "prior_mu_pre_age", "birth_date",
+    "w_translation", "translation_observed_fraction", "hist_mean_used",
+    "blend_used_history", ".vet_blend",
     "injury_group_prior_season", "injury_n_absent_weeks",
     "injury_mu_adj", "injury_sigma_multiplier",
     "injury_group", "injury_weeks_missed", "injury_sigma_mult",
@@ -1434,11 +2018,38 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 .compute_player_historical_stats <- function(season,
                                               cache_dir = CACHE_DIR_DEFAULT,
                                               min_games = 8L,
-                                              scoring_settings = DEFAULT_SCORING_SETTINGS) {
+                                              scoring_settings = DEFAULT_SCORING_SETTINGS,
+                                              recency_lambda = HIST_RECENCY_LAMBDA) {
 
-  prior_seasons <- (season - 3L):(season - 1L)
+  recency_lambda <- as.numeric(recency_lambda)
+  if (!is.finite(recency_lambda) || recency_lambda <= 0 || recency_lambda > 1) {
+    stop(".compute_player_historical_stats(): recency_lambda must be in (0, 1]. ",
+         "Got: ", recency_lambda, call. = FALSE)
+  }
 
-  history <- purrr::map_dfr(prior_seasons, function(s) {
+  # ---- Two windows, one load. [G3, stale-history gate] ----
+  # NARROW (season-3 .. season-1) is the historical window and is UNCHANGED.
+  # Every player who has narrow history keeps a bit-identical prior: the
+  # narrow table alone feeds drift estimation and the primary aggregation.
+  #
+  # WIDE (season-6 .. season-1) exists only to tell "never played" apart from
+  # "played, was bad, and stopped playing". Before this, both arrived at the
+  # lifecycle gate as zero rows and both were handed the position-average
+  # calibrated fallback, which is right for a rookie and badly wrong for a
+  # ten-year veteran buried on a depth chart.
+  #
+  # Loading pbp is the expensive step, so it happens once over the wide window
+  # and the narrow table is filtered out of it rather than re-read.
+  #
+  # Six, not career: long enough to separate the two populations, short enough
+  # that a season from a different NFL is not treated as evidence about this
+  # one. The recency weighting below decays what does get in.
+  narrow_seasons <- (season - 3L):(season - 1L)
+  wide_seasons   <- (season - HIST_STALE_LOOKBACK):(season - 1L)
+
+  prior_seasons <- wide_seasons
+
+  history_wide <- purrr::map_dfr(prior_seasons, function(s) {
 
     pbp <- tryCatch(
       load_normalized_season(s, cache_dir = cache_dir),
@@ -1479,27 +2090,207 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
     season_stats %>% dplyr::mutate(season = s)
   })
 
-  if (nrow(history) == 0) {
+  # The narrow table drives everything that existed before this change:
+  # drift estimation, phi2, change_sigma, and the primary aggregation. It is
+  # a filter of the wide load, not a second read.
+  history <- dplyr::filter(history_wide, season %in% narrow_seasons)
+
+  if (nrow(history_wide) == 0) {
     return(tibble::tibble(
       player_id = character(),
       position = character(),
       n_nfl_seasons = integer(),
       n_games_total = integer(),
       hist_mean = numeric(),
-      hist_sigma = numeric()
+      hist_sigma = numeric(),
+      stale_n_nfl_seasons = integer(),
+      stale_n_games_total = integer(),
+      stale_hist_mean = numeric(),
+      stale_hist_sigma = numeric(),
+      stale_change_sigma = numeric()
     ))
   }
 
-  # Aggregate across seasons: mean of means; sigma via pooled variance
-  history %>%
+  # An empty NARROW window with a non-empty wide one is legitimate: it means
+  # every qualifying player in this run is stale. Drift cannot be estimated
+  # from it, which the existing warning path below already handles.
+
+  # ---- Season-to-season CHANGE variance, by LAG. [2026-07-30, revised] ----
+  # A player's true per-game mean does not sit still between seasons: age,
+  # role, scheme, and regression all move it. The standard error of his PAST
+  # mean says nothing about that, so a prior built from sampling error alone is
+  # systematically overconfident about NEXT season. R/49 measured the miss at
+  # sd(z) = 3.72 against a calibrated 1.
+  #
+  # HORIZON MATTERS, and the first version of this ignored it. Drift
+  # accumulates with the gap between the history and the season being
+  # predicted, so a one-year estimate applied to a two-year gap is too small.
+  # That error left sd(z) at 1.553 instead of 1.000 on the R/49 re-gate.
+  #
+  # So the drift is estimated as a function of LAG, from every ordered pair of
+  # a player's seasons:
+  #   E[(mean_b - mean_a)^2] = change_var(lag) + samp_a + samp_b
+  # The sampling terms are known, so the remainder is real movement. A
+  # through-origin fit change_var(h) = phi2 * h is then applied at each
+  # player's OWN horizon, which is the gap from the centroid of his history to
+  # the target season. A player with one recent season has a shorter horizon,
+  # and therefore less accumulated drift, than one whose record is older.
+  #
+  # Re-estimated every run from the live panel under the live scoring, so there
+  # is no hardcoded variance constant to go stale.
+  h_a <- history %>%
+    dplyr::select(player_id, position, s_a = season, n_a = n_games,
+                   m_a = season_mean, sd_a = season_sigma)
+  h_b <- history %>%
+    dplyr::select(player_id, position, s_b = season, n_b = n_games,
+                   m_b = season_mean, sd_b = season_sigma)
+
+  season_pairs <- dplyr::inner_join(
+      h_a, h_b, by = c("player_id", "position"),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::filter(s_b > s_a) %>%
+    dplyr::mutate(
+      lag  = as.integer(s_b - s_a),
+      d2   = (m_b - m_a)^2,
+      samp = sd_a^2 / pmax(n_a, 1L) + sd_b^2 / pmax(n_b, 1L)
+    ) %>%
+    dplyr::filter(is.finite(d2), is.finite(samp))
+
+  lag_tbl <- season_pairs %>%
+    dplyr::group_by(position, lag) %>%
+    dplyr::summarise(
+      n_pairs = dplyr::n(),
+      # Floored at zero: sampling noise can drive the remainder negative in a
+      # thin cell, and a negative variance is invalid, not a smaller correction.
+      change_var = pmax(mean(d2, na.rm = TRUE) - mean(samp, na.rm = TRUE), 0),
+      .groups = "drop"
+    )
+
+  phi_tbl <- lag_tbl %>%
+    dplyr::group_by(position) %>%
+    dplyr::summarise(
+      n_pairs_total = sum(n_pairs),
+      # Weighted through-origin slope: change_var = phi2 * lag.
+      phi2 = pmax(sum(n_pairs * lag * change_var) /
+                    pmax(sum(n_pairs * lag^2), 1e-9), 0),
+      .groups = "drop"
+    )
+
+  if (nrow(lag_tbl) > 0) {
+    message("  Drift variance by lag (change_var, PPG^2):")
+    for (i in seq_len(nrow(lag_tbl))) {
+      message(sprintf("    %-3s lag %d: %.3f  (n_pairs = %d)",
+                      lag_tbl$position[i], lag_tbl$lag[i],
+                      lag_tbl$change_var[i], lag_tbl$n_pairs[i]))
+    }
+    message("  Through-origin drift slope phi2 (PPG^2 per year):")
+    for (i in seq_len(nrow(phi_tbl))) {
+      message(sprintf("    %-3s: %.3f  -> 1yr sigma %.3f, 2yr sigma %.3f",
+                      phi_tbl$position[i], phi_tbl$phi2[i],
+                      sqrt(phi_tbl$phi2[i]), sqrt(2 * phi_tbl$phi2[i])))
+    }
+  } else {
+    message("  WARNING: no player has 2+ qualifying seasons. Drift cannot be ",
+            "estimated; change_sigma = 0 and tau reverts to sampling-only.")
+  }
+
+  # Captured explicitly: after the summarise below there is no `season`
+  # column, so a bare `season` would silently resolve to the function
+  # argument by scoping accident. That is the intent, but it should be
+  # stated rather than relied on.
+  .target_season <- as.numeric(season)
+
+  # Aggregate across seasons: mean of means; sigma via pooled variance.
+  # Factored into a local helper so the narrow and wide windows are summarised
+  # by identical arithmetic. The narrow call must reproduce the previous
+  # behaviour exactly; if it does not, the backtest's unchanged-player gate
+  # will catch it.
+  .agg_history <- function(hist_df) {
+    if (nrow(hist_df) == 0) {
+      return(tibble::tibble(
+        player_id = character(), position = character(),
+        n_nfl_seasons = integer(), n_games_total = integer(),
+        hist_mean = numeric(), hist_sigma = numeric(),
+        hist_centroid = numeric(), phi2 = numeric(),
+        pred_lag = numeric(), change_sigma = numeric()
+      ))
+    }
+
+    hist_df %>%
     dplyr::group_by(player_id, position) %>%
     dplyr::summarise(
       n_nfl_seasons = dplyr::n(),
       n_games_total = as.integer(sum(n_games, na.rm = TRUE)),
-      hist_mean     = mean(season_mean, na.rm = TRUE),
+      # Recency-weighted mean of season means. w = lambda^(age of season in
+      # years before the target). At lambda = 1 every weight is 1 and this is
+      # arithmetically identical to mean(season_mean), including the na.rm
+      # behaviour, because NA seasons carry NA weight and drop from both sums.
+      hist_mean     = {
+        .w <- recency_lambda ^ (.target_season - season - 1)
+        .ok <- !is.na(season_mean) & is.finite(.w)
+        if (!any(.ok)) NA_real_ else sum(.w[.ok] * season_mean[.ok]) / sum(.w[.ok])
+      },
       # Pooled SD across qualifying seasons (simple mean of within-season SDs)
       hist_sigma    = mean(season_sigma, na.rm = TRUE),
+      # Centroid of the seasons actually used for this player. The prediction
+      # horizon is the gap from here to the target season, and drift is applied
+      # at that horizon rather than at a flat one year.
+      #
+      # This MUST carry the same weights as hist_mean above. hist_mean is a
+      # weighted mean of season means; its centre of mass is the weighted
+      # centroid, not the arithmetic one. Using an unweighted centroid with a
+      # weighted mean describes an estimator centred near the recent seasons
+      # while charging it drift as though it were centred further back, which
+      # inflates chg^2 in .blend_prior_components() and depresses the history
+      # arm's precision for exactly the players whose recent form is strongest.
+      # At lambda = 1 both reduce to the arithmetic mean, so this is identical
+      # to the previous behaviour at the default.
+      hist_centroid = {
+        .w <- recency_lambda ^ (.target_season - season - 1)
+        .ok <- !is.na(season) & is.finite(.w)
+        if (!any(.ok)) NA_real_ else sum(.w[.ok] * season[.ok]) / sum(.w[.ok])
+      },
       .groups       = "drop"
+    ) %>%
+    dplyr::left_join(phi_tbl %>% dplyr::select(position, phi2), by = "position") %>%
+    dplyr::mutate(
+      phi2      = dplyr::coalesce(phi2, 0),
+      pred_lag  = pmax(.target_season - hist_centroid, 0),
+      change_sigma = sqrt(phi2 * pred_lag)
+    ) %>%
+    dplyr::filter(position %in% SUPPORTED_POSITIONS)
+  }
+
+  # phi_tbl is estimated from the NARROW table only (see the drift block
+  # above), so both windows are charged drift from the same fitted phi2.
+  # Stale players carry a longer pred_lag because their centroid sits
+  # further back, which is exactly the widening their older evidence
+  # deserves. That is the whole of the sigma treatment: no separate
+  # inflation term is applied, because pred_lag already encodes the gap
+  # and an ad hoc multiplier here would re-introduce the per-game vs
+  # standard-error unit confusion documented at the prior_sigma comment.
+  narrow_agg <- .agg_history(history)
+
+  wide_agg <- .agg_history(history_wide) %>%
+    dplyr::select(
+      player_id, position,
+      stale_n_nfl_seasons = n_nfl_seasons,
+      stale_n_games_total = n_games_total,
+      stale_hist_mean     = hist_mean,
+      stale_hist_sigma    = hist_sigma,
+      stale_change_sigma  = change_sigma
+    )
+
+  # Left join FROM the wide side: a stale-only player has no narrow row at
+  # all, so joining from the narrow side would drop the very population this
+  # change exists to reach. Narrow columns stay NA for those players, which
+  # is what the lifecycle gate reads to route them.
+  wide_agg %>%
+    dplyr::left_join(narrow_agg, by = c("player_id", "position")) %>%
+    dplyr::relocate(
+      player_id, position, n_nfl_seasons, n_games_total,
+      hist_mean, hist_sigma, hist_centroid, phi2, pred_lag, change_sigma
     ) %>%
     dplyr::filter(position %in% SUPPORTED_POSITIONS)
 }
@@ -1550,12 +2341,23 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
                                      mu_history,
                                      sigma_history,
                                      n_nfl_seasons,
-                                     n_games_total) {
+                                     n_games_total,
+                                     change_sigma = 0) {
 
   # Guard against zero or NA sigmas
   sigma_translation <- ifelse(is.na(sigma_translation) | sigma_translation <= 0,
                               5.0, sigma_translation)
-  precision_translation <- 1 / (sigma_translation^2)
+
+  # A NA mu_translation means "no translation arm": the caller is asking for a
+  # history-only prior. Its precision must drop to ZERO rather than contribute
+  # 1 / sigma_translation^2 to the total. Before 2026-07-30 the arm was always
+  # counted, so a history-only caller inherited a phantom translation precision
+  # and got a prior_sigma that was too small while prior_mu came back NA (the
+  # NA propagated through the weighted average). Callers papered over the NA mu
+  # with a post-blend overwrite and, in doing so, also overwrote the sigma with
+  # a raw per-game SD. See the Season 3 tau/omega note in build_projection_priors().
+  has_translation <- !is.na(mu_translation)
+  precision_translation <- if (has_translation) 1 / (sigma_translation^2) else 0
 
   has_history <- !is.na(mu_history) &
                  !is.na(sigma_history) &
@@ -1566,23 +2368,94 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
                  n_games_total >= 1L
 
   if (!has_history) {
+    # Neither arm present is not a recoverable state: it would return a NA mu
+    # that only surfaces much later as a hole in the board. Fail loudly here.
+    if (!has_translation) {
+      stop(
+        ".blend_prior_components(): no translation arm and no usable history. ",
+        "A prior cannot be formed from nothing. Check the lifecycle_state ",
+        "assignment for this player.",
+        call. = FALSE
+      )
+    }
     return(list(
       prior_mu    = mu_translation,
-      prior_sigma = sigma_translation
+      prior_sigma = sigma_translation,
+      # [2026-08-10] Report the branch actually taken. The output column
+      # has_history is computed from n_nfl_seasons alone and does NOT agree
+      # with this: a player can carry seasons on record and still land here
+      # when no season clears the 8-game history cut, in which case he
+      # receives the bare position translation sigma. Without this column
+      # every downstream diagnostic reads such a player as history-blended.
+      blend_used_history = FALSE
     ))
   }
 
   # sigma_history is per-game, so the mean of n_games_total games has
   # precision n_games_total / sigma_game^2 (see bug-fix note above).
-  precision_history <- n_games_total / (sigma_history^2)
+  #
+  # CHANGE VARIANCE. [2026-07-30] The history arm is being used to predict NEXT
+  # season's mean, not to describe last season's. Sampling error alone treats a
+  # long track record as near-certainty about the future, which R/49 measured as
+  # a 3.7x overconfidence. Adding the season-to-season change variance gives:
+  #   Var(next season mean | history) = sigma_game^2 / n + change_sigma^2
+  # The change term does NOT shrink with more games, so it correctly caps how
+  # certain a long career can make us.
+  #
+  # Applied ONLY to the history arm. sigma_translation is already an
+  # out-of-sample RMSE against realized outcomes, so it contains change
+  # variance and would be double-counted if this were applied globally.
+  chg <- if (is.na(change_sigma) || change_sigma < 0) 0 else change_sigma
+  history_var <- (sigma_history^2) / n_games_total + chg^2
+  precision_history <- 1 / history_var
+
+  # TRANSLATION ARM DECAY. Reached only when BOTH arms exist: the history-only
+  # and translation-only paths above return before this point, so a player with
+  # no NFL history keeps the arm at full strength, which is correct.
+  #
+  # mu_translation predicts the mean of NFL years 1-3. Each observed qualifying
+  # season resolves a share of that window directly, and the history arm
+  # already carries it. Leaving the translation precision constant counts the
+  # same information twice, and does so more heavily the more seasons have been
+  # played, because the history arm's own precision decays with lag.
+  translation_observed_fraction <- 0
+  if (isTRUE(TRANSLATION_OBSERVED_DECAY) && has_translation) {
+    .w_target <- max(as.integer(TRANSLATION_TARGET_WINDOW), 1L)
+    .k <- if (is.na(n_nfl_seasons)) 0 else max(as.numeric(n_nfl_seasons), 0)
+    translation_observed_fraction <- min(.k, .w_target) / .w_target
+    precision_translation <- precision_translation *
+      (1 - translation_observed_fraction)
+  }
+
   blended_precision <- precision_translation + precision_history
 
-  blended_mu <- (precision_translation * mu_translation +
-                 precision_history * mu_history) / blended_precision
+  # With no translation arm this reduces to mu_history exactly. Written as a
+  # branch rather than relying on precision_translation == 0 so that a NA
+  # mu_translation cannot propagate through the multiplication.
+  # When the decay drives precision_translation to exactly 0 this reduces to
+  # mu_history, which is the intended endpoint: the target window is fully
+  # observed and history measures it directly. Guarded as a branch so a NA
+  # mu_translation can never propagate through the multiplication.
+  blended_mu <- if (has_translation && precision_translation > 0) {
+    (precision_translation * mu_translation +
+       precision_history * mu_history) / blended_precision
+  } else {
+    mu_history
+  }
 
+  # Standard error of the history mean, blended with translation precision when
+  # a translation arm is present. This is tau: uncertainty about the player's
+  # SEASON MEAN. It is NOT week-to-week dispersion, and must not be used to
+  # answer questions about weekly outcomes.
   blended_sigma <- sqrt(1 / blended_precision)
 
-  list(prior_mu = blended_mu, prior_sigma = blended_sigma)
+  list(prior_mu = blended_mu, prior_sigma = blended_sigma,
+       translation_observed_fraction = translation_observed_fraction,
+       # TRUE only when the history arm actually contributed precision.
+       # [2026-08-10] See the note on the early return above.
+       blend_used_history = TRUE,
+       w_translation = if (blended_precision > 0)
+                         precision_translation / blended_precision else 0)
 }
 
 # ------------------------------------------------------------------------------
@@ -2087,16 +2960,33 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
 #'             named list per position with $curve_data containing
 #'             age_at_season_start, mean_delta, fitted_loess, fitted_quad
 #' @keywords internal
-.load_or_build_aging_curves <- function(force_rebuild = FALSE,
-                                          cache_dir = CACHE_DIR_DEFAULT) {
+.load_or_build_aging_curves <- function(scoring_settings,
+                                          force_rebuild = FALSE,
+                                          cache_dir = CACHE_DIR_DEFAULT,
+                                          panel_seasons = AGING_PANEL_SEASONS) {
 
-  panel_cached  <- file.exists(AGING_PANEL_CACHE_PATH) && !force_rebuild
-  curves_cached <- file.exists(AGING_CURVES_CACHE_PATH) && !force_rebuild
+  if (missing(scoring_settings) || is.null(scoring_settings)) {
+    stop(
+      ".load_or_build_aging_curves(): scoring_settings is required. Curves ",
+      "are a trajectory of fantasy points by age and are therefore specific ",
+      "to a scoring. There is no meaningful default: a default would ",
+      "reintroduce the scoring-blind hardcode this function exists to remove.",
+      call. = FALSE
+    )
+  }
+
+  curves_path <- .aging_curves_cache_path(scoring_settings, cache_dir,
+                                         panel_seasons = panel_seasons)
+  panel_path  <- .r29_panel_cache_path(cache_dir)
+
+  panel_cached  <- file.exists(panel_path) && !force_rebuild
+  curves_cached <- file.exists(curves_path) && !force_rebuild
 
   if (panel_cached && curves_cached) {
     message("  Loading aging curves from cache...")
-    panel  <- readRDS(AGING_PANEL_CACHE_PATH)
-    curves <- readRDS(AGING_CURVES_CACHE_PATH)
+    message(glue("    {basename(curves_path)}"))
+    panel  <- readRDS(panel_path)
+    curves <- readRDS(curves_path)
 
     # Normalize stale cache layout. Older builds wrapped the position-keyed
     # curves as list(curves = <position-keyed>, built_for_season = <int>).
@@ -2116,35 +3006,58 @@ SLEEPER_TO_NFLREADR_TEAM_MAP <- c(
   }
 
   message(glue(""))
-  message(glue("  FIRST-RUN AGING CURVE BUILD"))
-  message(glue("  ============================"))
-  message(glue("  Building R/16 player-season panel (16 seasons)..."))
-  message(glue("  This step takes 10-15 minutes. Subsequent runs load from cache."))
+  message(glue("  AGING CURVE BUILD (scoring-specific)"))
+  message(glue("  ===================================="))
+  message(glue("  Target: {basename(curves_path)}"))
+
+  if (panel_cached) {
+    message(glue("  Panel cache hit; fitting curves on this scoring only."))
+    panel <- readRDS(panel_path)
+  } else {
+    message(glue("  Building R/16 player-season panel (16 seasons)..."))
+    message(glue("  This step takes 10-15 minutes. It is scoring-independent ",
+                 "and runs once."))
+    message(glue(""))
+
+    panel <- build_player_season_panel(
+      seasons   = panel_seasons,
+      cache_dir = cache_dir,
+      verbose   = TRUE
+    )
+
+    if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+    saveRDS(panel, panel_path)
+    message(glue("  Panel cached: {basename(panel_path)}"))
+  }
+
   message(glue(""))
+  message(glue("  Fitting R/23 aging curves on THIS scoring..."))
 
-  panel <- build_player_season_panel(
-    seasons   = AGING_PANEL_SEASONS,
-    cache_dir = cache_dir,
-    verbose   = TRUE
-  )
-
-  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
-  saveRDS(panel, AGING_PANEL_CACHE_PATH)
-  message(glue("  Panel cached: {basename(AGING_PANEL_CACHE_PATH)}"))
-
-  message(glue(""))
-  message(glue("  Fitting R/23 aging curves..."))
-
+  # scoring_settings flows into R/23, which routes the panel through
+  # attach_scored_ppg() so fp_per_game is the league's own points before any
+  # delta is computed. Without it R/23 falls back to compute_season_ppg()'s
+  # hardcoded PPR scale.
+  # seasons and cache_dir MUST be passed. R/23 threads both correctly into
+  # attach_scored_ppg(), but its own defaults are the file-level constants
+  # PANEL_SEASONS (2010:2025) and CACHE_DIR (production season2_cache). Omitting
+  # them meant the scored path reached past this run's namespace into
+  # production pbp and re-scored every season through the current one, so a
+  # holdout run fit its aging curves on the very season it was predicting, and
+  # wrote game-panel caches outside its namespace. The panel argument above is
+  # already correctly windowed; these two make the scoring pass agree with it.
   aging_results <- run_aging_curve_pipeline(
-    panel      = panel,
-    save_plots = FALSE,
-    verbose    = TRUE
+    panel            = panel,
+    seasons          = panel_seasons,
+    cache_dir        = cache_dir,
+    scoring_settings = scoring_settings,
+    save_plots       = FALSE,
+    verbose          = TRUE
   )
 
   curves <- aging_results$curves_boxscore
 
-  saveRDS(curves, AGING_CURVES_CACHE_PATH)
-  message(glue("  Curves cached: {basename(AGING_CURVES_CACHE_PATH)}"))
+  saveRDS(curves, curves_path)
+  message(glue("  Curves cached: {basename(curves_path)}"))
 
   list(panel = panel, curves = curves)
 }
@@ -2396,6 +3309,166 @@ compute_prior_weight <- function(week) {
 }
 
 # ==============================================================================
+# EXPORT 1b: load_ytd_k_table / compute_ytd_observed_weight  [2026-09-18]
+# ==============================================================================
+
+#' Load the R/58 games-based YTD k table, if the gate wrote one
+#'
+#' @param path Character, or NULL (default) for the path R/58 writes under
+#'   scoring_settings: YTD_K_PATH for flat PPR, a scoring-keyed path otherwise.
+#' @param scoring_settings List. The scoring the run uses. [2026-10-01] A table
+#'   is returned only when it was fit under this scoring (see
+#'   .r29_gate_matches_scoring()); otherwise NULL and the caller runs linear.
+#' @return Named numeric vector of k by position, or NULL when absent, fit under
+#'   another scoring, or when the gate recorded that the games-based form did
+#'   not win.
+#' @export
+load_ytd_k_table <- function(path = NULL,
+                             scoring_settings = DEFAULT_SCORING_SETTINGS) {
+  if (is.null(path)) path <- scoring_gate_path(YTD_K_PATH, scoring_settings)
+  if (!file.exists(path)) return(NULL)
+  obj <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(obj) || !is.list(obj) || is.null(obj$k_by_position)) return(NULL)
+  if (!.r29_gate_matches_scoring(obj, scoring_settings)) {
+    message(glue("  load_ytd_k_table(): {basename(path)} was fit under a ",
+                 "different scoring; ignored (linear schedule)."))
+    return(NULL)
+  }
+  if (!isTRUE(obj$gate_passed)) return(NULL)
+  k <- obj$k_by_position
+  if (!is.numeric(k) || is.null(names(k)) || any(!is.finite(k)) || any(k <= 0)) {
+    return(NULL)
+  }
+  k
+}
+
+#' Per-player observed weight for the YTD update
+#'
+#' Vectorized over players. Under mode "games" the weight is
+#' ytd_n / (ytd_n + k[position]); a position missing from the table falls back
+#' to the linear schedule for that row. Under mode "linear" every row gets
+#' 1 - compute_prior_weight(week). Mode "auto" is "games" when a gated k table
+#' is supplied and "linear" otherwise.
+#'
+#' @param ytd_n Integer vector of observed games.
+#' @param position Character vector.
+#' @param week Integer. Current week (linear fallback only).
+#' @param k_table Named numeric vector from load_ytd_k_table(), or NULL.
+#' @param mode "auto", "linear", or "games".
+#' @return List: observed_weight (numeric vector), mode_used (character
+#'   vector, "games" or "linear" per row).
+#' @export
+compute_ytd_observed_weight <- function(ytd_n, position, week,
+                                        k_table = NULL,
+                                        mode = YTD_WEIGHT_MODE_DEFAULT) {
+  mode <- match.arg(mode, c("auto", "linear", "games"))
+  if (mode == "auto") mode <- if (is.null(k_table)) "linear" else "games"
+  if (mode == "games" && is.null(k_table)) {
+    stop("compute_ytd_observed_weight(): mode = 'games' but no k table. ",
+         "Run R/58 or set mode = 'linear'.", call. = FALSE)
+  }
+
+  n   <- length(ytd_n)
+  lin <- rep(1 - compute_prior_weight(week), n)
+  if (mode == "linear") {
+    return(list(observed_weight = lin, mode_used = rep("linear", n)))
+  }
+
+  k_row <- unname(k_table[as.character(position)])
+  use_g <- !is.na(k_row)
+  w <- lin
+  w[use_g] <- ytd_n[use_g] / (ytd_n[use_g] + k_row[use_g])
+  w <- pmin(pmax(w, 0), 1 - PRIOR_WEIGHT_FLOOR)
+  list(observed_weight = w,
+       mode_used = ifelse(use_g, "games", "linear"))
+}
+
+# ==============================================================================
+# EXPORT 1c: load_r63_xfp_params / load_xfp_ytd  [2026-09-30]
+# ==============================================================================
+
+#' Load the R/63 C1 (xFP) parameters, per position, with wiring flags
+#'
+#' @param path Character, or NULL (default) for the path R/63 writes under
+#'   scoring_settings: R63_GATE_PATH_R29 for flat PPR, a scoring-keyed path
+#'   otherwise.
+#' @param scoring_settings List. The scoring the run uses. [2026-10-01] The
+#'   xFP map converts xFP into THIS scoring's points, so a gate fit under any
+#'   other scoring is rejected and wiring stays off.
+#' @return Tibble position, wired (logical), k1, a1, map_a0, map_b1; or NULL
+#'   when the gate object is absent, malformed, or fit under another scoring
+#'   (xFP wiring then stays off).
+#' @export
+load_r63_xfp_params <- function(path = NULL,
+                                scoring_settings = DEFAULT_SCORING_SETTINGS) {
+  if (is.null(path)) path <- scoring_gate_path(R63_GATE_PATH_R29, scoring_settings)
+  if (!file.exists(path)) return(NULL)
+  g <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(g) || !identical(g$schema_tag, R63_GATE_SCHEMA)) return(NULL)
+  if (!.r29_gate_matches_scoring(g, scoring_settings)) {
+    message(glue("  load_r63_xfp_params(): {basename(path)} was fit under a ",
+                 "different scoring; ignored (xFP wiring off)."))
+    return(NULL)
+  }
+  p <- g$params_all_seasons
+  d <- g$decisions
+  need_p <- c("position", "k1", "a1", "map_a0", "map_b1")
+  if (is.null(p) || is.null(d) || !all(need_p %in% names(p)) ||
+      !all(c("test", "position", "wiring_eligible") %in% names(d))) return(NULL)
+  wired <- d %>%
+    dplyr::filter(test == "c1_xfp") %>%
+    dplyr::select(position, wired = wiring_eligible)
+  out <- p %>%
+    dplyr::select(dplyr::all_of(need_p)) %>%
+    dplyr::left_join(wired, by = "position", relationship = "one-to-one") %>%
+    dplyr::mutate(wired = dplyr::coalesce(wired, FALSE))
+  if (any(!is.finite(out$a1)) || any(!is.finite(out$map_b1))) return(NULL)
+  out
+}
+
+#' Season-to-date expected fantasy points per player, weeks <= ytd_through
+#'
+#' @param season Integer.
+#' @param ytd_through Integer. Last week included (the projected week minus 1).
+#' @param model_version Character. ff_opportunity model version to request.
+#' @return Tibble player_id, ytd_xfp_n, ytd_xfp_raw_mean, or NULL when the
+#'   data cannot be loaded (wiring is then off for the run).
+#' @export
+load_xfp_ytd <- function(season, ytd_through,
+                         model_version = R29_EP_MODEL_VERSION) {
+  if (ytd_through < 1L) return(NULL)
+  ep <- tryCatch(
+    nflreadr::load_ff_opportunity(seasons = season, stat_type = "weekly",
+                                  model_version = model_version),
+    error = function(e) {
+      message(glue("  ff_opportunity {model_version} failed: {conditionMessage(e)}"))
+      NULL
+    })
+  if (is.null(ep) || nrow(ep) == 0) return(NULL)
+  need <- c("player_id", "week", "total_fantasy_points_exp")
+  if (!all(need %in% names(ep))) {
+    message("  ff_opportunity weekly is missing required columns; xFP wiring off.")
+    return(NULL)
+  }
+  ep <- ep %>%
+    dplyr::mutate(week = as.integer(week)) %>%
+    dplyr::filter(week <= ytd_through, !is.na(player_id),
+                  !is.na(total_fantasy_points_exp)) %>%
+    dplyr::distinct(player_id, week, .keep_all = TRUE)
+  if (nrow(ep) == 0) {
+    message(glue("  ff_opportunity {model_version}: no rows through week {ytd_through}; xFP wiring off."))
+    return(NULL)
+  }
+  message(glue("  ff_opportunity {model_version}: weeks {min(ep$week)}-{max(ep$week)}, ",
+               "{dplyr::n_distinct(ep$player_id)} players (through week {ytd_through})"))
+  ep %>%
+    dplyr::group_by(player_id) %>%
+    dplyr::summarise(ytd_xfp_n = dplyr::n(),
+                     ytd_xfp_raw_mean = mean(total_fantasy_points_exp),
+                     .groups = "drop")
+}
+
+# ==============================================================================
 # EXPORT 2: load_adp_fantasypros
 # ==============================================================================
 
@@ -2529,6 +3602,90 @@ load_adp_fantasypros <- function(season,
       adp_worst      = worst,
       adp_tier       = tier
     )
+
+  # ---------------------------------------------------------------------------
+  # ONE ROW PER GSIS ID  [2026-09-02]
+  # ---------------------------------------------------------------------------
+  # .build_fantasypros_crosswalk() matches on name and can map two DIFFERENT
+  # FantasyPros players onto the same NFL gsis_id. Observed on the 2026 PPR
+  # pull cached 2026-08-29:
+  #
+  #   nfl_gsis_id  fantasypros_id  player_name      pos  team  adp_rank
+  #   00-0039451   26379           Isaiah Williams  WR   NYJ   428
+  #   00-0039451   10977           Isaiah Williams  WR   FA    469
+  #
+  # Two distinct FantasyPros entries, one real player id. R/29's STEP 9 joins
+  # this table on nfl_gsis_id, so the duplicate fanned that player into two
+  # projection rows and the terminal player_uid guard aborted the whole run
+  # 300 lines later with "0 NA and 1 duplicate". The engine was unrunnable and
+  # no league board could be built.
+  #
+  # THE RULE, and it is a CHOICE, not a derivation. Prefer the row carrying a
+  # real NFL team over one marked FA or blank, then break ties on the lower
+  # (better) adp_rank. Rationale: an entry with a current team is the live
+  # listing; an FA duplicate of a rostered player is a stale or generic entry.
+  # On the observed case this keeps the NYJ row at 428 and drops FA at 469.
+  #
+  # WHAT THIS DOES NOT FIX. The crosswalk itself is still wrong: it should not
+  # map two FantasyPros ids onto one gsis_id in the first place. This is a
+  # containment measure at the boundary, not a repair of the name match. The
+  # count below is deliberately loud so a growing number is visible rather
+  # than silently absorbed.
+  .adp_dupe_ids <- adp_out %>%
+    dplyr::filter(!is.na(.data$nfl_gsis_id)) %>%
+    dplyr::count(.data$nfl_gsis_id, name = "n_rows") %>%
+    dplyr::filter(.data$n_rows > 1L)
+
+  if (nrow(.adp_dupe_ids) > 0L) {
+    .dupe_detail <- adp_out %>%
+      dplyr::filter(.data$nfl_gsis_id %in% .adp_dupe_ids$nfl_gsis_id) %>%
+      dplyr::arrange(.data$nfl_gsis_id, .data$adp_rank)
+    message(glue(
+      "  ADP crosswalk collision: {nrow(.adp_dupe_ids)} gsis_id(s) carry more ",
+      "than one FantasyPros entry. Keeping the team-assigned row, then the ",
+      "better adp_rank."
+    ))
+    for (i in seq_len(min(nrow(.dupe_detail), 10L))) {
+      message(glue(
+        "    {.dupe_detail$nfl_gsis_id[i]} | fp_id {.dupe_detail$fantasypros_id[i]} ",
+        "| {.dupe_detail$player_name[i]} | {.dupe_detail$pos[i]} ",
+        "| team {.dupe_detail$team[i]} | adp {.dupe_detail$adp_rank[i]}"
+      ))
+    }
+  }
+
+  .adp_keyed <- adp_out %>%
+    dplyr::filter(!is.na(.data$nfl_gsis_id)) %>%
+    dplyr::mutate(
+      .has_team = !is.na(.data$team) &
+        nchar(trimws(as.character(.data$team))) > 0L &
+        toupper(trimws(as.character(.data$team))) != "FA"
+    ) %>%
+    dplyr::arrange(.data$nfl_gsis_id, dplyr::desc(.data$.has_team),
+                   .data$adp_rank) %>%
+    dplyr::distinct(.data$nfl_gsis_id, .keep_all = TRUE) %>%
+    dplyr::select(-".has_team")
+
+  # Unmatched rows are DIFFERENT players that simply failed the crosswalk, not
+  # duplicates of one another. They are carried through untouched; R/29's join
+  # uses na_matches = "never" so they cannot match anything downstream anyway.
+  .adp_unkeyed <- adp_out %>%
+    dplyr::filter(is.na(.data$nfl_gsis_id))
+
+  adp_out <- dplyr::bind_rows(.adp_keyed, .adp_unkeyed)
+
+  .n_dupe_remaining <- adp_out %>%
+    dplyr::filter(!is.na(.data$nfl_gsis_id)) %>%
+    dplyr::count(.data$nfl_gsis_id, name = "n_rows") %>%
+    dplyr::filter(.data$n_rows > 1L) %>%
+    nrow()
+  if (.n_dupe_remaining > 0L) {
+    stop(glue(
+      "load_adp_fantasypros(): {.n_dupe_remaining} gsis_id(s) still carry ",
+      "multiple rows after deduplication. Do not cache this table -- R/29's ",
+      "STEP 9 join would fan out."
+    ), call. = FALSE)
+  }
 
   saveRDS(adp_out, cache_path)
   message(glue("  Cached to: {basename(cache_path)}"))
@@ -2748,7 +3905,7 @@ load_consensus_projections_fantasypros <- function(season,
       dplyr::filter(
         .data$position == pos,
         !is.na(.data$score_final),
-        !is.na(.data$ppr_per_game_y13)
+        !is.na(.data$outcome_scored)
       )
     n <- nrow(d)
 
@@ -2763,7 +3920,7 @@ load_consensus_projections_fantasypros <- function(season,
       next
     }
 
-    fit <- stats::lm(ppr_per_game_y13 ~ score_final, data = d)
+    fit <- stats::lm(outcome_scored ~ score_final, data = d)
     out[[pos]] <- list(
       intercept = unname(stats::coef(fit)[1]),
       slope     = unname(stats::coef(fit)[2]),
@@ -2773,7 +3930,7 @@ load_consensus_projections_fantasypros <- function(season,
   }
 
   if (verbose) {
-    message("  score_final -> PPR/game fallback calibration (per position):")
+    message("  score_final -> points fallback calibration, LEAGUE SCORING (per position):")
     for (pos in SUPPORTED_POSITIONS) {
       o <- out[[pos]]
       message(glue(
@@ -2815,7 +3972,8 @@ load_consensus_projections_fantasypros <- function(season,
 #'   n_nfl_seasons, score_final, score_v1, has_translation, has_history,
 #'   prior_source, years_exp. prior_source is the lifecycle state, one of:
 #'   "translation_active", "translation_capped_rookie",
-#'   "phased_out_history_only", "calibrated_fallback",
+#'   "phased_out_history_only", "phaseout_stale_history",
+#'   "calibrated_fallback",
 #'   "phaseout_no_history_fallback", "veteran_history_only".
 #'
 #' @details
@@ -2863,9 +4021,12 @@ build_projection_priors <- function(season,
                                                  "s2_week10_performance.rds"),
                                      cache_dir = CACHE_DIR_DEFAULT,
                                      scoring_settings = DEFAULT_SCORING_SETTINGS,
+                                     panel_seasons = NULL,
+                                     recency_lambda = HIST_RECENCY_LAMBDA,
                                      include_pre2015_vets = TRUE) {
 
   season <- as.integer(season)
+  if (is.null(panel_seasons)) panel_seasons <- .r29_aging_panel_seasons(season)
 
   if (!file.exists(prospects_path)) {
     stop(
@@ -2886,15 +4047,75 @@ build_projection_priors <- function(season,
   # file in season2_cache (where R/24 writes it; NOT the season3 augmented
   # predictions dir). Fails loud if absent so a stale or missing baseline can
   # never silently miscalibrate the prior.
-  translation_sigmas <- .load_translation_sigmas(translation_perf_path)
+  # Wave A2. Translation sigma is computed UNDER THIS LEAGUE'S SCORING from
+  # R/24's LOCO component predictions, not read as a fixed reference-scoring
+  # RMSE. See .compute_translation_sigmas_scored() for why the legacy path
+  # mis-weights the prior. The legacy loader is retained in the file for
+  # comparison and is no longer on the live path.
+  translation_preds_path <- file.path(dirname(translation_perf_path),
+                                      "s2_week10_predictions.rds")
+  translation_sigmas <- .compute_translation_sigmas_scored(
+    preds_path       = translation_preds_path,
+    scoring_settings = scoring_settings
+  )
+  legacy_sigmas <- .load_translation_sigmas(translation_perf_path)
+  message("  Translation sigma (scoring-aware vs legacy reference-scoring):")
+  for (p in names(translation_sigmas)) {
+    message(glue(
+      "    {p}: {round(translation_sigmas[[p]], 3)} ",
+      "(legacy {round(legacy_sigmas[[p]], 3)})"
+    ))
+  }
 
   message("STEP 1/4: Loading R/28 prospects and R/24 predictions...")
 
+  # WAVE A2 IDENTITY FIX.
+  #
+  # These two filters previously read !is.na(nfl_gsis_id) and silently removed
+  # every prospect without an NFL id: 848 -> 840 on the prospect side, 850 ->
+  # 840 on the prediction side. The eight removed were not edge cases but
+  # draftable 2026 rookies (Carson Beck, Nicholas Singleton, De'Zhaun
+  # Stribling, Colbie Young, Deion Burks, Kaden Prather, Oscar Delp, Joe
+  # Royer). They did not fall to the calibrated fallback; they were absent from
+  # the board entirely, which is worse because nothing downstream can notice a
+  # row that never existed.
+  #
+  # Removing the filter alone would be unsafe: joining on nfl_gsis_id with NA
+  # on both sides matches NA to NA under dplyr's default na_matches = "na" and
+  # fans out. So the join key becomes player_uid.
+  #
+  # The uid is built by .r29_build_player_uid() below, which INLINES its
+  # normalization rather than calling .normalize_player_name(). That is
+  # deliberate: R/24 and R/29 both define a function by that name and they
+  # disagree -- R/24's strips to [a-z], R/29's keeps spaces. Whichever file is
+  # sourced last wins, so a uid builder that calls the shared name produces
+  # "rk_carson beck_2026_QB" here and "rk_carsonbeck_2026_QB" in R/39, and the
+  # two halves never join. Inlining removes the dependency entirely.
   prospects <- readr::read_csv(prospects_path, show_col_types = FALSE) %>%
-    dplyr::filter(!is.na(nfl_gsis_id), position %in% SUPPORTED_POSITIONS)
+    dplyr::filter(position %in% SUPPORTED_POSITIONS) %>%
+    dplyr::mutate(
+      player_uid = .r29_build_player_uid(
+        nfl_gsis_id, cfb_player_name, draft_year, position
+      )
+    )
 
-  predictions <- readRDS(translation_path) %>%
-    dplyr::filter(!is.na(nfl_gsis_id))
+  predictions <- readRDS(translation_path)
+
+  if (!"player_uid" %in% names(predictions)) {
+    stop(
+      "build_projection_priors(): translation predictions carry no player_uid. ",
+      "Regenerate R/39 on schema s3_r39_v2 or later.",
+      call. = FALSE
+    )
+  }
+
+  dup_pros <- sum(duplicated(prospects$player_uid))
+  if (dup_pros > 0L) {
+    warning(glue(
+      "{dup_pros} duplicated player_uid(s) in the prospects file; the join ",
+      "will fan out. Investigate before trusting the board."
+    ), call. = FALSE)
+  }
 
   message(glue("  Prospects: {nrow(prospects)} rows ",
                "({length(unique(prospects$nfl_gsis_id))} unique gsis_ids)"))
@@ -2906,31 +4127,135 @@ build_projection_priors <- function(season,
   # against the v1 models; training rows keep their LOCO predictions), plus
   # draft_year (for years_exp) and pred_type ("final_model" rookie vs "loco"
   # training -- informational; the lifecycle logic keys on years_exp, not type).
+  # Wave A2. Carry the component prediction columns alongside the scalars. The
+  # scalars remain for diagnostics and backward compatibility; the SCORED
+  # component line is what feeds the prior. R/39 guarantees both variants'
+  # component columns are present and non-NA on every row.
+  comp_base_cols <- paste0("pred_base_",     STAT_COMPONENTS)
+  comp_enr_cols  <- paste0("pred_enriched_", STAT_COMPONENTS)
+  missing_comp   <- setdiff(c(comp_base_cols, comp_enr_cols), names(predictions))
+  if (length(missing_comp) > 0L) {
+    stop(
+      "build_projection_priors(): translation predictions missing component ",
+      "column(s): ", paste(missing_comp, collapse = ", "),
+      "\n  Regenerate R/39 (score_prediction_cohort()) on the Wave A2 schema ",
+      "s3_r39_v2.",
+      call. = FALSE
+    )
+  }
+
+  # Score both component lines under THIS league's scoring. This is the whole
+  # point of the A2 path: the prior now moves when scoring moves, with no
+  # conversion factor and no refit. A player's predicted stat line is fixed;
+  # what it is worth is not.
+  #
+  # NEGATIVE COMPONENTS ARE CLAMPED TO ZERO FIRST.
+  # Elastic net is unconstrained, so a low-projection player can carry a
+  # negative predicted pass TD or reception count. A negative count is not a
+  # quantity that exists, and it breaks the property this whole path was built
+  # to deliver: with all components non-negative, raising any scoring parameter
+  # can only raise a player's projection. With one negative component, raising
+  # that parameter LOWERS him. That is exactly the inversion observed when the
+  # pass TD went from 4 to 6 and a QB's prior fell.
+  #
+  # Clamping is applied here, at the point of use, rather than in R/39, so the
+  # R/39 file stays an honest record of raw model output and the modelling
+  # decision is visible where it changes a number. The count is reported every
+  # run; a rising count is a signal that the component models need attention,
+  # not something to be absorbed silently.
+  .clamp_components <- function(df, label) {
+    n_neg <- sum(vapply(df, function(x) sum(x < 0, na.rm = TRUE), integer(1)))
+    if (n_neg > 0L) {
+      message(glue(
+        "    {label}: {n_neg} negative component value(s) clamped to 0 ",
+        "(guarantees monotonicity under scoring changes)"
+      ))
+    }
+    as.data.frame(lapply(df, function(x) pmax(x, 0)))
+  }
+
+  pb <- predictions[, comp_base_cols, drop = FALSE]; names(pb) <- STAT_COMPONENTS
+  pe <- predictions[, comp_enr_cols,  drop = FALSE]; names(pe) <- STAT_COMPONENTS
+  pb <- .clamp_components(pb, "base")
+  pe <- .clamp_components(pe, "enriched")
+  predictions$pred_base_scored     <- score_stat_line(pb, scoring_settings)
+  predictions$pred_enriched_scored <- score_stat_line(pe, scoring_settings)
+
+  message(glue(
+    "  Component lines scored under league scoring. ",
+    "base mean {round(mean(predictions$pred_base_scored, na.rm = TRUE), 2)} ",
+    "(fixed-PPR scalar mean ",
+    "{round(mean(predictions$pred_base, na.rm = TRUE), 2)}); ",
+    "enriched mean ",
+    "{round(mean(predictions$pred_enriched_scored, na.rm = TRUE), 2)} ",
+    "(scalar {round(mean(predictions$pred_enriched, na.rm = TRUE), 2)})"
+  ))
+
+  # Join on player_uid, never nfl_gsis_id. player_uid is non-NA on every row by
+  # construction, so this cannot fan out on NA and cannot drop the id-less
+  # rookie cohort. nfl_gsis_id travels through for every downstream consumer
+  # that still keys on it.
   base <- prospects %>%
-    dplyr::select(nfl_gsis_id, position, score_v1, score_final,
+    dplyr::select(player_uid, nfl_gsis_id, position, score_v1, score_final,
                   score_base, score_enriched) %>%
     dplyr::left_join(
-      predictions %>% dplyr::select(nfl_gsis_id, pred_base, pred_enriched,
+      predictions %>% dplyr::select(player_uid,
+                                    pred_base, pred_enriched,
+                                    pred_base_scored, pred_enriched_scored,
                                     draft_year, pred_type),
-      by = "nfl_gsis_id"
+      by = "player_uid"
     )
+
+  n_no_pred <- sum(is.na(base$pred_base_scored))
+  message(glue(
+    "  Prospect/prediction join on player_uid: {nrow(base)} rows, ",
+    "{nrow(base) - n_no_pred} with a translation prediction, ",
+    "{n_no_pred} without."
+  ))
 
   message(glue("  Joined: {nrow(base)} prospect rows; ",
                "{sum(!is.na(base$pred_base))} have pred_base, ",
                "{sum(!is.na(base$pred_enriched))} have pred_enriched"))
 
-  # Fit the per-position score_final -> PPR/game fallback calibration once, from
-  # the training rows in the joined set (those with a known ppr_per_game_y13).
-  # The R/39 augmented file does not carry ppr_per_game_y13 into `base` (only
-  # pred_* and meta were selected), so pull outcome from the predictions object
-  # directly for the fit.
+  # Fit the per-position score_final -> points fallback calibration once.
+  #
+  # WAVE A2: the outcome regressed on is the OBSERVED stat line scored under
+  # THIS LEAGUE'S SCORING, not ppr_per_game_y13. The old outcome was a fixed
+  # reference-scoring number, which made the fallback line identical across
+  # every league. That matters more than it sounds: on the 2026 board 328
+  # players sit on phaseout_no_history_fallback, so a scoring-blind fallback
+  # freezes roughly a third of the prior surface no matter what the league
+  # scores. Same defect class as the translation prior, different code path.
+  #
+  # The observed components live in R/24's LOCO predictions file, the same
+  # source the scoring-aware sigma reads. R/39's augmented file deliberately
+  # carries predictions only, so the truth is pulled from R/24 directly.
+  loco_truth <- readRDS(translation_preds_path)
+  missing_truth <- setdiff(c("nfl_gsis_id", STAT_COMPONENTS), names(loco_truth))
+  if (length(missing_truth) > 0L) {
+    stop(
+      "build_projection_priors(): LOCO predictions file missing column(s): ",
+      paste(missing_truth, collapse = ", "),
+      "\n  Observed component columns are required to calibrate the fallback ",
+      "under league scoring. Regenerate R/24.",
+      call. = FALSE
+    )
+  }
+  loco_truth$outcome_scored <- score_stat_line(
+    loco_truth[, STAT_COMPONENTS, drop = FALSE], scoring_settings
+  )
+
+  if (!"player_uid" %in% names(loco_truth)) {
+    stop(
+      "build_projection_priors(): LOCO predictions file carries no player_uid. ",
+      "Regenerate R/24.", call. = FALSE
+    )
+  }
   fallback_fit_df <- prospects %>%
-    dplyr::select(nfl_gsis_id, position, score_final) %>%
+    dplyr::select(player_uid, position, score_final) %>%
     dplyr::inner_join(
-      predictions %>%
-        dplyr::filter(pred_type == "loco") %>%
-        dplyr::select(nfl_gsis_id, ppr_per_game_y13),
-      by = "nfl_gsis_id"
+      loco_truth %>% dplyr::select(player_uid, outcome_scored),
+      by = "player_uid"
     )
   fallback_calib <- .fit_score_final_fallback(fallback_fit_df)
 
@@ -2939,7 +4264,8 @@ build_projection_priors <- function(season,
   history <- .compute_player_historical_stats(
     season = season,
     cache_dir = cache_dir,
-    scoring_settings = scoring_settings
+    scoring_settings = scoring_settings,
+    recency_lambda = recency_lambda
   )
 
   message(glue("  Historical stats computed for {nrow(history)} players"))
@@ -2949,8 +4275,17 @@ build_projection_priors <- function(season,
   r28_priors <- base %>%
     dplyr::left_join(
       history %>% dplyr::select(player_id, hist_mean, hist_sigma,
-                                 n_nfl_seasons, n_games_total),
-      by = c("nfl_gsis_id" = "player_id")
+                                 n_nfl_seasons, n_games_total, change_sigma,
+                                 # G3: wide-window columns. Selected explicitly
+                                 # here because this join is the only path from
+                                 # the history table to the lifecycle gate.
+                                 stale_hist_mean, stale_hist_sigma,
+                                 stale_n_nfl_seasons, stale_n_games_total,
+                                 stale_change_sigma),
+      # na_matches = "never": nfl_gsis_id is NA for the id-less rookie cohort,
+      # and dplyr's default would match those NAs against any NA-keyed history
+      # row. Every join keyed on nfl_gsis_id below carries the same guard.
+      by = c("nfl_gsis_id" = "player_id"), na_matches = "never"
     )
 
   r28_priors <- r28_priors %>%
@@ -2966,10 +4301,19 @@ build_projection_priors <- function(season,
       # Select the configured prediction; if the configured one is NA but the
       # other exists, fall to the available one rather than dropping to the
       # score_final fallback unnecessarily.
+      #
+      # WAVE A2: the SCORED component line is the point estimate, not the
+      # fixed-PPR scalar. pred_base / pred_enriched are retained on the row for
+      # diagnostics but no longer feed the prior. Under reference scoring the
+      # two are near-identical (correlation 0.997+ on the rookie cohort); they
+      # diverge exactly where they should, which is when the league scores
+      # differently from PPR.
       .variant = ROOKIE_TRANSLATION_VARIANT[[position]] %||% "base",
       pred_selected = {
-        primary  <- if (.variant == "enriched") pred_enriched else pred_base
-        fallback <- if (.variant == "enriched") pred_base else pred_enriched
+        primary  <- if (.variant == "enriched") pred_enriched_scored
+                    else pred_base_scored
+        fallback <- if (.variant == "enriched") pred_base_scored
+                    else pred_enriched_scored
         if (!is.na(primary)) as.numeric(primary)
         else if (!is.na(fallback)) as.numeric(fallback)
         else NA_real_
@@ -2999,14 +4343,56 @@ build_projection_priors <- function(season,
       .has_hist_raw = !is.na(hist_mean) & !is.na(n_nfl_seasons) &
                       n_nfl_seasons >= 1L,
 
+      # Stale history: nothing in the 3-year window, but qualifying seasons
+      # inside the 6-year one. This is the population that used to be
+      # indistinguishable from a rookie at this gate. A ten-year veteran with
+      # no recent snaps was handed the position-average calibrated line, so
+      # the model was MORE generous the longer a player had been out.
+      .has_hist_stale = !.has_hist_raw &
+                        !is.na(stale_hist_mean) &
+                        !is.na(stale_n_nfl_seasons) &
+                        stale_n_nfl_seasons >= 1L,
+
       lifecycle_state = dplyr::case_when(
         .phased_out &  .has_hist_raw  ~ "phased_out_history_only",
-        # Phased out, no computable history: calibrated fallback, NOT translation
-        # (Option 1). A 4+ year player's college signal is dead by construction.
+        # Phased out, no RECENT history but a real older record: price off that
+        # record, decayed. Ordered above the fallback arm so it intercepts the
+        # players the fallback was previously catching by accident.
+        .phased_out & .has_hist_stale ~ "phaseout_stale_history",
+        # Phased out, no computable history at any depth: calibrated fallback,
+        # NOT translation (Option 1). A 4+ year player's college signal is dead
+        # by construction. After the arm above, this arm means what it says.
         .phased_out & !.has_hist_raw  ~ "phaseout_no_history_fallback",
         .is_rookie  &  has_prediction ~ "translation_capped_rookie",
         has_prediction                ~ "translation_active",
         TRUE                          ~ "calibrated_fallback"
+      ),
+
+      # --- Effective history columns. For every pre-existing state these are
+      # the narrow columns unchanged, so nothing about those players moves.
+      # Only phaseout_stale_history reads the wide columns. Routing the
+      # substitution through named columns here rather than inside the blend
+      # call keeps one place where "which history does this player use" is
+      # decided, and makes the answer visible in diagnostics.
+      .hist_mean_eff = dplyr::if_else(
+        lifecycle_state == "phaseout_stale_history",
+        stale_hist_mean, hist_mean
+      ),
+      .hist_sigma_eff = dplyr::if_else(
+        lifecycle_state == "phaseout_stale_history",
+        stale_hist_sigma, hist_sigma
+      ),
+      .n_seasons_eff = dplyr::if_else(
+        lifecycle_state == "phaseout_stale_history",
+        stale_n_nfl_seasons, n_nfl_seasons
+      ),
+      .n_games_eff = dplyr::if_else(
+        lifecycle_state == "phaseout_stale_history",
+        stale_n_games_total, n_games_total
+      ),
+      .change_sigma_eff = dplyr::if_else(
+        lifecycle_state == "phaseout_stale_history",
+        stale_change_sigma, change_sigma
       ),
 
       # --- Calibrated fallback value (used by fallback states). Pull the two
@@ -3021,7 +4407,23 @@ build_projection_priors <- function(season,
         f <- fallback_calib[[position]]
         if (!is.null(f)) f$slope else 0.15
       },
-      mu_fallback = .fb_intercept + .fb_slope * as.numeric(score_final),
+      # Calibrated fallback line, FLOORED AT ZERO.
+      #
+      # The fit is linear in score_final and is applied to players well below
+      # its training support, where it returns the intercept: the QB line reads
+      # -2.29 + 0.198 * score_final, so a low-score player lands negative. A
+      # negative PPG projection is not a quantity that exists -- a player who
+      # never produces scores zero -- and it breaks monotonicity: refitting the
+      # line under a higher pass TD steepens the slope and lowers the
+      # intercept, so anyone below the crossover moves DOWN when scoring goes
+      # UP. That is the same inversion class the component path removed from
+      # the translation prior, arriving through the fallback instead.
+      #
+      # Flooring here rather than clamping prior_mu later keeps the floor
+      # attached to the term that needs it. History-based priors are not
+      # floored: a negative history mean is a real observed outcome, not an
+      # extrapolation artifact.
+      mu_fallback = max(0, .fb_intercept + .fb_slope * as.numeric(score_final)),
 
       # --- mu_translation by state.
       mu_translation = dplyr::case_when(
@@ -3032,8 +4434,9 @@ build_projection_priors <- function(season,
         lifecycle_state %in% c("calibrated_fallback",
                                "phaseout_no_history_fallback")
           ~ mu_fallback,
-        # phased_out_history_only: translation is zeroed; mu_translation is
-        # unused because the post-blend overwrite forces pure history. Set NA.
+        # phased_out_history_only and phaseout_stale_history: translation is
+        # zeroed; mu_translation is unused because the post-blend overwrite
+        # forces pure history. Set NA.
         TRUE ~ NA_real_
       ),
 
@@ -3053,42 +4456,77 @@ build_projection_priors <- function(season,
       # real mu_translation; .blend_prior_components() correctly returns the
       # translation alone when history is absent (n_nfl_seasons 0/NA) and blends
       # when history is present.
-      .mu_for_blend = if (lifecycle_state == "phased_out_history_only")
+      .mu_for_blend = if (lifecycle_state %in% c("phased_out_history_only",
+                                                 "phaseout_stale_history"))
                         NA_real_ else mu_translation,
 
       blend = list(.blend_prior_components(
         mu_translation     = .mu_for_blend,
         sigma_translation  = sigma_translation,
-        mu_history         = hist_mean,
-        sigma_history      = hist_sigma,
-        n_nfl_seasons      = n_nfl_seasons,
-        n_games_total      = n_games_total
+        mu_history         = .hist_mean_eff,
+        sigma_history      = .hist_sigma_eff,
+        n_nfl_seasons      = .n_seasons_eff,
+        n_games_total      = .n_games_eff,
+        change_sigma       = .change_sigma_eff
       ))
     ) %>%
     dplyr::ungroup() %>%
     dplyr::mutate(
-      # For phased_out_history_only, force the prior to pure history: the blend
-      # above still mixed in any mu_translation we passed, so overwrite with the
-      # history mean/sigma directly for that state. This is the explicit
-      # zero-translation guardrail (Option A).
+      # For phased_out_history_only, force the prior MU to pure history. The
+      # blend returns mu_history for that state on its own now that the
+      # translation arm drops out on a NA mu_translation, so this is redundant
+      # rather than load-bearing. It is kept as the explicit zero-translation
+      # guardrail (Option A).
       prior_mu = dplyr::if_else(
-        lifecycle_state == "phased_out_history_only",
-        hist_mean,
+        lifecycle_state %in% c("phased_out_history_only",
+                               "phaseout_stale_history"),
+        .hist_mean_eff,
         purrr::map_dbl(blend, "prior_mu")
       ),
-      prior_sigma = dplyr::if_else(
-        lifecycle_state == "phased_out_history_only",
-        hist_sigma,
-        purrr::map_dbl(blend, "prior_sigma")
-      ),
+      # prior_sigma is deliberately NOT overwritten. [2026-07-30]
+      # It used to be replaced with hist_sigma for phased_out_history_only.
+      # hist_sigma is a raw PER-GAME dispersion (see .compute_nfl_history:
+      # season_sigma = sd(game_points), then hist_sigma = mean(season_sigma)),
+      # while every other branch of this column holds a STANDARD ERROR of the
+      # season mean. Substituting one for the other overstated phased-out
+      # veterans by roughly sqrt(n_games_total), about 7 across three full
+      # seasons. The effect inverted the board: the players the model knows
+      # most about carried the widest intervals, the largest boom/bust spreads,
+      # and the biggest best-ball ceiling bonus in R/33, purely because their
+      # sigma was denominated in different units.
+      prior_sigma = purrr::map_dbl(blend, "prior_sigma"),
+      # Diagnostics emitted from INSIDE the blend, computed from the actual
+      # precisions rather than reconstructed downstream. A reconstruction of
+      # the form (1/sigma_translation^2) / (1/prior_sigma^2) assumes the
+      # translation precision is undecayed and silently returns values above 1
+      # once TRANSLATION_OBSERVED_DECAY is active. Emitting the real numbers
+      # removes that failure mode from every future diagnostic.
+      w_translation = purrr::map_dbl(blend, function(b)
+        if (!is.null(b$w_translation)) b$w_translation else NA_real_),
+      translation_observed_fraction = purrr::map_dbl(blend, function(b)
+        if (!is.null(b$translation_observed_fraction))
+          b$translation_observed_fraction else NA_real_),
+      # [2026-08-10] Which branch of .blend_prior_components() ran, as opposed
+      # to has_history below, which only counts qualifying seasons.
+      blend_used_history = purrr::map_lgl(blend, function(b)
+        isTRUE(b$blend_used_history)),
+      hist_mean_used = hist_mean,
       n_nfl_seasons   = dplyr::coalesce(n_nfl_seasons, 0L),
       has_history     = n_nfl_seasons >= 1L,
       prior_source    = lifecycle_state
     ) %>%
     dplyr::select(
-      nfl_gsis_id, position, prior_mu, prior_sigma, n_nfl_seasons,
+      player_uid, nfl_gsis_id, position, prior_mu, prior_sigma, n_nfl_seasons,
+      w_translation, translation_observed_fraction, blend_used_history,
+      hist_mean_used,
       score_final, score_v1, has_translation, has_history, prior_source,
-      years_exp
+      years_exp,
+      # omega_raw is the WEEK-TO-WEEK dispersion, kept separate from tau.
+      # [2026-07-30] Additive only: nothing downstream is required to read
+      # it, and no existing column changes meaning. NA for players without
+      # qualifying NFL history, which R/32's omega model fills in.
+      omega_raw = hist_sigma,
+      n_games_history = n_games_total
     )
 
   # Lifecycle state summary -- shows how many players took each path and the
@@ -3110,32 +4548,94 @@ build_projection_priors <- function(season,
     # Veterans with history but NOT in R/28 (pre-2015 draftees)
     vet_priors <- history %>%
       dplyr::filter(!player_id %in% r28_priors$nfl_gsis_id) %>%
+      # G3: the history table now also carries players whose ONLY qualifying
+      # seasons fall outside the narrow window. Their narrow columns are NA,
+      # so reading hist_mean directly would send them to the degenerate branch
+      # below with prior_mu = NA. Resolve narrow-or-stale up front, which is
+      # the same substitution the lifecycle gate makes for R/28 players.
+      dplyr::mutate(
+        .stale_only     = is.na(hist_mean) & !is.na(stale_hist_mean),
+        hist_mean       = dplyr::coalesce(hist_mean, stale_hist_mean),
+        hist_sigma      = dplyr::coalesce(hist_sigma, stale_hist_sigma),
+        n_nfl_seasons   = dplyr::coalesce(n_nfl_seasons, stale_n_nfl_seasons),
+        n_games_total   = dplyr::coalesce(n_games_total, stale_n_games_total),
+        change_sigma    = dplyr::coalesce(change_sigma, stale_change_sigma)
+      ) %>%
+      # These veterans route through .blend_prior_components() with NO
+      # translation arm, so they receive the same standard-error-of-the-mean
+      # treatment as every other branch. [2026-07-30]
+      # Previously prior_sigma was set to hist_sigma directly, a raw PER-GAME
+      # dispersion, which is the same units defect corrected above for
+      # phased_out_history_only. One code path now owns the conversion.
+      dplyr::rowwise() %>%
+      dplyr::mutate(
+        .vet_blend = list(
+          if (!is.na(hist_sigma) && hist_sigma > 0 &&
+              !is.na(n_games_total) && n_games_total >= 1L &&
+              !is.na(n_nfl_seasons) && n_nfl_seasons >= 1L) {
+            .blend_prior_components(
+              mu_translation    = NA_real_,
+              sigma_translation = translation_sigmas[[position]],
+              mu_history        = hist_mean,
+              sigma_history     = hist_sigma,
+              n_nfl_seasons     = n_nfl_seasons,
+              n_games_total     = n_games_total,
+              change_sigma      = change_sigma
+            )
+          } else {
+            # Degenerate history: a single logged game, or a season with no
+            # within-season variance, so no per-game SD exists to convert.
+            # Fall back to the position translation RMSE as a conservative
+            # tau, which is the behaviour this branch always had. The blend is
+            # not called here because it would hit its no-arm hard stop.
+            list(
+              prior_mu    = hist_mean,
+              prior_sigma = translation_sigmas[[position]]
+            )
+          }
+        )
+      ) %>%
+      dplyr::ungroup() %>%
       dplyr::mutate(
         nfl_gsis_id   = player_id,
-        prior_mu      = hist_mean,
-        # For veterans, prior sigma = within-player historical SD;
-        # if only one qualifying season, use position-specific TRANSLATION RMSE
-        # as a conservative variance estimate
-        prior_sigma   = dplyr::if_else(
-          is.na(hist_sigma) | hist_sigma <= 0,
-          purrr::map_dbl(position, ~ translation_sigmas[[.x]]),
-          hist_sigma
-        ),
+        prior_mu      = purrr::map_dbl(.vet_blend, "prior_mu"),
+        prior_sigma   = purrr::map_dbl(.vet_blend, "prior_sigma"),
+        # History-only by construction: no translation arm, so the weight on it
+        # is 0 and no share of the target window is being double-counted. Held
+        # as literals rather than read from the blend because the degenerate
+        # branch above returns a two-element list without them.
+        w_translation                 = 0,
+        translation_observed_fraction = NA_real_,
+        # [2026-08-10] TRUE for the real blend call, FALSE for the degenerate
+        # fallback below it, which returns a two-element list and therefore
+        # yields FALSE through isTRUE(NULL). That is the correct answer: the
+        # fallback has no usable history and hands back the translation RMSE.
+        blend_used_history            = purrr::map_lgl(.vet_blend, function(b)
+                                          isTRUE(b$blend_used_history)),
+        hist_mean_used                = hist_mean,
         score_final     = NA_real_,
         score_v1        = NA_real_,
         has_translation = FALSE,
         has_history     = TRUE,
-        prior_source    = "veteran_history_only",
+        prior_source    = dplyr::if_else(.stale_only,
+                                         "phaseout_stale_history",
+                                         "veteran_history_only"),
         # Pre-2015 vets are by definition well past phase-out; years_exp is not
         # computed for them (no draft_year in the history table) and is unused
         # downstream for history-only players. NA keeps the column aligned for
         # the bind_rows with r28_priors.
-        years_exp       = NA_integer_
+        years_exp       = NA_integer_,
+        # Veterans always carry a real gsis, so the uid is that id.
+        player_uid      = as.character(player_id)
       ) %>%
       dplyr::select(
-        nfl_gsis_id, position, prior_mu, prior_sigma, n_nfl_seasons,
-        score_final, score_v1, has_translation, has_history, prior_source,
-        years_exp
+        player_uid, nfl_gsis_id, position, prior_mu, prior_sigma,
+        n_nfl_seasons, w_translation, translation_observed_fraction,
+        blend_used_history,
+        hist_mean_used, score_final, score_v1, has_translation, has_history,
+        prior_source, years_exp,
+        omega_raw = hist_sigma,
+        n_games_history = n_games_total
       )
 
     message(glue("  Added {nrow(vet_priors)} non-R/28 veterans ",
@@ -3151,12 +4651,20 @@ build_projection_priors <- function(season,
         prior_source == "translation_active"              ~ 1L,
         prior_source == "translation_capped_rookie"       ~ 2L,
         prior_source == "phased_out_history_only"         ~ 3L,
-        prior_source == "calibrated_fallback"             ~ 4L,
-        prior_source == "phaseout_no_history_fallback"    ~ 5L,
-        prior_source == "veteran_history_only"            ~ 6L,
-        TRUE                                              ~ 7L
+        # Stale history outranks both fallbacks: a decayed real record is
+        # richer than a position-average line fitted to score_final.
+        prior_source == "phaseout_stale_history"          ~ 4L,
+        prior_source == "calibrated_fallback"             ~ 5L,
+        prior_source == "phaseout_no_history_fallback"    ~ 6L,
+        prior_source == "veteran_history_only"            ~ 7L,
+        TRUE                                              ~ 8L
       )) %>%
-      dplyr::distinct(nfl_gsis_id, .keep_all = TRUE)
+      # Dedupe on player_uid, NOT nfl_gsis_id. nfl_gsis_id is NA for the
+      # id-less rookie cohort, and distinct() treats every NA as the SAME
+      # value, so keying here on gsis silently collapsed eight distinct
+      # rookies into one row. player_uid is unique per player by
+      # construction, so this dedupes real duplicates only.
+      dplyr::distinct(player_uid, .keep_all = TRUE)
   } else {
     priors <- r28_priors
   }
@@ -3176,7 +4684,9 @@ build_projection_priors <- function(season,
   message("STEP 5/5: Applying aging curve adjustments (R/23 integration)...")
 
   aging_artifacts <- .load_or_build_aging_curves(
-    cache_dir = cache_dir
+    scoring_settings = scoring_settings,
+    cache_dir        = cache_dir,
+    panel_seasons    = panel_seasons
   )
   curves <- aging_artifacts$curves
 
@@ -3191,12 +4701,22 @@ build_projection_priors <- function(season,
 
   priors <- priors %>%
     dplyr::left_join(aging_adj, by = "nfl_gsis_id",
-                     relationship = "many-to-one") %>%
+                     relationship = "many-to-one",
+                     na_matches = "never") %>%
     dplyr::mutate(
       # Preserve original prior_mu before aging adjustment for diagnostic
       prior_mu_pre_age = prior_mu,
-      # Apply aging delta (0 for players without ages)
-      aging_delta_ppg  = dplyr::coalesce(aging_delta_ppg, 0),
+      # Raw curve delta, before the per-position weight. Kept as its own column
+      # so a neutralized position still reports what the curve WOULD have said,
+      # which is what makes the neutralization auditable rather than invisible.
+      aging_delta_raw  = dplyr::coalesce(aging_delta_ppg, 0),
+      aging_weight     = dplyr::coalesce(
+        unname(AGING_POSITION_WEIGHTS[position]), 1
+      ),
+      # Applied delta (0 for players without ages, and 0 for any position whose
+      # weight is neutralized -- see AGING_POSITION_WEIGHTS for the gate
+      # evidence behind QB = 0.00).
+      aging_delta_ppg  = aging_delta_raw * aging_weight,
       prior_mu         = prior_mu + aging_delta_ppg
     )
 
@@ -3211,6 +4731,22 @@ build_projection_priors <- function(season,
   message(glue("    Largest decline: {round(max_neg_delta, 2)} PPG"))
   message(glue("    Largest improvement: {round(max_pos_delta, 2)} PPG"))
 
+  # Report neutralized positions explicitly. A silent zero is indistinguishable
+  # from a missing curve, so name it and size what was suppressed.
+  neutralized <- names(AGING_POSITION_WEIGHTS)[AGING_POSITION_WEIGHTS == 0]
+  if (length(neutralized) > 0L) {
+    for (np in neutralized) {
+      sup <- priors$aging_delta_raw[priors$position == np &
+                                      !is.na(priors$aging_delta_raw)]
+      sup <- sup[sup != 0]
+      message(glue(
+        "    {np} aging NEUTRALIZED (weight 0.00): {length(sup)} player(s) ",
+        "suppressed, mean abs curve delta ",
+        "{round(mean(abs(sup)), 2)} PPG. See AGING_POSITION_WEIGHTS."
+      ))
+    }
+  }
+
   # ---- STEP 6: Apply injury proximity adjustments (Build 2 integration) ----
 
   message("STEP 6/6: Applying injury proximity adjustments (R/25 integration)...")
@@ -3223,13 +4759,19 @@ build_projection_priors <- function(season,
   )
 
   priors <- priors %>%
-    dplyr::left_join(injury_adj, by = "nfl_gsis_id",
+    dplyr::left_join(injury_adj, by = "nfl_gsis_id", na_matches = "never",
                      relationship = "many-to-one") %>%
     dplyr::mutate(
-      # Apply injury mu adjustment
-      prior_mu    = prior_mu + injury_mu_adj,
-      # Apply injury sigma inflation
-      prior_sigma = prior_sigma * injury_sigma_multiplier
+      # coalesce(): a player with no injury row gets NO adjustment, which is
+      # what "no injury on record" means. Without it an unmatched row turns
+      # prior_mu and prior_sigma into NA and the player silently disappears
+      # from every downstream ranking. The aging and volume steps already
+      # coalesce; these two did not, and the gap was invisible until rows with
+      # an NA nfl_gsis_id (the id-less rookie cohort) reached this join.
+      injury_mu_adj            = dplyr::coalesce(injury_mu_adj, 0),
+      injury_sigma_multiplier  = dplyr::coalesce(injury_sigma_multiplier, 1),
+      prior_mu                 = prior_mu + injury_mu_adj,
+      prior_sigma              = prior_sigma * injury_sigma_multiplier
     )
 
   n_treatment <- sum(priors$injury_group_prior_season == "treatment",
@@ -3260,10 +4802,12 @@ build_projection_priors <- function(season,
   )
 
   priors <- priors %>%
-    dplyr::left_join(ramp_adj, by = "nfl_gsis_id",
+    dplyr::left_join(ramp_adj, by = "nfl_gsis_id", na_matches = "never",
                      relationship = "many-to-one") %>%
     dplyr::mutate(
-      prior_mu = prior_mu + ramp_mu_adj
+      # See the injury step above: no ramp row means no adjustment, not NA.
+      ramp_mu_adj = dplyr::coalesce(ramp_mu_adj, 0),
+      prior_mu    = prior_mu + ramp_mu_adj
     )
 
   n_vet_ramp  <- sum(priors$ramp_mu_adj != 0, na.rm = TRUE)
@@ -3284,14 +4828,14 @@ build_projection_priors <- function(season,
   message("STEP 8/8: Applying volume/efficiency 70/30 blend (R/16 + Week 4)...")
 
   # Load cached panel (written by Build 1; always present after first run)
-  if (!file.exists(AGING_PANEL_CACHE_PATH)) {
+  if (!file.exists(.r29_panel_cache_path(cache_dir))) {
     message("  Panel cache not found -- skipping volume/efficiency blend.")
     message("  Re-run once to trigger the panel build.")
     priors$volume_implied_ppg <- NA_real_
     priors$volume_blend_adj   <- 0
     priors$n_panel_seasons    <- 0L
   } else {
-    panel_data <- readRDS(AGING_PANEL_CACHE_PATH)
+    panel_data <- readRDS(.r29_panel_cache_path(cache_dir))
 
     vol_adj <- .compute_volume_efficiency_blend(
       priors           = priors,
@@ -3308,7 +4852,7 @@ build_projection_priors <- function(season,
       dplyr::left_join(
         vol_adj %>% dplyr::select(nfl_gsis_id, volume_implied_ppg,
                                    volume_blend_adj, n_panel_seasons),
-        by = "nfl_gsis_id"
+        by = "nfl_gsis_id", na_matches = "never"
       ) %>%
       dplyr::mutate(
         volume_blend_adj = dplyr::coalesce(volume_blend_adj, 0),
@@ -3331,6 +4875,43 @@ build_projection_priors <- function(season,
     message(glue("    Largest discount: {round(max_neg_vol, 2)} PPG"))
   }
 
+  # ---- Terminal integrity guard ----
+  # An NA prior_mu is not a benign missing value: the player still occupies a
+  # row, still reaches the ranking code, and sorts to an arbitrary position
+  # rather than erroring. Every adjustment step above is written so that "no
+  # matching row" means "no adjustment", and this asserts that contract held.
+  # It exists because the contract was silently violated once: the injury and
+  # ramp joins lacked a coalesce, so any row whose key did not match came back
+  # NA and vanished from the board without a message.
+  bad <- priors %>% dplyr::filter(is.na(prior_mu) | is.na(prior_sigma))
+  if (nrow(bad) > 0L) {
+    print(as.data.frame(
+      bad %>% dplyr::select(dplyr::any_of(c(
+        "player_uid", "nfl_gsis_id", "position", "prior_source",
+        "prior_mu", "prior_sigma"
+      ))) %>% utils::head(20)
+    ))
+    stop(glue(
+      "build_projection_priors(): {nrow(bad)} player(s) finished with an NA ",
+      "prior_mu or prior_sigma. Rows printed above. An adjustment step is ",
+      "producing NA on an unmatched key instead of a no-op; find the join ",
+      "that lacks a coalesce()."
+    ), call. = FALSE)
+  }
+
+  n_uid_dup <- sum(duplicated(priors$player_uid))
+  if (n_uid_dup > 0L) {
+    stop(glue(
+      "build_projection_priors(): {n_uid_dup} duplicated player_uid(s) in the ",
+      "returned priors. A join fanned out; the board would double-count these ",
+      "players."
+    ), call. = FALSE)
+  }
+
+  message(glue(
+    "  Integrity: {nrow(priors)} priors, no NA mu/sigma, no duplicate uid."
+  ))
+
   priors
 }
 
@@ -3351,6 +4932,16 @@ build_projection_priors <- function(season,
 #' @param ytd_stats Tibble from .compute_player_ytd_stats() with columns
 #'   player_id, position, ytd_n_games, ytd_mean, ytd_sigma, team.
 #' @param week Integer. Current NFL week (1-18).
+#' @param xfp_ytd Tibble from load_xfp_ytd() (player_id, ytd_xfp_n,
+#'   ytd_xfp_raw_mean), or NULL. NULL turns the R/63 xFP wiring off.
+#' @param xfp_params Tibble from load_r63_xfp_params(), or NULL.
+#' @param scoring_settings List. [2026-10-01] Selects which gate tables the
+#'   k_table and xfp_params defaults load. A scoring with no gated table runs
+#'   the linear schedule with xFP off.
+#' @details [2026-09-30] Wired positions (R/63 gate) use the blended
+#'   observed mean a * ytd_mean + (1 - a) * calibrated xFP with weight
+#'   n / (n + k1). shadow_unwired_posterior_mu (pre-R/63 rule, every row) and
+#'   shadow_c1_posterior_mu (xFP rule, every row) are diagnostic columns.
 #' @return Tibble with columns: nfl_gsis_id, position, team, prior_mu,
 #'   prior_sigma, ytd_n, ytd_mean, ytd_sigma, posterior_mu, posterior_sigma.
 #'
@@ -3374,27 +4965,60 @@ build_projection_priors <- function(season,
 #'
 #' @seealso compute_prior_weight, build_projection_priors
 #' @export
-update_projection_with_ytd <- function(priors, ytd_stats, week) {
+update_projection_with_ytd <- function(priors, ytd_stats, week,
+                                       k_table = load_ytd_k_table(
+                                         scoring_settings = scoring_settings),
+                                       ytd_weight_mode = YTD_WEIGHT_MODE_DEFAULT,
+                                       xfp_ytd = NULL,
+                                       xfp_params = load_r63_xfp_params(
+                                         scoring_settings = scoring_settings),
+                                       scoring_settings = DEFAULT_SCORING_SETTINGS) {
 
   week <- as.integer(week)
   prior_weight <- compute_prior_weight(week)
   observed_weight <- 1 - prior_weight
 
-  message(glue("update_projection_with_ytd(): week={week}, ",
-               "prior_weight={round(prior_weight, 3)}, ",
-               "observed_weight={round(observed_weight, 3)}"))
+  # [2026-09-18] The scalar above is now the LINEAR fallback only; the
+  # per-player weight is computed after the join below. Message states which.
+  eff_mode <- ytd_weight_mode
+  if (eff_mode == "auto") eff_mode <- if (is.null(k_table)) "linear" else "games"
+  if (eff_mode == "games") {
+    message(glue("update_projection_with_ytd(): week={week}, ",
+                 "YTD weight mode = GAMES (R/58 gated k: ",
+                 "{paste(names(k_table), round(k_table, 2), sep = '=', collapse = ', ')}); ",
+                 "linear fallback observed_weight={round(observed_weight, 3)}"))
+  } else {
+    message(glue("update_projection_with_ytd(): week={week}, ",
+                 "YTD weight mode = LINEAR (no gated R/58 k table for this scoring at ",
+                 "{basename(scoring_gate_path(YTD_K_PATH, scoring_settings))}), ",
+                 "prior_weight={round(prior_weight, 3)}, ",
+                 "observed_weight={round(observed_weight, 3)}"))
+  }
 
   # Join priors to YTD stats
   updated <- priors %>%
     dplyr::left_join(
       ytd_stats %>% dplyr::select(player_id, team, ytd_n_games, ytd_mean,
                                    ytd_sigma),
-      by = c("nfl_gsis_id" = "player_id")
+      # na_matches = "never": nfl_gsis_id is NA for the id-less rookie cohort
+      # and would otherwise match NA player_id rows on the right.
+      by = c("nfl_gsis_id" = "player_id"), na_matches = "never"
     ) %>%
     dplyr::rename(ytd_n = ytd_n_games) %>%
     dplyr::mutate(
       ytd_n = dplyr::coalesce(ytd_n, 0L),
       has_observed = ytd_n > 0L
+    )
+
+  # [2026-09-18] Per-player observed weight (games-based when gated).
+  ow <- compute_ytd_observed_weight(updated$ytd_n, updated$position, week,
+                                    k_table = k_table, mode = ytd_weight_mode)
+  updated <- updated %>%
+    dplyr::mutate(
+      ytd_obs_weight  = ow$observed_weight,
+      ytd_weight_mode = ow$mode_used,
+      prior_weight    = 1 - ytd_obs_weight,
+      observed_weight = ytd_obs_weight
     )
 
   # For players with no observed data, posterior = prior unchanged
@@ -3423,17 +5047,96 @@ update_projection_with_ytd <- function(priors, ytd_stats, week) {
         ),
         prior_sigma
       )
-    ) %>%
+    )
+
+  # [2026-09-30] R/63 xFP wiring. shadow_unwired_posterior_mu is the posterior
+  # exactly as computed above (the pre-R/63 rule), kept for every row so the
+  # forward scoreboard can score wired vs unwired on the production prior.
+  updated <- updated %>%
+    dplyr::mutate(shadow_unwired_posterior_mu = posterior_mu)
+
+  xfp_on <- !is.null(xfp_ytd) && !is.null(xfp_params)
+  if (xfp_on) {
+    w_lin_now <- 1 - compute_prior_weight(week)
+    n_before  <- nrow(updated)
+    updated <- updated %>%
+      dplyr::left_join(xfp_ytd, by = c("nfl_gsis_id" = "player_id"),
+                       na_matches = "never", relationship = "many-to-one") %>%
+      dplyr::left_join(
+        xfp_params %>% dplyr::rename(xfp_wired = wired, xfp_k1 = k1, xfp_a1 = a1,
+                                     xfp_map_a0 = map_a0, xfp_map_b1 = map_b1),
+        by = "position", relationship = "many-to-one") %>%
+      dplyr::mutate(
+        ytd_xfp_n    = dplyr::coalesce(ytd_xfp_n, 0L),
+        # calibrated to league scoring by the R/63 map; no xFP history -> actual
+        ytd_xfp_mean = dplyr::if_else(ytd_xfp_n > 0L,
+                                      xfp_map_a0 + xfp_map_b1 * ytd_xfp_raw_mean,
+                                      ytd_mean),
+        c1_obs = xfp_a1 * ytd_mean + (1 - xfp_a1) * ytd_xfp_mean,
+        c1_w   = dplyr::if_else(position == "QB" | is.na(xfp_k1),
+                                w_lin_now, ytd_n / (ytd_n + xfp_k1)),
+        c1_w   = pmin(pmax(c1_w, 0), 1 - PRIOR_WEIGHT_FLOOR),
+        shadow_c1_posterior_mu = dplyr::if_else(
+          has_observed, (1 - c1_w) * prior_mu + c1_w * c1_obs, prior_mu),
+        xfp_wired     = dplyr::coalesce(xfp_wired, FALSE),
+        .apply        = xfp_wired & has_observed,
+        ytd_xfp_share = dplyr::if_else(.apply, 1 - xfp_a1, 0),
+        posterior_mu  = dplyr::if_else(xfp_wired, shadow_c1_posterior_mu, posterior_mu),
+        ytd_obs_weight  = dplyr::if_else(.apply, c1_w, ytd_obs_weight),
+        ytd_weight_mode = dplyr::if_else(.apply, "games_xfp", ytd_weight_mode),
+        # Same variance formula as above with the wired weight. It is not
+        # re-derived for the blended mean (which is less noisy than the actual
+        # mean), so wired intervals are conservative rather than tight.
+        posterior_sigma = dplyr::if_else(
+          .apply,
+          sqrt((1 - c1_w)^2 * prior_sigma^2 +
+                 c1_w^2 * (effective_ytd_sigma^2 / pmax(ytd_n, 1))),
+          posterior_sigma)
+      )
+    stopifnot(nrow(updated) == n_before)
+
+    wired_pos <- xfp_params$position[xfp_params$wired]
+    moved <- updated %>% dplyr::filter(.apply)
+    message(glue(
+      "update_projection_with_ytd(): xFP wiring ON (R/63). Wired: ",
+      "{if (length(wired_pos)) paste(wired_pos, collapse = ', ') else 'none'}; ",
+      "{nrow(moved)} player(s) on the blended mean; mean |wired - unwired| = ",
+      "{if (nrow(moved)) round(mean(abs(moved$posterior_mu - moved$shadow_unwired_posterior_mu)), 3) else 0} PPG; ",
+      "{sum(updated$has_observed & updated$ytd_xfp_n == 0L)} observed player(s) with no xFP row."))
+  } else {
+    updated <- updated %>%
+      dplyr::mutate(ytd_xfp_n = 0L, ytd_xfp_mean = NA_real_, ytd_xfp_share = 0,
+                    shadow_c1_posterior_mu = NA_real_)
+    message(glue("update_projection_with_ytd(): xFP wiring OFF ",
+                 "({if (is.null(xfp_params)) 'no R/63 gate object' else 'no xFP season-to-date data'}); ",
+                 "every position on the pre-R/63 rule."))
+  }
+
+  updated <- updated %>%
+    # player_uid FIRST. This whitelist previously omitted it, which silently
+    # dropped the never-NA identity key one step after the priors were built
+    # and left every downstream stage keyed on an NA-bearing column.
     dplyr::select(
-      nfl_gsis_id, position, team, prior_mu, prior_sigma,
+      player_uid, nfl_gsis_id, position, team, prior_mu, prior_sigma,
       ytd_n, ytd_mean, ytd_sigma, posterior_mu, posterior_sigma,
+      ytd_obs_weight, ytd_weight_mode,
+      # [2026-09-30] R/63 xFP wiring and forward-scoreboard shadows.
+      ytd_xfp_n, ytd_xfp_mean, ytd_xfp_share,
+      shadow_unwired_posterior_mu, shadow_c1_posterior_mu,
       score_final, score_v1, has_translation, has_history, n_nfl_seasons,
       prior_source,
       current_age, aging_delta_ppg, prior_mu_pre_age,
       injury_group_prior_season, injury_n_absent_weeks,
       injury_mu_adj, injury_sigma_multiplier,
       ramp_flag_prior_season, ramp_relative_change, ramp_mu_adj,
-      volume_implied_ppg, volume_blend_adj, n_panel_seasons
+      volume_implied_ppg, volume_blend_adj, n_panel_seasons,
+      # omega_raw / n_games_history added 2026-07-30. This whitelist is the
+      # spot that silently dropped player_uid once; any new prior column
+      # must be added here or it vanishes with no error.
+      omega_raw, n_games_history,
+      # Arm-balance diagnostics from .blend_prior_components().
+      w_translation, translation_observed_fraction, blend_used_history,
+      hist_mean_used
     )
 
   updated
@@ -3750,11 +5453,23 @@ run_projection_engine <- function(season,
                                    prospects_path = PROSPECTS_PATH_DEFAULT,
                                    translation_path = TRANSLATION_PREDS_PATH_DEFAULT,
                                    cache_dir = CACHE_DIR_DEFAULT,
+                                   out_prefix = R29_OUT_PREFIX_DEFAULT,
+                                   panel_seasons = NULL,
+                                   recency_lambda = HIST_RECENCY_LAMBDA,
+                                   filter_to_active_roster = TRUE,
                                    write_outputs = TRUE,
-                                   force_fp_refresh = FALSE) {
+                                   force_fp_refresh = FALSE,
+                                   ytd_through = NULL) {
 
   season <- as.integer(season)
   week <- as.integer(week)
+  # [2026-09-30] Last week of observed data used. Default week - 1L: the
+  # projected week is never part of its own season-to-date mean.
+  ytd_through <- if (is.null(ytd_through)) week - 1L else as.integer(ytd_through)
+  if (ytd_through < 0L || ytd_through >= week) {
+    stop(glue("run_projection_engine(): ytd_through must be in 0..{week - 1L} ",
+              "for week {week}. Got {ytd_through}."), call. = FALSE)
+  }
 
   message(glue("\n{strrep('=', 70)}"))
   message(glue("R/29 IN-SEASON PROJECTION ENGINE -- Season {season} Week {week}"))
@@ -3767,7 +5482,9 @@ run_projection_engine <- function(season,
     prospects_path = prospects_path,
     translation_path = translation_path,
     cache_dir = cache_dir,
-    scoring_settings = scoring_settings
+    scoring_settings = scoring_settings,
+    panel_seasons = panel_seasons,
+    recency_lambda = recency_lambda
   )
 
   # ---- STEP 4: Load current season pbp ----
@@ -3778,6 +5495,34 @@ run_projection_engine <- function(season,
 
   if (pbp_exists) {
     pbp <- load_normalized_season(season, cache_dir = cache_dir)
+
+    # [2026-09-18] Staleness gate. Existence of the file is not evidence that it
+    # covers the requested week. Compare max regular-season week in the cache to
+    # the week being projected. A cache one week behind (week - 1) is complete
+    # for a YTD update; anything older is stale.
+    pbp_weeks <- pbp$week[pbp$season_type == "REG" & !is.na(pbp$week)]
+    pbp_max_week <- if (length(pbp_weeks) == 0) 0L else max(pbp_weeks)
+    pbp_n_games_max <- if (pbp_max_week > 0L) {
+      dplyr::n_distinct(pbp$game_id[pbp$week == pbp_max_week])
+    } else 0L
+    message(glue("  Cache coverage: max REG week {pbp_max_week} ",
+                 "({pbp_n_games_max} game(s) in that week); ",
+                 "projecting week {week}."))
+    if (pbp_max_week < ytd_through) {
+      msg <- glue(
+        "pbp_normalized_{season}.rds is STALE: max week {pbp_max_week} but ",
+        "week {week} requested. Rebuild with ",
+        "load_multi_season_pbp(seasons = {season}, force_reload = TRUE) ",
+        "before running the engine."
+      )
+      if (identical(R29_PBP_STALE_ACTION, "stop")) stop(msg, call. = FALSE)
+      warning(msg, call. = FALSE)
+    } else if (pbp_max_week >= week) {
+      # [2026-09-30] The YTD window stops at ytd_through (week - 1 by default),
+      # so games from the projected week in the cache are excluded, not used.
+      message(glue("  NOTE: the cache holds week {pbp_max_week} games; YTD uses ",
+                   "weeks 1-{ytd_through} only, so the projected week does not leak."))
+    }
   } else {
     message(glue("  No pbp cache for season {season}. ",
                  "Running in PRESEASON MODE -- no YTD update will be applied."))
@@ -3788,12 +5533,16 @@ run_projection_engine <- function(season,
   roster <- .load_current_roster(season = season)
 
   # ---- STEP 5: Compute YTD stats ----
-  message(glue("\n[5/11] Computing season-to-date stats through Week {week}..."))
+  # [2026-09-30] LEAK FIX. The filter was week <= current_week with
+  # current_week = week, which included the projected week itself (a Thursday
+  # game leaked into that week's projection). The window now ends at
+  # ytd_through, default week - 1L. A week 1 run is preseason by construction.
+  message(glue("\n[5/11] Computing season-to-date stats through Week {ytd_through}..."))
 
-  if (pbp_exists) {
+  if (pbp_exists && ytd_through >= 1L) {
     ytd <- .compute_player_ytd_stats(
       pbp = pbp,
-      current_week = week,
+      current_week = ytd_through,
       roster = roster,
       scoring_settings = scoring_settings
     )
@@ -3809,12 +5558,21 @@ run_projection_engine <- function(season,
       ytd_mean = numeric(),
       ytd_sigma = numeric()
     )
-    message("  Preseason mode: YTD stats are empty.")
+    message("  Preseason mode (no pbp cache or ytd_through = 0): YTD stats are empty.")
   }
+
+  # ---- STEP 5b: xFP season-to-date for the R/63 wiring [2026-09-30] ----
+  xfp_ytd <- if (nrow(ytd) > 0L) load_xfp_ytd(season, ytd_through) else NULL
 
   # ---- STEP 6: Update with YTD ----
   message("\n[6/11] Updating projections with YTD data...")
-  updated <- update_projection_with_ytd(priors, ytd, week)
+  # [2026-10-01] scoring_settings selects the gate tables fit under THIS
+  # scoring (R/58 k, R/63 xFP). Before this, every scoring read the flat-PPR
+  # tables.
+  message(glue("  Scoring key {.r29_scoring_key(scoring_settings)}",
+               "{if (.r29_is_default_scoring(scoring_settings)) ' (default flat PPR)' else ''}"))
+  updated <- update_projection_with_ytd(priors, ytd, week, xfp_ytd = xfp_ytd,
+                                        scoring_settings = scoring_settings)
 
   # ---- STEP 7: Baselines + intervals ----
   message("\n[7/11] Computing position baselines and projection intervals...")
@@ -3864,7 +5622,19 @@ run_projection_engine <- function(season,
       dplyr::left_join(
         adp %>% dplyr::select(nfl_gsis_id, adp_rank, adp_ecr, adp_sd,
                               adp_tier),
-        by = "nfl_gsis_id"
+        # na_matches = "never": both sides carry NA nfl_gsis_id, so the default
+        # matched NA to NA and fanned out (the many-to-many warning).
+        #
+        # relationship = "many-to-one" [2026-09-02]: without it, a duplicate
+        # gsis_id on the ADP side fanned a player into two projection rows
+        # SILENTLY, and the failure only surfaced 300 lines later at the
+        # terminal player_uid guard as "0 NA and 1 duplicate" -- a message that
+        # points at output assembly rather than at this join. Declaring the
+        # relationship makes dplyr refuse here, naming the offending key.
+        # load_adp_fantasypros() now dedupes before caching, so this should
+        # never fire; it is the backstop, not the fix.
+        by = "nfl_gsis_id", na_matches = "never",
+        relationship = "many-to-one"
       )
     fp_match_rate_adp <- mean(!is.na(with_intervals$adp_rank))
   } else {
@@ -3879,7 +5649,12 @@ run_projection_engine <- function(season,
     with_intervals <- with_intervals %>%
       dplyr::left_join(
         consensus %>% dplyr::select(nfl_gsis_id, consensus_proj),
-        by = "nfl_gsis_id"
+        # relationship = "many-to-one" [2026-09-02]: same backstop as the ADP
+        # join above. The consensus cache was clean when the ADP one was not,
+        # so this guard is precautionary rather than responding to an observed
+        # failure.
+        by = "nfl_gsis_id", na_matches = "never",
+        relationship = "many-to-one"
       ) %>%
       dplyr::mutate(
         consensus_delta = posterior_mu - consensus_proj
@@ -3963,18 +5738,106 @@ run_projection_engine <- function(season,
   # and who are not in the active filter get dropped entirely.
   active_gsis_ids <- active_filter$nfl_gsis_id
 
+  # WAVE A2 IDENTITY FIX, PART 3: the active-roster gate.
+  #
+  # is_active was `nfl_gsis_id %in% active_gsis_ids`. .build_active_roster_filter()
+  # drops rows on !is.na(gsis_id), so active_gsis_ids contains no NA, and
+  # NA %in% <no NA> is FALSE. Every id-less rookie therefore failed the gate
+  # and was removed by filter(is_active) below -- the same silent drop the
+  # earlier prior-join fix removed, relocated to the output stage.
+  #
+  # Recovery is by normalized name plus position against the roster, the same
+  # mechanism the Sleeper rookie integration already uses upstream. The
+  # normalized name is recovered from player_uid, whose synthetic form is
+  # rk_<normname>_<draft_year>_<position> and whose normalization strips
+  # everything outside [a-z], so normname never contains an underscore.
+  #
+  # AMBIGUITY IS NOT RESOLVED, IT IS REFUSED. If a normalized name+position
+  # matches more than one roster row, the player is NOT marked active. A
+  # rookie missing from the board is a visible gap; a rookie carrying another
+  # player's roster spot is a silent error.
+  .norm_nm <- function(x) {
+    nm <- tolower(as.character(x))
+    nm <- gsub("\\b(jr|sr|ii|iii|iv|v)\\b\\.?", "", nm)
+    nm <- gsub("[^a-z]", "", nm)
+    trimws(nm)
+  }
+
+  roster_nm <- roster %>%
+    dplyr::filter(!is.na(.data$team), nchar(.data$team) > 0) %>%
+    dplyr::transmute(
+      nm_key       = paste0(.norm_nm(.data$full_name), "|",
+                            toupper(as.character(.data$position))),
+      roster_name  = .data$full_name,
+      nm_team      = .data$team
+    ) %>%
+    dplyr::filter(nchar(.data$nm_key) > 1)
+
+  ambiguous_keys <- roster_nm %>%
+    dplyr::count(.data$nm_key, name = "n_rows") %>%
+    dplyr::filter(.data$n_rows > 1L) %>%
+    dplyr::pull(.data$nm_key)
+
+  roster_nm <- roster_nm %>%
+    dplyr::filter(!.data$nm_key %in% ambiguous_keys) %>%
+    dplyr::distinct(.data$nm_key, .keep_all = TRUE)
+
   with_names <- with_value %>%
     dplyr::left_join(name_resolution, by = "nfl_gsis_id",
-                     relationship = "many-to-one") %>%
+                     relationship = "many-to-one", na_matches = "never") %>%
     dplyr::left_join(
       active_filter %>% dplyr::select(nfl_gsis_id, roster_team = team),
-      by = "nfl_gsis_id"
+      by = "nfl_gsis_id", na_matches = "never"
     ) %>%
     dplyr::mutate(
-      is_active = nfl_gsis_id %in% active_gsis_ids,
-      team      = dplyr::coalesce(roster_team, team)
+      # Name key for the id-less cohort only, recovered from player_uid.
+      nm_key = dplyr::if_else(
+        is.na(.data$nfl_gsis_id) & startsWith(.data$player_uid, "rk_"),
+        paste0(vapply(strsplit(.data$player_uid, "_", fixed = TRUE),
+                      function(p) if (length(p) >= 2L) p[2] else NA_character_,
+                      character(1)),
+               "|", toupper(as.character(.data$position))),
+        NA_character_
+      )
     ) %>%
-    dplyr::select(-roster_team)
+    dplyr::left_join(roster_nm, by = "nm_key", na_matches = "never") %>%
+    dplyr::mutate(
+      is_active = dplyr::if_else(
+        is.na(.data$nfl_gsis_id),
+        !is.na(.data$nm_team),
+        .data$nfl_gsis_id %in% active_gsis_ids
+      ),
+      player_name = dplyr::coalesce(.data$player_name, .data$roster_name),
+      name_source = dplyr::if_else(
+        is.na(.data$nfl_gsis_id) & !is.na(.data$roster_name),
+        "roster_name_recovery", .data$name_source
+      ),
+      team = dplyr::coalesce(.data$roster_team, .data$nm_team, .data$team)
+    )
+
+  # Report the id-less cohort explicitly. These are the players the gsis-keyed
+  # gate used to delete without a message.
+  idless_report <- with_names %>%
+    dplyr::filter(is.na(.data$nfl_gsis_id)) %>%
+    dplyr::select(player_uid, player_name, position, is_active)
+  message(glue("  Id-less cohort: {nrow(idless_report)} player(s), ",
+               "{sum(idless_report$is_active)} recovered as active by ",
+               "name+position, {sum(!idless_report$is_active)} not on a roster."))
+  if (nrow(idless_report) > 0L) {
+    for (i in seq_len(nrow(idless_report))) {
+      message(glue("    {idless_report$player_uid[i]} | ",
+                   "{dplyr::coalesce(idless_report$player_name[i], 'NO NAME')} | ",
+                   "{idless_report$position[i]} | ",
+                   "active={idless_report$is_active[i]}"))
+    }
+  }
+  if (length(ambiguous_keys) > 0L) {
+    message(glue("    ({length(ambiguous_keys)} roster name+position key(s) ",
+                 "were ambiguous and excluded from recovery.)"))
+  }
+
+  with_names <- with_names %>%
+    dplyr::select(-roster_team, -nm_key, -roster_name, -nm_team)
 
   # Drop players who are not on the active roster AND have no resolved
   # name from any check. These are unverifiable players who should not
@@ -3989,14 +5852,29 @@ run_projection_engine <- function(season,
   # Further filter: drop players not on the active roster (this is the
   # main filter -- it removes retired players, unsigned free agents not
   # in the roster file, and historical-only entries)
-  with_names <- with_names %>% dplyr::filter(is_active)
+  # The roster this filters against is always the present-day one. For the
+  # upcoming season that is correct: a projection for a retired player is
+  # noise. For a HISTORICAL target season it is survivorship bias, and in the
+  # damaging direction: it removes precisely the players who were projected
+  # and then washed out, which is the population where the projection is most
+  # likely to have been wrong. Scoring only the survivors flatters the model.
+  # A holdout run passes FALSE and scores everyone who was projected.
+  if (isTRUE(filter_to_active_roster)) {
+    with_names <- with_names %>% dplyr::filter(is_active)
 
-  n_after_filter <- nrow(with_names)
-  n_dropped <- n_before_filter - n_after_filter
+    n_after_filter <- nrow(with_names)
+    n_dropped <- n_before_filter - n_after_filter
 
-  message(glue("  Active roster filter: kept {n_after_filter}, ",
-               "dropped {n_dropped} ",
-               "(retired, unsigned, or unverifiable)"))
+    message(glue("  Active roster filter: kept {n_after_filter}, ",
+                 "dropped {n_dropped} ",
+                 "(retired, unsigned, or unverifiable)"))
+  } else {
+    n_after_filter <- nrow(with_names)
+    message(glue("  Active roster filter DISABLED ",
+                 "(filter_to_active_roster = FALSE): retaining all ",
+                 "{n_after_filter} projected players, including those not on ",
+                 "a present-day roster."))
+  }
 
   name_source_summary <- with_names %>%
     dplyr::count(name_source, name = "n")
@@ -4016,11 +5894,37 @@ run_projection_engine <- function(season,
     dplyr::ungroup() %>%
     dplyr::arrange(position, projected_rank)
 
+  # WAVE A2 IDENTITY FIX, PART 2.
+  #
+  # player_uid was built and used internally above, but the emitted CSV
+  # carried only nfl_gsis_id, so the fix stopped at this boundary. Eight
+  # draftable 2026 rookies have NA nfl_gsis_id. Downstream (R/32, R/33, R/46)
+  # keyed on nfl_gsis_id, NA matched NA and they contaminated each other.
+  # Emitting player_uid makes the never-NA key available to every consumer.
+  if (!"player_uid" %in% names(with_names)) {
+    stop(
+      "run_projection_engine(): player_uid was lost between priors and the ",
+      "output assembly. It is the never-NA join key for the id-less rookie ",
+      "cohort and downstream files require it. Do not write this CSV.",
+      call. = FALSE
+    )
+  }
+  n_uid_na  <- sum(is.na(with_names$player_uid))
+  n_uid_dup <- sum(duplicated(with_names$player_uid))
+  if (n_uid_na > 0L || n_uid_dup > 0L) {
+    stop(glue(
+      "run_projection_engine(): player_uid integrity failure at output ",
+      "assembly -- {n_uid_na} NA and {n_uid_dup} duplicate. Downstream joins ",
+      "would fan out or collide."
+    ), call. = FALSE)
+  }
+
   # Final projections schema -- consolidated and ordered
   projections_out <- with_names %>%
     dplyr::transmute(
       season              = season,
       week                = week,
+      player_uid          = player_uid,
       nfl_gsis_id         = nfl_gsis_id,
       player_name         = player_name,
       name_source         = name_source,
@@ -4030,6 +5934,14 @@ run_projection_engine <- function(season,
       current_age         = round(current_age, 1),
       aging_delta_ppg     = round(aging_delta_ppg, 2),
       prior_mu_pre_age    = round(prior_mu_pre_age, 3),
+      # Arm-balance diagnostics, carried from .blend_prior_components().
+      # Additive: no existing column changes meaning.
+      w_translation       = round(w_translation, 4),
+      translation_observed_fraction = round(translation_observed_fraction, 3),
+      # [2026-08-10] Which branch of the prior blend ran. Distinct from
+      # has_history, which counts qualifying seasons only.
+      blend_used_history  = blend_used_history,
+      hist_mean_used      = round(hist_mean_used, 3),
       injury_group        = injury_group_prior_season,
       injury_weeks_missed = injury_n_absent_weeks,
       injury_mu_adj       = round(injury_mu_adj, 2),
@@ -4044,6 +5956,18 @@ run_projection_engine <- function(season,
       ytd_n               = ytd_n,
       ytd_mean            = round(ytd_mean, 3),
       ytd_sigma           = round(ytd_sigma, 3),
+      # [2026-09-18] Which YTD weight rule produced posterior_mu for this row.
+      ytd_obs_weight      = round(ytd_obs_weight, 4),
+      ytd_weight_mode     = ytd_weight_mode,
+      # [2026-09-30] R/63 xFP. ytd_xfp_share > 0 only where wired (WR per the
+      # gate). The two shadow columns are for the forward scoreboard and are
+      # read by nothing downstream.
+      ytd_xfp_n           = ytd_xfp_n,
+      ytd_xfp_mean        = round(ytd_xfp_mean, 3),
+      ytd_xfp_share       = round(ytd_xfp_share, 3),
+      shadow_unwired_posterior_mu = round(shadow_unwired_posterior_mu, 3),
+      shadow_c1_posterior_mu      = round(shadow_c1_posterior_mu, 3),
+      ytd_through         = ytd_through,
       posterior_mu        = round(posterior_mu, 3),
       posterior_sigma     = round(posterior_sigma, 3),
       projection_lower_80 = round(projection_lower_80, 3),
@@ -4052,6 +5976,24 @@ run_projection_engine <- function(season,
       projection_upper_95 = round(projection_upper_95, 3),
       boom_probability    = round(boom_probability, 4),
       bust_probability    = round(bust_probability, 4),
+      # Position boom/bust thresholds, in points, carried into the output so
+      # DOWNSTREAM consumers can recompute the tail probabilities against their
+      # own posterior instead of inheriting R/29's. [2026-07-30]
+      # R/32 shifts and scales the posterior away from r29_posterior_mu (mean
+      # absolute move 1.70 PPG, max 17.18 on the DK board), so a boom
+      # probability computed here and passed through unchanged describes a
+      # projection that R/32 no longer uses. These two columns are what let R/32
+      # recompute without duplicating the baseline machinery or re-deriving the
+      # threshold by inverting qnorm(), which is impossible once a probability
+      # saturates at exactly 0 or 1.
+      boom_threshold_pts  = round(boom_threshold_pts, 4),
+      bust_threshold_pts  = round(bust_threshold_pts, 4),
+      # WEEK-TO-WEEK dispersion (omega), distinct from posterior_sigma (tau).
+      # tau answers 'how sure am I of his season average'. omega answers
+      # 'how much do his weeks vary', which is what best ball pays for.
+      # Var(one future week) = tau^2 + omega^2, and omega dominates.
+      omega_raw           = round(omega_raw, 3),
+      n_games_history     = n_games_history,
       adp_rank            = adp_rank,
       adp_ecr             = adp_ecr,
       adp_tier            = adp_tier,
@@ -4068,11 +6010,14 @@ run_projection_engine <- function(season,
   if (write_outputs) {
     if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
 
-    readr::write_csv(projections_out, OUTPUT_PROJECTIONS_PATH)
-    message(glue("  Wrote: {OUTPUT_PROJECTIONS_PATH}"))
+    proj_out_path  <- .r29_output_projections_path(cache_dir, out_prefix)
+    defst_out_path <- .r29_output_def_st_path(cache_dir, out_prefix)
 
-    readr::write_csv(def_st, OUTPUT_DEF_ST_PATH)
-    message(glue("  Wrote: {OUTPUT_DEF_ST_PATH}"))
+    readr::write_csv(projections_out, proj_out_path)
+    message(glue("  Wrote: {proj_out_path}"))
+
+    readr::write_csv(def_st, defst_out_path)
+    message(glue("  Wrote: {defst_out_path}"))
   }
 
   message(glue("\n{strrep('=', 70)}"))
@@ -4081,8 +6026,14 @@ run_projection_engine <- function(season,
   message(glue("  ADP match rate: {round(100 * fp_match_rate_adp, 1)}%"))
   message(glue("  Consensus match rate: ",
                "{round(100 * fp_match_rate_consensus, 1)}%"))
-  message(glue("  Prior weight (week {week}): ",
+  message(glue("  Prior weight, linear schedule (week {week}): ",
                "{round(compute_prior_weight(week), 3)}"))
+  if ("ytd_weight_mode" %in% names(projections_out)) {
+    message(glue("  YTD weight mode used: ",
+                 "{paste(names(table(projections_out$ytd_weight_mode)), ",
+                 "table(projections_out$ytd_weight_mode), ",
+                 "sep = '=', collapse = ', ')}"))
+  }
   message(glue("{strrep('=', 70)}\n"))
 
   invisible(list(
