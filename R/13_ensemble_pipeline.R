@@ -83,6 +83,15 @@ library(stacks)
 # Ridge penalty on the meta-learner blending coefficients.
 .W11_STACK_PENALTIES <- 10^seq(-3, -0.5, length.out = 20)
 
+# Pairwise Wilcoxon tests in compare_models(): significance threshold applied
+# to Holm-adjusted p-values, minimum distinct players required to run the
+# player-level test, and the schema tag stamped on every wilcoxon_tests table.
+# v2 = player-level test (unit = player_id) + Holm adjustment; v1 (pre
+# 2026-10-14) was a row-level paired test compared to raw p < 0.05.
+.W11_ALPHA               <- 0.05
+.W11_MIN_WILCOX_PLAYERS  <- 10L
+.W11_WILCOX_SCHEMA       <- "w11_wilcoxon_v2"
+
 
 # =============================================================================
 # FUNCTION: train_model_suite
@@ -541,8 +550,9 @@ train_model_suite <- function(
 #'
 #' @description
 #' Computes RMSE, MAE, and R-squared for all three models on the held-out test
-#' weeks. Runs paired Wilcoxon signed-rank tests on per-week absolute errors to
-#' assess whether performance differences are statistically meaningful.
+#' weeks. Runs player-level Wilcoxon signed-rank tests on per-player mean gaps
+#' in absolute error, Holm-adjusted, to assess whether performance differences
+#' are statistically meaningful.
 #'
 #' \strong{Week 10 limitation fix:}
 #' The Week 9 regression predictions artifact (\code{week9_predictions_2025.rds})
@@ -570,9 +580,17 @@ train_model_suite <- function(
 #'     \item \code{weekly_errors}  Tibble. Per-week per-model absolute error.
 #'       Columns: season (int), week (int), model (chr), abs_error (dbl),
 #'       actual (dbl), player_id (chr).
-#'     \item \code{wilcoxon_tests} Tibble. Pairwise Wilcoxon results.
-#'       Columns: comparison (chr), p_value (dbl), significant (lgl),
-#'       better_model (chr).
+#'     \item \code{wilcoxon_tests} Tibble. One row per model pair (3 rows).
+#'       Columns: comparison (chr), n_rows (int), n_players (int),
+#'       p_value (dbl; player-level, unadjusted), p_value_row (dbl;
+#'       row-level paired test, reference only), hl_estimate, hl_ci_lo,
+#'       hl_ci_hi (dbl; Hodges-Lehmann center and 95\% interval of the
+#'       per-player gaps, model A minus model B absolute error),
+#'       mean_gap_player (dbl), p_adj (dbl; Holm), adj_family (chr;
+#'       "position" here, "run" after \code{run_full_pipeline()}),
+#'       significant (lgl; p_adj < 0.05), better_model (chr; lower mean
+#'       absolute error), note (chr). Attribute \code{schema} =
+#'       "w11_wilcoxon_v2".
 #'     \item \code{week9_comparison} Tibble or NULL. Overlap comparison with
 #'       Week 9 regression predictions. NULL if \code{week9_preds_path} is NULL
 #'       or no matching rows found after postseason remapping.
@@ -584,14 +602,33 @@ train_model_suite <- function(
 #'
 #' @details
 #' \strong{Wilcoxon test interpretation:}
-#' The paired Wilcoxon signed-rank test is used over a t-test because per-week
-#' fantasy point errors are right-skewed (large errors when a star player busts
-#' unexpectedly). Wilcoxon tests the median difference in absolute errors rather
-#' than the mean, which is more appropriate for this distribution.
+#' Each pairwise test runs on one value per player: that player's mean gap in
+#' absolute error between the two models across all of the player's test rows.
+#' Test rows from the same player (up to 4 test weeks x 3 seasons) are not
+#' independent, so the player, not the player-week row, is the unit of
+#' analysis. The one-sample signed-rank test asks whether the per-player gaps
+#' are centered on zero (their pseudo-median); \code{hl_estimate} with
+#' \code{hl_ci_lo} / \code{hl_ci_hi} reports that center (Hodges-Lehmann) and
+#' a 95\% interval.
 #'
-#' p < 0.05 is the significance threshold. Given sample sizes of ~30-80 test
-#' rows, this test is conservative -- a non-significant result should be
-#' interpreted as "no evidence of difference" not "models are equivalent."
+#' Wilcoxon is used over a t-test because raw per-week absolute errors are
+#' right-skewed (large errors when a star player busts unexpectedly). The
+#' signed-rank test does not need normal errors, but it does assume the
+#' per-player gaps are roughly symmetric. In the 2026-07-27 run, raw-error
+#' skewness was 0.83 to 1.71 while player-mean gap skewness was -0.49 to 0.73,
+#' so that assumption roughly holds.
+#'
+#' p-values are Holm-adjusted (\code{p_adj}) and \code{significant} is
+#' \code{p_adj < 0.05}. In a standalone call the family is the 3 pairs for this
+#' position; \code{run_full_pipeline()} re-adjusts across every test in the
+#' run (3 pairs x positions). The unadjusted row-level paired test is kept as
+#' \code{p_value_row} for comparison only: it treats rows as independent and
+#' overstates the evidence.
+#'
+#' Test-set sizes in the 2026-07-27 run (seasons 2023-2025, weeks 15-18):
+#' passer 322 rows / 74 players, rusher 611 / 149, receiver 1249 / 329. A
+#' non-significant result means "no evidence of difference", not "models are
+#' equivalent."
 #'
 #' \strong{Postseason remapping logic:}
 #' NFL postseason weeks are numbered 19 (Wild Card), 20 (Divisional),
@@ -766,44 +803,108 @@ compare_models <- function(
       values_to = "abs_error"
     )
 
-  # ---- Pairwise Wilcoxon signed-rank tests ----------------------------------
-  # Paired by observation (same player-week compared across models).
-  # Tests whether median absolute error differs between models.
+  # ---- Pairwise Wilcoxon signed-rank tests (player-level) -------------------
+  # Unit of analysis is the player, not the player-week row. A player can
+  # contribute up to 12 test rows (4 test weeks x 3 seasons) and those rows
+  # are not independent, so a row-level paired test overstates the evidence.
+  # For each model pair:
+  #   1. gap = abs_error(model A) - abs_error(model B), per row
+  #   2. average the gaps within player_id (one value per player)
+  #   3. one-sample signed-rank test of the player-mean gaps against 0
+  # The test asks whether the per-player gaps are centered on zero (their
+  # pseudo-median). hl_estimate / hl_ci_lo / hl_ci_hi report that center
+  # (Hodges-Lehmann) with a 95% interval. Positive gap = model A has the
+  # larger error (model B better). The row-level paired test is kept as
+  # p_value_row for comparison only.
+  # p_adj / significant are Holm-adjusted across the 3 pairs here
+  # (adj_family = "position"). run_full_pipeline() re-adjusts across every
+  # position in the run (adj_family = "run") via .w11_adjust_wilcoxon().
 
-  run_wilcoxon <- function(err_a, err_b, label_a, label_b) {
-    if (length(err_a) < 10L || length(err_b) < 10L) {
-      return(tibble::tibble(
-        comparison  = glue("{label_a}_vs_{label_b}"),
-        p_value     = NA_real_,
-        significant = NA,
-        better_model = if (mean(err_a, na.rm = TRUE) < mean(err_b, na.rm = TRUE))
-          label_a else label_b,
-        note        = "Insufficient observations for Wilcoxon test"
-      ))
-    }
-    test_result <- stats::wilcox.test(err_a, err_b, paired = TRUE,
-                                      exact = FALSE, correct = TRUE)
-    tibble::tibble(
-      comparison   = glue("{label_a}_vs_{label_b}"),
-      p_value      = test_result$p.value,
-      significant  = test_result$p.value < 0.05,
-      better_model = if (mean(err_a, na.rm = TRUE) < mean(err_b, na.rm = TRUE))
-        label_a else label_b,
-      note         = NA_character_
+  run_wilcoxon <- function(err_wide, col_a, col_b) {
+    label    <- as.character(glue("{col_a}_vs_{col_b}"))
+    err_a    <- err_wide[[col_a]]
+    err_b    <- err_wide[[col_b]]
+    gap_rows <- err_a - err_b
+    keep     <- !is.na(gap_rows)
+
+    gap_player <- tibble::tibble(
+      player_id = err_wide$player_id[keep],
+      gap       = gap_rows[keep]
+    ) %>%
+      dplyr::group_by(player_id) %>%
+      dplyr::summarise(gap = mean(gap), .groups = "drop") %>%
+      dplyr::pull(gap)
+
+    n_rows          <- as.integer(sum(keep))
+    n_players       <- length(gap_player)
+    mean_gap_player <- if (n_players > 0L) mean(gap_player) else NA_real_
+    better_model    <- if (mean(err_a, na.rm = TRUE) < mean(err_b, na.rm = TRUE))
+      col_a else col_b
+
+    out <- tibble::tibble(
+      comparison      = label,
+      n_rows          = n_rows,
+      n_players       = n_players,
+      p_value         = NA_real_,
+      p_value_row     = NA_real_,
+      hl_estimate     = NA_real_,
+      hl_ci_lo        = NA_real_,
+      hl_ci_hi        = NA_real_,
+      mean_gap_player = mean_gap_player,
+      p_adj           = NA_real_,
+      adj_family      = NA_character_,
+      significant     = NA,
+      better_model    = better_model,
+      note            = NA_character_
     )
+
+    if (n_players < .W11_MIN_WILCOX_PLAYERS) {
+      out$note <- as.character(glue("Insufficient players for Wilcoxon test ",
+                                    "({n_players} < {.W11_MIN_WILCOX_PLAYERS})"))
+      return(out)
+    }
+
+    test_player <- tryCatch(
+      stats::wilcox.test(gap_player, mu = 0, exact = FALSE, correct = TRUE,
+                         conf.int = TRUE),
+      error = function(e) e
+    )
+    if (inherits(test_player, "error")) {
+      out$note <- as.character(glue("Player-level Wilcoxon failed: ",
+                                    "{conditionMessage(test_player)}"))
+      return(out)
+    }
+
+    out$p_value     <- test_player$p.value
+    out$hl_estimate <- unname(test_player$estimate)
+    out$hl_ci_lo    <- test_player$conf.int[1]
+    out$hl_ci_hi    <- test_player$conf.int[2]
+    out$p_value_row <- stats::wilcox.test(err_a[keep], err_b[keep], paired = TRUE,
+                                          exact = FALSE, correct = TRUE)$p.value
+
+    # better_model is chosen by mean absolute error; the test measures the
+    # pseudo-median of per-player gaps. Flag if the two ever point in
+    # opposite directions (all 9 agreed in the 2026-07-27 run).
+    if (!is.na(out$hl_estimate) && !is.na(mean_gap_player) &&
+        sign(out$hl_estimate) != 0 && sign(mean_gap_player) != 0 &&
+        sign(out$hl_estimate) != sign(mean_gap_player)) {
+      warning(glue("{position} {label}: mean player gap ({round(mean_gap_player, 4)}) ",
+                   "and Hodges-Lehmann estimate ({round(out$hl_estimate, 4)}) ",
+                   "disagree in sign; better_model may not match the test."),
+              call. = FALSE)
+    }
+    out
   }
 
   err_wide <- weekly_errors %>%
     tidyr::pivot_wider(names_from = model, values_from = abs_error)
 
   wilcoxon_tests <- dplyr::bind_rows(
-    run_wilcoxon(err_wide$xgboost,      err_wide$random_forest,
-                 "xgboost",      "random_forest"),
-    run_wilcoxon(err_wide$xgboost,      err_wide$elastic_net,
-                 "xgboost",      "elastic_net"),
-    run_wilcoxon(err_wide$random_forest, err_wide$elastic_net,
-                 "random_forest", "elastic_net")
+    run_wilcoxon(err_wide, "xgboost",       "random_forest"),
+    run_wilcoxon(err_wide, "xgboost",       "elastic_net"),
+    run_wilcoxon(err_wide, "random_forest", "elastic_net")
   )
+  wilcoxon_tests <- .w11_holm(wilcoxon_tests, family = "position")
 
   # ---- Week 10 postseason join fix: Week 9 comparison ----------------------
   # week9_predictions_2025.rds has predicted_week = 22 (Super Bowl week).
@@ -932,6 +1033,63 @@ compare_models <- function(
     week9_remap_log  = remap_log,
     position         = position
   )
+}
+
+
+# =============================================================================
+# INTERNAL: Holm adjustment for pairwise Wilcoxon tables
+# =============================================================================
+# .w11_holm() adjusts one wilcoxon_tests table in place. Rows with
+# p_value = NA (insufficient players, failed test) are left out of the family,
+# so m = number of non-NA tests.
+#
+# .w11_adjust_wilcoxon() takes the per-position comparisons list built by
+# run_full_pipeline(), re-adjusts across every test in the run (3 pairs x
+# positions), writes p_adj / adj_family / significant back into each
+# comparisons[[pos]]$wilcoxon_tests, and returns the bound run-level table.
+# Kept as a pure function so it is testable without training models.
+
+.w11_holm <- function(tests, family) {
+  stopifnot(is.data.frame(tests), "p_value" %in% names(tests))
+  ok <- !is.na(tests$p_value)
+  tests$p_adj       <- NA_real_
+  tests$adj_family  <- NA_character_
+  tests$significant <- NA
+  if (any(ok)) {
+    tests$p_adj[ok]       <- stats::p.adjust(tests$p_value[ok], method = "holm")
+    tests$adj_family[ok]  <- family
+    tests$significant[ok] <- tests$p_adj[ok] < .W11_ALPHA
+  }
+  attr(tests, "schema") <- .W11_WILCOX_SCHEMA
+  tests
+}
+
+.w11_adjust_wilcoxon <- function(comparisons) {
+  if (length(comparisons) == 0L) {
+    return(list(comparisons = comparisons, summary = tibble::tibble()))
+  }
+  missing_tables <- names(comparisons)[vapply(comparisons, function(cmp) {
+    is.null(cmp$wilcoxon_tests) || !"p_value" %in% names(cmp$wilcoxon_tests)
+  }, logical(1))]
+  if (length(missing_tables) > 0L) {
+    stop(glue(".w11_adjust_wilcoxon(): no usable wilcoxon_tests for: ",
+              "{paste(missing_tables, collapse = ', ')}"), call. = FALSE)
+  }
+
+  run_tests <- dplyr::bind_rows(lapply(names(comparisons), function(pos) {
+    comparisons[[pos]]$wilcoxon_tests %>%
+      dplyr::mutate(position = pos, .before = 1)
+  }))
+  run_tests <- .w11_holm(run_tests, family = "run")
+
+  for (pos in names(comparisons)) {
+    pos_tests <- run_tests[run_tests$position == pos, , drop = FALSE]
+    pos_tests$position <- NULL
+    attr(pos_tests, "schema") <- .W11_WILCOX_SCHEMA
+    comparisons[[pos]]$wilcoxon_tests <- pos_tests
+  }
+
+  list(comparisons = comparisons, summary = run_tests)
 }
 
 
@@ -1139,6 +1297,10 @@ build_ensemble <- function(
 #' @param reduced_rmse_tolerance Numeric. Maximum acceptable RMSE increase
 #'   (absolute, not percentage) from using the reduced feature set vs full.
 #'   Default: 0.5 (half a fantasy point -- roughly 5-7% of typical RMSE).
+#' @param seed Integer. RNG seed set immediately before the reduced XGBoost
+#'   fit, which subsamples rows (\code{sample_size} < 1) and columns
+#'   (\code{mtry}). Without it \code{reduced_rmse} changes on every call.
+#'   Default: 2025L.
 #'
 #' @return Named list with elements:
 #'   \itemize{
@@ -1193,7 +1355,8 @@ build_ensemble <- function(
 select_features <- function(
     suite_list,
     n_top                  = 20L,
-    reduced_rmse_tolerance = 0.5
+    reduced_rmse_tolerance = 0.5,
+    seed                   = 2025L
 ) {
 
   required_slots <- c("xgb_fit", "rf_fit", "en_fit", "train", "test",
@@ -1433,6 +1596,10 @@ select_features <- function(
     workflows::add_recipe(reduced_recipe) %>%
     workflows::add_model(reduced_xgb_spec)
 
+  # Seed immediately before the fit: the reduced XGBoost spec subsamples rows
+  # and columns, and R's xgboost draws from R's RNG. Unseeded, reduced_rmse
+  # moved between identical runs (2026-10-15 refresh: passer +0.057).
+  set.seed(seed)
   reduced_fit <- parsnip::fit(reduced_wf, data = train_reduced)
   reduced_pred <- pmax(predict(reduced_fit, new_data = test_reduced)$.pred, 0)
   actual        <- test_reduced$ppr_points_next_week
@@ -1500,15 +1667,16 @@ select_features <- function(
 #'   artifacts exist. Default: \code{FALSE}.
 #' @param output_dir Character. Directory for saving artifacts.
 #'   Default: \code{here::here("output")}.
-#' @param seed Integer. RNG seed passed to \code{train_model_suite()}.
-#'   Default: 2025L.
+#' @param seed Integer. RNG seed passed to \code{train_model_suite()} and
+#'   \code{select_features()}. Default: 2025L.
 #'
 #' @return Named list with elements:
 #'   \itemize{
 #'     \item \code{suites}      Named list (per position) of
 #'       \code{train_model_suite()} output.
 #'     \item \code{comparisons} Named list (per position) of
-#'       \code{compare_models()} output.
+#'       \code{compare_models()} output. \code{wilcoxon_tests} in each is
+#'       re-adjusted across the whole run (\code{adj_family = "run"}).
 #'     \item \code{ensembles}   Named list (per position) of
 #'       \code{build_ensemble()} output.
 #'     \item \code{features}    Named list (per position) of
@@ -1516,6 +1684,9 @@ select_features <- function(
 #'     \item \code{summary}     Tibble. Cross-position metrics table.
 #'       Columns: position (chr), model (chr), rmse (dbl), mae (dbl),
 #'       rsq (dbl), n_test (int).
+#'     \item \code{wilcoxon_summary} Tibble. Every pairwise Wilcoxon test in
+#'       the run (3 per position), Holm-adjusted together. Same columns as
+#'       \code{compare_models()$wilcoxon_tests} plus position (chr).
 #'   }
 #'
 #' @details
@@ -1749,11 +1920,20 @@ run_full_pipeline <- function(
     # ---- Step 7: Feature importance -----------------------------------------
 
     message(glue("Step 7/7: Selecting features for {pos}..."))
-    features_out[[pos]] <- select_features(suites[[pos]])
+    features_out[[pos]] <- select_features(suites[[pos]], seed = seed)
 
     # ---- Memory cleanup between positions ------------------------------------
     gc()
   }
+
+  # ---- Run-level multiple-comparison adjustment -----------------------------
+  # Holm across every pairwise Wilcoxon test in this run (3 pairs x positions).
+  # Overwrites p_adj / adj_family / significant in each comparisons[[pos]]
+  # (compare_models() only adjusted within its own 3 pairs).
+
+  wilcox_adj       <- .w11_adjust_wilcoxon(comparisons)
+  comparisons      <- wilcox_adj$comparisons
+  wilcoxon_summary <- wilcox_adj$summary
 
   # ---- Step 8: Cross-position summary table ---------------------------------
 
@@ -1784,11 +1964,12 @@ run_full_pipeline <- function(
 
   full_output_path <- artifact_path("full_results")
   results <- list(
-    suites      = suites,
-    comparisons = comparisons,
-    ensembles   = ensembles,
-    features    = features_out,
-    summary     = summary_table
+    suites           = suites,
+    comparisons      = comparisons,
+    ensembles        = ensembles,
+    features         = features_out,
+    summary          = summary_table,
+    wilcoxon_summary = wilcoxon_summary
   )
   saveRDS(results, full_output_path)
   message(glue("Full results saved: {full_output_path}"))
@@ -1800,6 +1981,11 @@ run_full_pipeline <- function(
   print(summary_table %>%
           dplyr::select(position, model, rmse) %>%
           tidyr::pivot_wider(names_from = model, values_from = rmse))
+
+  message("\nPairwise Wilcoxon (player-level, Holm across the run):")
+  print(wilcoxon_summary %>%
+          dplyr::select(position, comparison, n_players, p_value, p_value_row,
+                        p_adj, significant, hl_estimate))
 
   results
 }

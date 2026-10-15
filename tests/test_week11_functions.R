@@ -15,6 +15,11 @@
 #   - Cross-position summary table structure
 #   - Memory management: rm/gc pattern in run_full_pipeline
 #   - Edge cases: single position, all-NA importance column, empty test set
+#   - Player-level Wilcoxon + Holm adjustment (Section 10, added 2026-10-14)
+#   - Fold-ordering checks recover weeks via spl$in_id / complement()
+#     (fixed 2026-10-15; previously vacuous at Section 2, false-failing at
+#     Section 9)
+#   - select_features() reduced-fit reproducibility (Section 11, 2026-10-15)
 # =============================================================================
 
 library(testthat)
@@ -150,14 +155,26 @@ test_that("temporal CV folds respect week-level boundaries", {
 
   folds <- suite$folds
 
-  for (i in seq_len(length(folds$splits))) {
-    spl <- folds$splits[[i]]
-    train_idx <- rsample::analysis(spl)$week
-    val_idx   <- rsample::assessment(spl)$week
+  # The data attached to the splits (train_model) has week stripped, so
+  # analysis(spl)$week is NULL and the old version of this check passed
+  # vacuously. Recover weeks from train_raw (same row order as train_model)
+  # using the row positions rsample stores on the split: spl$in_id for the
+  # analysis rows and rsample::complement(spl) for the assessment rows.
+  train_raw_weeks <- suite$train_raw$week
 
+  for (i in seq_len(length(folds$splits))) {
+    spl       <- folds$splits[[i]]
+    train_wks <- unique(train_raw_weeks[spl$in_id])
+    val_wks   <- unique(train_raw_weeks[rsample::complement(spl)])
+
+    expect_true(
+      length(train_wks) > 0L && length(val_wks) > 0L &&
+        !anyNA(train_wks) && !anyNA(val_wks),
+      label = glue::glue("Fold {i}: week values must resolve for both sides")
+    )
     # No validation week should appear in training
     expect_true(
-      length(intersect(train_idx, val_idx)) == 0L,
+      length(intersect(train_wks, val_wks)) == 0L,
       label = glue::glue("Fold {i}: training and validation weeks must not overlap")
     )
   }
@@ -739,10 +756,12 @@ test_that("ASSUMPTION: temporal fold ordering -- folds are strictly chronologica
 
   for (i in seq_len(length(suite$folds$splits))) {
     spl          <- suite$folds$splits[[i]]
-    train_idx    <- rsample::analysis(spl) %>% tibble::rowid_to_column(".row") %>%
-                      dplyr::pull(.row)
-    val_idx      <- rsample::assessment(spl) %>% tibble::rowid_to_column(".row") %>%
-                      dplyr::pull(.row)
+    # Original row positions stored on the split. (rowid_to_column() on
+    # analysis()/assessment() renumbers each subset from 1, which pointed the
+    # validation rows at the first rows of train_raw, i.e. week 1, and made
+    # this test fail on correctly built folds.)
+    train_idx    <- spl$in_id
+    val_idx      <- rsample::complement(spl)
 
     # Use indices to recover week values from train_raw
     train_wks <- train_raw_weeks[train_idx]
@@ -906,6 +925,215 @@ test_that("ASSUMPTION: train/test week partition is strict -- no week overlap", 
       "Overlap detected at weeks: ", paste(overlap, collapse = ", ")
     )
   )
+})
+
+
+# =============================================================================
+# SECTION 10: Player-level Wilcoxon tests and Holm adjustment
+# =============================================================================
+# compare_models() tests each model pair on one mean gap per player (rows from
+# the same player are not independent), keeps the row-level test as
+# p_value_row, and Holm-adjusts within its 3 pairs. run_full_pipeline()
+# re-adjusts across the run through .w11_adjust_wilcoxon().
+#
+# Fixture: make_ml_data() test rows cycle weeks 15,16,17,18, so assigning each
+# consecutive block of 4 test rows to one player gives every player exactly one
+# row per test week. That keeps (player_id, season, week) unique, which the
+# compare_models() duplicate guard requires.
+
+make_wilcox_ml_data <- function(n_test) {
+  d       <- make_ml_data(n_train = 120L, n_test = n_test, seed = 42L)
+  is_test <- d$week %in% 15:18
+  idx     <- seq_len(sum(is_test))
+  d$player_id[is_test] <- paste0("T", sprintf("%03d", ((idx - 1L) %/% 4L) + 1L))
+  d
+}
+
+# 60 test rows -> 15 players x 4 weeks (above the 10-player floor)
+wilcox_suite <- train_model_suite(make_wilcox_ml_data(60L), position = "rusher",
+                                  train_weeks = 1:14, test_weeks = 15:18,
+                                  n_folds = 2L)
+wilcox_comp  <- compare_models(wilcox_suite, week9_preds_path = NULL,
+                               baselines = FALSE)
+wilcox_wide  <- wilcox_comp$weekly_errors %>%
+  tidyr::pivot_wider(names_from = model, values_from = abs_error)
+
+wilcox_pairs <- list(c("xgboost", "random_forest"),
+                     c("xgboost", "elastic_net"),
+                     c("random_forest", "elastic_net"))
+
+# Fake run-level comparisons for .w11_adjust_wilcoxon(): only the columns the
+# helper reads (p_value) plus a comparison label are needed.
+make_fake_wilcox <- function(p) {
+  tibble::tibble(
+    comparison = c("xgboost_vs_random_forest", "xgboost_vs_elastic_net",
+                   "random_forest_vs_elastic_net"),
+    p_value    = p
+  )
+}
+
+test_that("wilcoxon_tests has 3 rows, all v2 columns, and the schema attribute", {
+  wt <- wilcox_comp$wilcoxon_tests
+  expect_equal(nrow(wt), 3L)
+  expected_cols <- c("comparison", "n_rows", "n_players", "p_value",
+                     "p_value_row", "hl_estimate", "hl_ci_lo", "hl_ci_hi",
+                     "mean_gap_player", "p_adj", "adj_family", "significant",
+                     "better_model", "note")
+  expect_true(all(expected_cols %in% names(wt)),
+              label = paste("Missing:", paste(setdiff(expected_cols, names(wt)),
+                                              collapse = ", ")))
+  expect_identical(attr(wt, "schema"), "w11_wilcoxon_v2")
+  expect_type(wt$comparison, "character")
+})
+
+test_that("player-level n equals n_distinct(player_id); row n equals test rows", {
+  wt <- wilcox_comp$wilcoxon_tests
+  expect_true(all(wt$n_players == dplyr::n_distinct(wilcox_suite$test_raw$player_id)))
+  expect_true(all(wt$n_players == 15L))
+  expect_true(all(wt$n_rows == nrow(wilcox_suite$test_raw)))
+})
+
+test_that("player-level p_value and HL estimate match a hand computation", {
+  wt <- wilcox_comp$wilcoxon_tests
+  for (p in wilcox_pairs) {
+    lab <- paste0(p[1], "_vs_", p[2])
+    gap_player <- tibble::tibble(player_id = wilcox_wide$player_id,
+                                 gap = wilcox_wide[[p[1]]] - wilcox_wide[[p[2]]]) %>%
+      dplyr::group_by(player_id) %>%
+      dplyr::summarise(gap = mean(gap), .groups = "drop") %>%
+      dplyr::pull(gap)
+    ref <- stats::wilcox.test(gap_player, mu = 0, exact = FALSE, correct = TRUE,
+                              conf.int = TRUE)
+    row <- wt[wt$comparison == lab, ]
+    expect_equal(row$p_value, ref$p.value, tolerance = 1e-12, label = lab)
+    expect_equal(row$hl_estimate, unname(ref$estimate), tolerance = 1e-12, label = lab)
+    expect_equal(row$mean_gap_player, mean(gap_player), tolerance = 1e-12, label = lab)
+  }
+})
+
+test_that("p_value_row reproduces the old row-level paired test", {
+  wt <- wilcox_comp$wilcoxon_tests
+  for (p in wilcox_pairs) {
+    lab <- paste0(p[1], "_vs_", p[2])
+    ref <- stats::wilcox.test(wilcox_wide[[p[1]]], wilcox_wide[[p[2]]],
+                              paired = TRUE, exact = FALSE, correct = TRUE)$p.value
+    expect_equal(wt$p_value_row[wt$comparison == lab], ref, tolerance = 1e-12,
+                 label = lab)
+  }
+})
+
+test_that("standalone compare_models: Holm within position drives significant", {
+  wt <- wilcox_comp$wilcoxon_tests
+  ok <- !is.na(wt$p_value)
+  expect_true(any(ok))
+  expect_equal(wt$p_adj[ok], stats::p.adjust(wt$p_value[ok], method = "holm"),
+               tolerance = 1e-12)
+  expect_true(all(wt$p_adj[ok] >= wt$p_value[ok]))
+  expect_true(all(wt$p_adj[ok] <= 1))
+  expect_true(all(wt$adj_family[ok] == "position"))
+  expect_identical(wt$significant[ok], wt$p_adj[ok] < 0.05)
+})
+
+test_that("fewer than 10 players returns NA p-values with a note, no error", {
+  # 20 test rows -> 5 players x 4 weeks; small test set also triggers the
+  # train_model_suite low-power warning, which is expected here.
+  small_suite <- suppressWarnings(
+    train_model_suite(make_wilcox_ml_data(20L), position = "rusher",
+                      train_weeks = 1:14, test_weeks = 15:18, n_folds = 2L)
+  )
+  comp <- NULL
+  expect_no_error(
+    comp <- compare_models(small_suite, week9_preds_path = NULL, baselines = FALSE)
+  )
+  wt <- comp$wilcoxon_tests
+  expect_equal(nrow(wt), 3L)
+  expect_true(all(wt$n_players == 5L))
+  expect_true(all(is.na(wt$p_value)))
+  expect_true(all(is.na(wt$p_adj)))
+  expect_true(all(is.na(wt$significant)))
+  expect_true(all(grepl("Insufficient players", wt$note)))
+})
+
+test_that(".w11_adjust_wilcoxon: 3 positions -> 9 rows, Holm across the run", {
+  fake_comp <- list(
+    passer   = list(wilcoxon_tests = make_fake_wilcox(c(0.65, 0.27, 0.29))),
+    rusher   = list(wilcoxon_tests = make_fake_wilcox(c(0.46, 0.43, 0.22))),
+    receiver = list(wilcoxon_tests = make_fake_wilcox(c(0.018, 0.30, 0.0023)))
+  )
+  adj <- .w11_adjust_wilcoxon(fake_comp)
+  run <- adj$summary
+
+  expect_equal(nrow(run), 9L)
+  expect_true(all(run$adj_family == "run"))
+  expect_equal(run$p_adj, stats::p.adjust(run$p_value, method = "holm"),
+               tolerance = 1e-12)
+  expect_true(all(run$p_adj >= run$p_value))
+  expect_identical(run$significant, run$p_adj < 0.05)
+  expect_identical(attr(run, "schema"), "w11_wilcoxon_v2")
+
+  # Per-position slots are overwritten with the run-level values
+  for (pos in names(fake_comp)) {
+    pos_wt <- adj$comparisons[[pos]]$wilcoxon_tests
+    expect_equal(nrow(pos_wt), 3L, label = pos)
+    expect_false("position" %in% names(pos_wt), label = pos)
+    expect_equal(pos_wt$p_adj, run$p_adj[run$position == pos],
+                 tolerance = 1e-12, label = pos)
+    expect_true(all(pos_wt$adj_family == "run"), label = pos)
+  }
+})
+
+test_that(".w11_adjust_wilcoxon: one position -> 3 rows, Holm across 3", {
+  adj <- .w11_adjust_wilcoxon(list(
+    rusher = list(wilcoxon_tests = make_fake_wilcox(c(0.01, 0.04, 0.30)))
+  ))
+  expect_equal(nrow(adj$summary), 3L)
+  expect_equal(adj$summary$p_adj,
+               stats::p.adjust(c(0.01, 0.04, 0.30), method = "holm"),
+               tolerance = 1e-12)
+})
+
+test_that(".w11_adjust_wilcoxon: NA p-values are left out of the Holm family", {
+  fake_comp <- list(
+    passer   = list(wilcoxon_tests = make_fake_wilcox(c(NA, 0.27, 0.29))),
+    rusher   = list(wilcoxon_tests = make_fake_wilcox(c(0.46, 0.43, 0.22))),
+    receiver = list(wilcoxon_tests = make_fake_wilcox(c(0.018, 0.30, 0.0023)))
+  )
+  run <- .w11_adjust_wilcoxon(fake_comp)$summary
+  ok  <- !is.na(run$p_value)
+  expect_equal(sum(ok), 8L)
+  expect_true(is.na(run$p_adj[!ok]))
+  expect_true(is.na(run$significant[!ok]))
+  expect_true(is.na(run$adj_family[!ok]))
+  expect_equal(run$p_adj[ok], stats::p.adjust(run$p_value[ok], method = "holm"),
+               tolerance = 1e-12)
+})
+
+test_that(".w11_adjust_wilcoxon stops when a position has no usable table", {
+  expect_error(
+    .w11_adjust_wilcoxon(list(passer = list(metrics_table = tibble::tibble()))),
+    "no usable wilcoxon_tests"
+  )
+})
+
+
+# =============================================================================
+# SECTION 11: select_features() reproducibility
+# =============================================================================
+# The reduced XGBoost refit subsamples rows and columns. select_features()
+# now seeds immediately before that fit, so the same inputs and seed must give
+# the same reduced_rmse. Reuses wilcox_suite from Section 10.
+
+test_that("select_features: same seed gives identical reduced_rmse", {
+  run_a <- select_features(wilcox_suite, seed = 2025L)
+  run_b <- select_features(wilcox_suite, seed = 2025L)
+  expect_identical(run_a$reduced_rmse, run_b$reduced_rmse)
+  expect_identical(run_a$top_features, run_b$top_features)
+})
+
+test_that("select_features: default seed equals explicit 2025L", {
+  run_default  <- select_features(wilcox_suite)
+  run_explicit <- select_features(wilcox_suite, seed = 2025L)
+  expect_identical(run_default$reduced_rmse, run_explicit$reduced_rmse)
 })
 
 
