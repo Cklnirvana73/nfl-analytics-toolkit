@@ -96,3 +96,6 @@ output/draft_boards/
 # Claude Code local state
 .claude/worktrees/
 .claude/settings.local.json
+
+# Test logs (contain local machine paths)
+output/assumption_tests/

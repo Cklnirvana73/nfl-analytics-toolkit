@@ -89,8 +89,7 @@ Data is pulled from nflverse and cached locally under data/ (not tracked).
 
 ## Testing
 
-64 test files under tests/, using testthat, plus assumption-check logs in
-output/assumption_tests/.
+64 test files under tests/, using testthat.
 
 ## Statistics Series
 

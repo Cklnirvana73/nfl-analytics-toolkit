@@ -113,7 +113,7 @@
 #' @return Invisible named list of board tibbles, or the plan when dry_run.
 #' @export
 batch_value_boards <- function(
-    username       = "YOUR_SLEEPER_USERNAME",
+    username       = Sys.getenv("SLEEPER_USERNAME"),
     include_dk     = TRUE,
     leagues        = NULL,
     season         = 2026L,

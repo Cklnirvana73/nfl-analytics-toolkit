@@ -89,7 +89,7 @@
 #   source(here::here("R", "37_trade_value_model.R"))
 #
 #   # Build the per-league trade value table (interactive league menu):
-#   tv <- build_trade_value_table(username = "YOUR_SLEEPER_USERNAME")
+#   tv <- build_trade_value_table(username = Sys.getenv("SLEEPER_USERNAME"))
 #
 #   # Evaluate a specific trade within one league:
 #   res <- evaluate_trade(

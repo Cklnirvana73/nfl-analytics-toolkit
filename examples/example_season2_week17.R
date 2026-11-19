@@ -313,7 +313,7 @@ cat("\n================================================================\n")
 cat("EXAMPLE 7: Full interactive build (commented; needs a username)\n")
 cat("================================================================\n\n")
 
-# tv <- build_trade_value_table(username = "YOUR_SLEEPER_USERNAME")
+# tv <- build_trade_value_table(username = Sys.getenv("SLEEPER_USERNAME"))
 # head(tv, 20)
 #
 # # Then evaluate a trade in one of the built leagues:

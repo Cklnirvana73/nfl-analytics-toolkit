@@ -1952,7 +1952,7 @@ get_nfl_state <- function() {
 #' @return Integer roster_id, or NA_integer_ if no roster matches.
 #'
 #' @examples
-#' lg  <- get_user_leagues("YOUR_SLEEPER_USERNAME")
+#' lg  <- get_user_leagues(Sys.getenv("SLEEPER_USERNAME"))
 #' uid <- attr(lg, "sleeper_user_id")
 #' resolve_user_roster_id(lg$league_id[1], uid)
 #'

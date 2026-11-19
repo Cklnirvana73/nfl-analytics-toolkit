@@ -80,7 +80,10 @@ if (!exists("get_nfl_state")) {
 SCHEMA_TAG_APP <- "s3_r55_app_v5"
 
 # The Sleeper account whose leagues populate the dropdown.
-APP_SLEEPER_USERNAME <- "YOUR_SLEEPER_USERNAME"
+APP_SLEEPER_USERNAME <- Sys.getenv("SLEEPER_USERNAME")
+if (!nzchar(APP_SLEEPER_USERNAME)) {
+  stop("Set SLEEPER_USERNAME in the project .Renviron, then restart R.", call. = FALSE)
+}
 
 # Season the app operates on.
 APP_SEASON <- 2026L
