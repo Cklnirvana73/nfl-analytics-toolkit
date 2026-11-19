@@ -18,11 +18,26 @@
 #   TE ~1.35, QB ~0.45). Wave A2 item R5 is the fix on the R/36 side.
 #
 # WHAT IT IS NOT
-#   Week-specific. r32_posterior_mu is a per-game season mean, updated by the
-#   R/29 YTD rule (see ytd_weight_mode). No opponent, no Vegas. R/35's offense
-#   matchup factor is neutralized (DVP_CAP_OFFENSE = 0.00) on gate evidence,
-#   so nothing shifts the mean for the opponent. Bye teams are flagged from
-#   the schedule and their band is zeroed, the same rule R/35 v1.1 applies.
+#   Opponent-adjusted. r32_posterior_mu is a per-game season mean, updated by
+#   the R/29 YTD rule (see ytd_weight_mode). R/35's offense matchup factor is
+#   neutralized (DVP_CAP_OFFENSE = 0.00) on gate evidence. Bye teams are
+#   flagged from the schedule and their band is zeroed, the same rule R/35
+#   v1.1 applies.
+#
+# VEGAS OFFENSE SHIFT  [2026-10-22]
+#   The one week-specific term: the team's implied total for the week
+#   (home = (total + spread) / 2, away = (total - spread) / 2), applied ONLY at
+#   positions where R/68 (68_offense_vegas_gate.R) passed its out-of-sample
+#   gate, in the form R/68 chose for that position:
+#     additive      mu = mu_base + b * (team_implied - center)
+#     proportional  mu = mu_base * (1 + b * (team_implied - center) / center)
+#   Positions that did not pass get vegas_shift = 0 (vegas_mode "off"). No
+#   gate file, a schema mismatch, or a gate fit under a different scoring
+#   turns the whole shift off with a console line saying why. A missing line
+#   (not yet posted) shifts 0. mu_base keeps the unshifted mean; the quantiles
+#   are taken around the shifted mean with the same sigma_wk.
+#   Default gate path is the flat-PPR file; R/65's chain passes the site's
+#   keyed path and scoring key.
 #
 # AVAILABILITY  [2026-09-18, v2]
 #   The chain knows nothing about who will play. A commissioner-list player and
@@ -72,7 +87,9 @@ source(here::here("R", "50_weekly_predictive_shape.R"))
 R59_RECON_PATH  <- here::here("data", "season2_cache", "s2_week15_reconciled_projections.rds")
 R59_SHAPE_PATH  <- SHAPE_CACHE_PATH            # from R/50: data/season2_cache/s3_weekly_shape_table.rds
 R59_OUTPUT_DIR  <- here::here("data", "season3_cache")
-R59_SCHEMA_TAG  <- "s3_r59_bands_v3"
+R59_SCHEMA_TAG  <- "s3_r59_bands_v4"   # v4: mu_base, team_implied, vegas_shift, vegas_mode [2026-10-22]
+R59_VEGAS_GATE_PATH <- here::here("data", "season3_cache", "s3_r68_offense_vegas.rds")
+R59_VEGAS_SCHEMA    <- "s3_r68_offense_vegas_v1"
 # Shared manual override, R/35 load_availability() contract. Final word.
 R59_OVERRIDE_PATH <- here::here("data", "season3_cache", "availability_overrides.csv")
 R59_OVERRIDE_STATUSES <- c("active", "out_week", "out_for_season")
@@ -127,10 +144,57 @@ R59_OUT_PREFIX_DEFAULT <- "s3_"
   }
   wk <- sched %>%
     dplyr::filter(.data$game_type == "REG", .data$week == !!week)
+  # [2026-10-22] team_implied, same construction as R/68 and R/34
+  # (spread_line > 0 means the home team is favored). NA until posted.
+  has_lines <- all(c("spread_line", "total_line") %in% names(wk))
+  if (!has_lines) { wk$spread_line <- NA_real_; wk$total_line <- NA_real_ }
   dplyr::bind_rows(
-    wk %>% dplyr::transmute(team = home_team, opponent = away_team, home = TRUE),
-    wk %>% dplyr::transmute(team = away_team, opponent = home_team, home = FALSE)
+    wk %>% dplyr::transmute(team = home_team, opponent = away_team, home = TRUE,
+                            team_implied = (total_line + spread_line) / 2),
+    wk %>% dplyr::transmute(team = away_team, opponent = home_team, home = FALSE,
+                            team_implied = (total_line - spread_line) / 2)
   )
+}
+
+# ------------------------------------------------------------------------------
+# .r59_vegas_params  [2026-10-22]
+#
+# Positions where R/68 passed, with mode / b / center. NULL = shift off
+# everywhere (and the console says why).
+# @param path Gate object path (flat PPR default, or the site's keyed path).
+# @param scoring_key NULL for flat PPR (the gate must be the default-scoring
+#   object), or the R/29 scoring key the gate must carry.
+# ------------------------------------------------------------------------------
+.r59_vegas_params <- function(path, scoring_key = NULL) {
+  if (is.null(path) || !file.exists(path)) {
+    message(glue("  Vegas offense shift OFF: no R/68 gate at {basename(as.character(path))}"))
+    return(NULL)
+  }
+  g <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(g) || !identical(g$schema_tag, R59_VEGAS_SCHEMA) || is.null(g$decisions)) {
+    message("  Vegas offense shift OFF: R/68 gate unreadable or wrong schema")
+    return(NULL)
+  }
+  if (is.null(scoring_key)) {
+    if (!isTRUE(g$is_default_scoring)) {
+      message("  Vegas offense shift OFF: gate was fit under a non-default scoring; pass vegas_scoring_key")
+      return(NULL)
+    }
+  } else if (!identical(g$scoring_key, scoring_key)) {
+    message("  Vegas offense shift OFF: gate scoring key differs from this run's scoring")
+    return(NULL)
+  }
+  d <- g$decisions %>%
+    dplyr::filter(mode %in% c("additive", "proportional"), is.finite(b),
+                  is.finite(center), center > 0) %>%
+    dplyr::select(position, mode, b, center)
+  if (nrow(d) == 0) {
+    message("  Vegas offense shift OFF: no position passed R/68")
+    return(NULL)
+  }
+  message(glue("  Vegas offense shift ON (R/68 built {format(g$built_at, '%Y-%m-%d')}): ",
+               "{paste0(d$position, ' ', d$mode, ' b=', round(d$b, 4), collapse = '; ')}"))
+  d
 }
 
 # ------------------------------------------------------------------------------
@@ -233,7 +297,9 @@ run_weekly_bands <- function(week,
                              p_high = R59_P_HIGH,
                              write_outputs = TRUE,
                              print_top = 12L,
-                             out_prefix = R59_OUT_PREFIX_DEFAULT) {
+                             out_prefix = R59_OUT_PREFIX_DEFAULT,
+                             vegas_gate_path = R59_VEGAS_GATE_PATH,
+                             vegas_scoring_key = NULL) {
 
   week   <- as.integer(week)
   season <- as.integer(season)
@@ -287,7 +353,43 @@ run_weekly_bands <- function(week,
   n_dropped <- nrow(rec %>% dplyr::filter(.data$position %in% R59_POSITIONS)) - nrow(df)
   if (n_dropped > 0) message(glue("  {n_dropped} row(s) dropped for NA/zero mu or sigma (no band fabricated)"))
 
-  mu  <- df$r32_posterior_mu
+  # [2026-10-22] Vegas offense shift (R/68-gated positions only; see header)
+  vp <- .r59_vegas_params(vegas_gate_path, vegas_scoring_key)
+  df <- df %>% dplyr::mutate(mu_base = r32_posterior_mu)
+  if (!is.null(wt)) {
+    df <- df %>% dplyr::left_join(wt %>% dplyr::select(team, team_implied),
+                                  by = "team", relationship = "many-to-one")
+  } else {
+    df$team_implied <- NA_real_
+  }
+  if (!is.null(vp)) {
+    df <- df %>%
+      dplyr::left_join(vp %>% dplyr::rename(v_mode = mode, v_b = b, v_center = center),
+                       by = "position", relationship = "many-to-one") %>%
+      dplyr::mutate(
+        v_mode = dplyr::coalesce(v_mode, "off"),
+        vegas_shift = dplyr::case_when(
+          v_mode == "additive" & !is.na(team_implied) ~ v_b * (team_implied - v_center),
+          v_mode == "proportional" & !is.na(team_implied) ~
+            mu_base * v_b * (team_implied - v_center) / v_center,
+          TRUE ~ 0),
+        vegas_mode = v_mode) %>%
+      dplyr::select(-v_mode, -v_b, -v_center)
+  } else {
+    df$vegas_shift <- 0; df$vegas_mode <- "off"
+  }
+  sh <- df %>% dplyr::filter(vegas_shift != 0)
+  if (nrow(sh) > 0) {
+    message("  Vegas shift applied (points), by position:")
+    print(sh %>% dplyr::group_by(position, vegas_mode) %>%
+            dplyr::summarise(n = dplyr::n(), min = round(min(vegas_shift), 2),
+                             mean = round(mean(vegas_shift), 2), max = round(max(vegas_shift), 2),
+                             .groups = "drop"))
+  }
+  n_noline <- sum(df$vegas_mode != "off" & is.na(df$team_implied))
+  if (n_noline > 0) message(glue("  {n_noline} row(s) at shifted positions with no line posted (shift 0)"))
+
+  mu  <- df$mu_base + df$vegas_shift
   sig <- df$r32_sigma_week
   pos <- df$position
 
@@ -314,7 +416,7 @@ run_weekly_bands <- function(week,
 
   if (!is.null(wt)) {
     df <- df %>%
-      dplyr::left_join(wt, by = "team") %>%
+      dplyr::left_join(wt %>% dplyr::select(-dplyr::any_of("team_implied")), by = "team") %>%
       dplyr::mutate(
         on_bye = is.na(.data$opponent),
         # Bye: no game, no points. Same rule as R/35 v1.1 (.apply_matchup).
@@ -404,6 +506,10 @@ run_weekly_bands <- function(week,
       ytd_n           = if ("ytd_n" %in% names(df)) ytd_n else NA_integer_,
       ytd_weight_mode = if ("ytd_weight_mode" %in% names(df)) ytd_weight_mode else NA_character_,
       mu       = round(mu, 2),
+      mu_base      = round(mu_base, 2),
+      team_implied = round(team_implied, 2),
+      vegas_shift  = round(vegas_shift, 2),
+      vegas_mode,
       sigma_wk = round(sigma_wk, 2),
       low      = round(low, 2),
       q1       = round(q1, 2),
