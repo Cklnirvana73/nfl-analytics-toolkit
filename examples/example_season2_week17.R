@@ -194,10 +194,13 @@ tv_dynasty <- compute_player_trade_values(
 tv_dynasty <- .assign_tiers_and_ranks(tv_dynasty)
 
 swing <- tv_redraft %>%
+  dplyr::filter(!rookie_flag, !is.na(nfl_gsis_id)) %>%
   dplyr::select(nfl_gsis_id, player_name, position,
                 age_at_season_start, tv_redraft = trade_value) %>%
   dplyr::inner_join(
-    tv_dynasty %>% dplyr::select(nfl_gsis_id, tv_dynasty = trade_value),
+    tv_dynasty %>%
+      dplyr::filter(!rookie_flag, !is.na(nfl_gsis_id)) %>%
+      dplyr::select(nfl_gsis_id, tv_dynasty = trade_value),
     by = "nfl_gsis_id"
   ) %>%
   dplyr::mutate(delta = tv_dynasty - tv_redraft)

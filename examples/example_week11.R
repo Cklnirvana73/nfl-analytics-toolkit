@@ -158,10 +158,13 @@ cat("                r > 0.90 means models make similar errors; ensemble gain is
 # The Week 10 known limitation is resolved here: predicted_week = 22 in the
 # Week 9 predictions artifact is detected, logged, and dropped before joining.
 #
-# NFL context: The Wilcoxon test uses per-week absolute errors rather than
-# a t-test because fantasy point error distributions are right-skewed. A
-# handful of bust weeks (player is projected 15, scores 2) inflate the mean
-# but the Wilcoxon median comparison is more robust to these outliers.
+# NFL context: raw fantasy point errors are right-skewed. A handful of bust
+# weeks (player is projected 15, scores 2) inflate the mean, so the comparison
+# uses a Wilcoxon signed-rank test rather than a t-test. The test runs on one
+# value per player (that player's mean gap in absolute error between two
+# models), because test weeks from the same player are not independent. It
+# asks whether those per-player gaps are centered on zero; hl_estimate is that
+# center. p-values are Holm-adjusted across the 3 model pairs.
 
 cat("\n====================================================\n")
 cat("EXAMPLE 3: Model comparison with postseason join fix\n")
@@ -176,9 +179,11 @@ comp_rb <- compare_models(
 cat("\nMetrics table (sorted best to worst RMSE):\n")
 print(comp_rb$metrics_table)
 
-cat("\nWilcoxon test results (paired per-week absolute errors):\n")
+cat("\nWilcoxon test results (player-level, one mean gap per player):\n")
 print(comp_rb$wilcoxon_tests)
-cat("p < 0.05 = statistically significant difference in median error.\n")
+cat("significant = Holm-adjusted p (p_adj) < 0.05 across the 3 pairs.\n")
+cat("hl_estimate = center of the per-player gaps (model A minus model B error).\n")
+cat("p_value_row = old row-level test, reference only (treats rows as independent).\n")
 
 # Week 10 postseason fix log
 if (nrow(comp_rb$week9_remap_log) > 0L) {
