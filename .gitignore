@@ -81,3 +81,18 @@ output/*.jpg
 .DS_Store
 
 Thumbs.db
+
+# Rendered NFL output: regenerate from visuals/ and examples/
+output/plots/
+output/season2_week*/
+
+# Local only: private data and personal league boards
+output/private/
+output/draft_boards/
+
+# Stats series: per-post CSVs are tracked (overrides *.csv above)
+!stats_posts/output/data/*.csv
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json

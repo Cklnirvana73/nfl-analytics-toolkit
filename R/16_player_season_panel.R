@@ -77,7 +77,7 @@
 #
 # COLUMN REFERENCE
 # ----------------
-# See docs/Week2_Column_Reference.txt for the full output schema.
+# See reference/Week2_Column_Reference.txt for the full output schema.
 #
 # =============================================================================
 

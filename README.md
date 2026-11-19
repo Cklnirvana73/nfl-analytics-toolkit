@@ -35,12 +35,21 @@ install.packages(c("nflfastR", "tidyverse", "nflplotR"))
 ## Project Structure
 ```
 nfl-analytics-toolkit/
-├── R/                  # Core functions
-├── tests/              # Unit and integration tests
-├── output/             # Visualizations
-├── data/               # Cached data (not tracked)
-├── examples/           # Usage examples
-└── vignettes/          # Tutorials
+├── R/                  # Pipeline modules (numbered, sourced in order)
+├── tests/              # testthat suites; tests/legacy_runners/ holds the early weekly runners
+├── examples/           # Weekly example and verification scripts
+├── visuals/            # NFL figure scripts (write to output/plots/, not tracked)
+├── analysis/           # One-off studies
+├── diagnostics/        # Diagnostic scripts
+├── shiny_app/          # Season 2 fantasy decision app
+├── shiny_dfs/          # DFS lineup app
+├── scripts/            # deploy/ (shinyapps.io), season3/, dev/
+├── stats_posts/        # LinkedIn Statistics Series: scripts, figures, per-post data
+├── reference/          # Column and schema references
+├── archive/            # Superseded reference copies (never sourced)
+├── figures/            # Curated figures
+├── output/             # Pipeline artifacts (mostly not tracked)
+└── data/               # Cached data (not tracked)
 ```
 
 ## Skills Demonstrated

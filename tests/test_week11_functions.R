@@ -3,7 +3,7 @@
 # =============================================================================
 # File:    tests/test_week11_functions.R
 # Purpose: Test suite for R/13_ensemble_pipeline.R
-# Run via: source("test_week11.R") from project root
+# Run via: source("tests/legacy_runners/test_week11.R") from project root
 #
 # Coverage:
 #   - Input validation for all five functions

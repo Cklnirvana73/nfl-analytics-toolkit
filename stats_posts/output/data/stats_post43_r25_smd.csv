@@ -1,0 +1,7 @@
+"covariate","type","mean_trt","mean_ctl","sd_trt","sd_ctl","smd","source","abs_smd","flag_0.20"
+"prior_season_ppg","continuous",8.29295511168996,12.1097959159708,6.15404699745339,6.20149383015688,-0.617830124184159,"R/25 formula, effect sample",0.617830124184159,TRUE
+"n_prior_games","continuous",2,7.48769819573537,0,0.49998534409814,-15.5220094073317,"R/25 formula, effect sample",15.5220094073317,TRUE
+"share_QB","binary",0.0173913043478261,0.160196828868234,NA,NA,-0.518654275841785,"proportion SMD, computed here",0.518654275841785,TRUE
+"share_RB","binary",0.252173913043478,0.261344997266266,NA,NA,-0.0209950392285075,"proportion SMD, computed here",0.0209950392285075,FALSE
+"share_WR","binary",0.356521739130435,0.411153635866594,NA,NA,-0.112515168162229,"proportion SMD, computed here",0.112515168162229,FALSE
+"share_TE","binary",0.373913043478261,0.167304537998907,NA,NA,0.47815295478521,"proportion SMD, computed here",0.47815295478521,TRUE

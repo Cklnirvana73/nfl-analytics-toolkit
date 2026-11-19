@@ -13,7 +13,7 @@
 #   Integration                  -- 4 tests
 #
 # PREREQUISITES
-# This file is sourced by test_week10.R which calls test_file().
+# This file is sourced by tests/legacy_runners/test_week10.R which calls test_file().
 # The following objects must exist in the calling session OR this script
 # will build them from saved RDS artifacts:
 #   ml_data_tiered     -- from define_outcome_tiers()

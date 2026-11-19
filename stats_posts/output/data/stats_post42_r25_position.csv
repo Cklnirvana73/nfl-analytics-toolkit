@@ -1,0 +1,9 @@
+"group","position","n","pct"
+"control","QB",293,16
+"control","RB",478,26.1
+"control","TE",306,16.7
+"control","WR",752,41.1
+"treatment","QB",2,1.7
+"treatment","RB",29,25.2
+"treatment","TE",43,37.4
+"treatment","WR",41,35.7

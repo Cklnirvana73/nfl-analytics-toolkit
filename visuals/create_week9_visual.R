@@ -14,7 +14,7 @@
 #   4. Next-week projections leaderboard (real predictions) -- static PNG
 #
 # Usage:
-#   Run week9_working_on.R first to produce output/week9_models_2025.rds
+#   Run scripts/dev/week9_working_on.R first to produce output/week9_models_2025.rds
 #   and output/week9_predictions_2025.rds.
 #   Then: source("visuals/create_week9_visual.R")
 #
@@ -46,13 +46,13 @@ preds_path  <- here::here("output", "week9_predictions_2025.rds")
 if (!file.exists(models_path)) {
   stop(paste0(
     "week9_models_2025.rds not found at: ", models_path, "\n",
-    "Run week9_working_on.R (Steps 1-10) to generate it first."
+    "Run scripts/dev/week9_working_on.R (Steps 1-10) to generate it first."
   ))
 }
 if (!file.exists(preds_path)) {
   stop(paste0(
     "week9_predictions_2025.rds not found at: ", preds_path, "\n",
-    "Run week9_working_on.R (Step 10) to generate it first."
+    "Run scripts/dev/week9_working_on.R (Step 10) to generate it first."
   ))
 }
 

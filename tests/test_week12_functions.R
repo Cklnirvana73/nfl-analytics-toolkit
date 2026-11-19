@@ -10,7 +10,7 @@
 # validation only. Full integration tests require running the ensemble pipeline
 # first (see example_week12.R Examples 5 and 7 for live integration).
 #
-# Run from: test_week12.R (root level) or directly via testthat::test_file()
+# Run from: tests/legacy_runners/test_week12.R or directly via testthat::test_file()
 # ==============================================================================
 
 library(testthat)

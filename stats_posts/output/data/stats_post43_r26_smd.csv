@@ -1,0 +1,4 @@
+"covariate","sample","mean_trt","mean_ctl","smd","note","abs_smd","flag_0.25"
+"early_usage (weeks 1-4)","effect sample",0.157198067230061,0.221148755787162,-0.61030666571794,"R/26 balance covariate",0.61030666571794,TRUE
+"weeks 1-8 PPG","effect sample",9.60042747421549,11.3428357898715,-0.31163244936629,"DESCRIPTIVE ONLY: concurrent with the ramp window",0.31163244936629,TRUE
+"early_usage (weeks 1-4)","groups file",0.156532921231607,0.22046774281538,-0.611287194476768,"the sample check_balance_ramp_groups() sees",0.611287194476768,TRUE

@@ -3,7 +3,7 @@
 # ==============================================================================
 #
 # Tests for R/10_opponent_features.R
-# Run via: source(here("test_week8.R"))
+# Run via: source(here("tests", "legacy_runners", "test_week8.R"))
 #
 # Test categories:
 #   1.  Input validation (all 4 functions)

@@ -1,0 +1,4 @@
+"position","n_player_weeks","r_season_avg","r_last3","r_diff_computed_here","p_value_adj","cohens_q","better_predictor"
+"QB",6566,0.377,0.337,0.04,4.27870639478405e-10,0.0459,"std"
+"RB",15199,0.5816,0.5653,0.0163,1.91483121380635e-08,0.0243,"std"
+"WR",23021,0.4649,0.4192,0.0457,8.64251262233882e-54,0.0568,"std"

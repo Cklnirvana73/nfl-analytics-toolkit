@@ -1,0 +1,5 @@
+"comparison","estimate","ci_lower","ci_upper","n_na_draws","ci_method","share_of_raw_remaining"
+"raw (no adjustment)",-4.53258785720134,-5.51303170732507,-3.48377492532462,NA,"stored basic B1000",1
+"within prior-season PPG quintile",-2.281550469118,-3.01604528445532,-1.56046166599774,0,"percentile B2000",0.503365966859988
+"within position",-2.62264820107412,-3.53898459010831,-1.78455083318819,0,"percentile B2000",0.57862048871425
+"within position x prior-season PPG quintile",-1.87336404991019,-2.59045502696453,-1.17484917818511,0,"percentile B2000",0.413310035884644
