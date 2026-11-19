@@ -4,7 +4,7 @@
 #
 # READ-ONLY against data/season2_cache/ (the 2026-09-17 rerun).
 # Writes only stats_posts/output/data/stats_post43_*.csv. Edits no toolkit file.
-# Run from the nfl-analytics-toolkit project root:  source("stats_post43_pull.R")
+# Run from the nfl-analytics-toolkit project root:  source("stats_posts/scripts/stats_post43_pull.R")
 #
 # Built on stats_post42_pull.R: same cache files, same group reconstruction,
 # same reproduction gates, so every Post 43 number sits on the Post 42 sample.

@@ -21,7 +21,7 @@
 # them against the CSVs that pull script wrote.
 #
 # Run from the nfl-analytics-toolkit project root:
-#   source("create_stats_post43_visual.R")
+#   source("stats_posts/scripts/create_stats_post43_visual.R")
 # Outputs: stats_posts/output/plots/stats_post43_position_confounder.png and .svg (1200x800)
 # ==============================================================================
 
